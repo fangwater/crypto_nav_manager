@@ -80,6 +80,24 @@ ORDER BY ts DESC, id DESC
 LIMIT 1;
 ```
 
+Sync Binance Portfolio Margin UM funding income with:
+
+```bash
+cargo run --release --bin sync_binance_funding -- \
+  --strategy binance_fr_arb01 \
+  --local-ip 172.31.35.234 \
+  --local-ip 172.31.35.233
+```
+
+The command loads the strategy's credentials from its registered `env_path`
+and writes to its own `funding_fees` table. With an empty table it starts at
+the registered `st_ms`; later runs use the latest database event time with a
+24-hour overlap and idempotent `tranId` upserts. Pass `--full` to ignore the
+database cursor. Binance may still truncate online income history according to
+its server-side retention window, so compare the resulting minimum event time
+with `st_ms` before treating a backfill as complete. Repeating `--local-ip`
+provides an IP pool; the dispatcher accounts for request weight per IP.
+
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
 

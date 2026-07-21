@@ -221,13 +221,15 @@ impl BinanceClient {
 
     pub async fn funding_fees(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
         self.require_portfolio_margin()?;
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
-        let mut start_ms = range.start_ms;
+        let mut page_number = 1_i64;
         loop {
             let params = vec![
                 ("incomeType".to_string(), "FUNDING_FEE".to_string()),
-                ("startTime".to_string(), start_ms.to_string()),
+                ("startTime".to_string(), range.start_ms.to_string()),
                 ("endTime".to_string(), range.end_ms.to_string()),
+                ("page".to_string(), page_number.to_string()),
                 ("limit".to_string(), LIMIT.to_string()),
             ];
             let value = self
@@ -238,31 +240,23 @@ impl BinanceClient {
                 break;
             }
             let page_len = page.len();
-            let last_time = page
-                .iter()
-                .filter_map(|row| value_i64(row, "time"))
-                .max()
-                .ok_or_else(|| ExchangeError::InvalidResponse {
-                    exchange: EXCHANGE,
-                    message: "income page has no numeric time field".to_string(),
-                })?;
-            rows.extend(
-                page.into_iter()
-                    .filter(|row| value_i64(row, "time").is_some_and(|ts| ts <= range.end_ms)),
-            );
-            if page_len < LIMIT || last_time >= range.end_ms {
+            rows.extend(page.into_iter().filter(|row| {
+                value_i64(row, "time").is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
+            }));
+            if page_len < LIMIT {
                 break;
             }
-            let next = last_time.saturating_add(1);
-            if next <= start_ms {
+            let next_page = page_number.saturating_add(1);
+            if next_page <= page_number {
                 return Err(ExchangeError::InvalidResponse {
                     exchange: EXCHANGE,
                     message: "income pagination did not advance".to_string(),
                 });
             }
-            start_ms = next;
+            page_number = next_page;
         }
-        dedup(&mut rows, &["tranId", "time", "symbol"]);
+        dedup(&mut rows, &["tranId"]);
+        rows.sort_by_key(|row| value_i64(row, "time").unwrap_or_default());
         Ok(rows)
     }
 
