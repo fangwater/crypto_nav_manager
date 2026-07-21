@@ -96,7 +96,16 @@ the registered `st_ms`; later runs use the latest database event time with a
 database cursor. Binance may still truncate online income history according to
 its server-side retention window, so compare the resulting minimum event time
 with `st_ms` before treating a backfill as complete. Repeating `--local-ip`
-provides an IP pool; the dispatcher accounts for request weight per IP.
+provides an IP pool; the dispatcher accounts for request weight per IP. After
+the database transaction commits, affected UTC days are atomically rewritten
+in the registered LiangTorch `funding_csv_dir` using its existing column
+format. Rebuild every daily CSV from PostgreSQL without calling Binance with:
+
+```bash
+cargo run --release --bin sync_binance_funding -- \
+  --strategy binance_fr_arb01 \
+  --export-csv-only
+```
 
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
