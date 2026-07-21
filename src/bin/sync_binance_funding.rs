@@ -1,19 +1,18 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
 use crypto_nav_manager::{
     exchange::binance::{BinanceAccountMode, BinanceClient, BinanceCredentials},
     models::TimeRange,
     rest_dispatcher::{Dispatcher, DispatcherConfig},
 };
-use serde::Serialize;
 use serde_json::Value;
 use sqlx::{
     AssertSqlSafe, PgPool, Postgres, QueryBuilder,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -31,7 +30,7 @@ struct Args {
     strategy: String,
 
     /// Source IP used for Binance REST requests. May be supplied more than once.
-    #[arg(long)]
+    #[arg(long, required = true)]
     local_ip: Vec<IpAddr>,
 
     /// Ignore the database cursor and request from the strategy's st_ms.
@@ -41,14 +40,6 @@ struct Args {
     /// Optional inclusive end timestamp. Defaults to the current time.
     #[arg(long)]
     end_ms: Option<i64>,
-
-    /// Export all stored rows to LiangTorch daily CSV files without calling Binance.
-    #[arg(long)]
-    export_csv_only: bool,
-
-    /// Overrides the strategy's registered LiangTorch funding CSV directory.
-    #[arg(long)]
-    csv_dir: Option<PathBuf>,
 
     /// Overrides CRYPTO_NAV_DATABASE_URL when provided.
     #[arg(long)]
@@ -60,8 +51,6 @@ struct StrategyStorage {
     schema: String,
     env_path: PathBuf,
     st_ms: i64,
-    funding_csv_dir: PathBuf,
-    funding_csv_account: String,
 }
 
 #[derive(Debug)]
@@ -83,27 +72,7 @@ async fn main() -> Result<()> {
         .run(&pool)
         .await
         .context("run PostgreSQL migrations")?;
-    let mut strategy = strategy_storage(&pool, &args.strategy).await?;
-    if let Some(csv_dir) = args.csv_dir {
-        strategy.funding_csv_dir = csv_dir;
-    }
-
-    if args.export_csv_only {
-        let rows = load_all_rows(&pool, &strategy.schema).await?;
-        let files = write_daily_csv(&strategy, &rows)?;
-        println!(
-            "CSV export complete: strategy={}, rows={}, files={}, directory={}",
-            args.strategy,
-            rows.len(),
-            files,
-            strategy.funding_csv_dir.display()
-        );
-        pool.close().await;
-        return Ok(());
-    }
-    if args.local_ip.is_empty() {
-        bail!("at least one --local-ip is required unless --export-csv-only is used");
-    }
+    let strategy = strategy_storage(&pool, &args.strategy).await?;
     let credentials = read_binance_credentials(&strategy.env_path)?;
     let latest_ms = latest_event_time(&pool, &strategy.schema).await?;
     let end_ms = args.end_ms.unwrap_or_else(now_ms);
@@ -149,15 +118,7 @@ async fn main() -> Result<()> {
 
     print_format(&rows);
     let affected = upsert_rows(&pool, &strategy.schema, &rows).await?;
-    let csv_rows = load_affected_days(&pool, &strategy.schema, &rows).await?;
-    let csv_files = write_daily_csv(&strategy, &csv_rows)?;
     print_progress(&pool, &strategy.schema, rows.len(), affected).await?;
-    println!(
-        "CSV refresh: rows={}, files={}, directory={}",
-        csv_rows.len(),
-        csv_files,
-        strategy.funding_csv_dir.display()
-    );
     pool.close().await;
     Ok(())
 }
@@ -183,34 +144,16 @@ async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
 }
 
 async fn strategy_storage(pool: &PgPool, slug: &str) -> Result<StrategyStorage> {
-    let row: Option<(
-        String,
-        String,
-        i64,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
-        "SELECT db_schema, env_path, st_ms, exchange, account_mode, host, \
-                funding_csv_dir, funding_csv_account \
+    let row: Option<(String, String, i64, String, String, String)> = sqlx::query_as(
+        "SELECT db_schema, env_path, st_ms, exchange, account_mode, host \
          FROM strategy_envs WHERE slug = $1",
     )
     .bind(slug)
     .fetch_optional(pool)
     .await
     .context("query strategy storage")?;
-    let (
-        schema,
-        env_path,
-        st_ms,
-        exchange,
-        account_mode,
-        host,
-        funding_csv_dir,
-        funding_csv_account,
-    ) = row.with_context(|| format!("strategy not found in strategy_envs: {slug}"))?;
+    let (schema, env_path, st_ms, exchange, account_mode, host) =
+        row.with_context(|| format!("strategy not found in strategy_envs: {slug}"))?;
     if exchange != "binance" || account_mode != "portfolio_margin" {
         bail!("strategy {slug} is not a Binance Portfolio Margin account");
     }
@@ -224,11 +167,6 @@ async fn strategy_storage(pool: &PgPool, slug: &str) -> Result<StrategyStorage> 
         schema,
         env_path: PathBuf::from(env_path),
         st_ms,
-        funding_csv_dir: PathBuf::from(
-            funding_csv_dir.context("strategy has no funding_csv_dir configured")?,
-        ),
-        funding_csv_account: funding_csv_account
-            .context("strategy has no funding_csv_account configured")?,
     })
 }
 
@@ -379,178 +317,6 @@ async fn upsert_rows(pool: &PgPool, schema: &str, rows: &[FundingRow]) -> Result
     }
     transaction.commit().await.context("commit funding sync")?;
     Ok(affected)
-}
-
-async fn load_all_rows(pool: &PgPool, schema: &str) -> Result<Vec<FundingRow>> {
-    load_rows(pool, schema, None).await
-}
-
-async fn load_affected_days(
-    pool: &PgPool,
-    schema: &str,
-    fetched: &[FundingRow],
-) -> Result<Vec<FundingRow>> {
-    let Some(first_day_ms) = fetched
-        .iter()
-        .map(|row| utc_day_start_ms(row.event_time_ms))
-        .min()
-    else {
-        return Ok(Vec::new());
-    };
-    let last_day_ms = fetched
-        .iter()
-        .map(|row| utc_day_start_ms(row.event_time_ms))
-        .max()
-        .expect("non-empty funding rows have a last day");
-    load_rows(
-        pool,
-        schema,
-        Some((
-            first_day_ms,
-            last_day_ms.saturating_add(24 * 60 * 60 * 1_000),
-        )),
-    )
-    .await
-}
-
-async fn load_rows(
-    pool: &PgPool,
-    schema: &str,
-    range: Option<(i64, i64)>,
-) -> Result<Vec<FundingRow>> {
-    let mut sql = format!(
-        "SELECT record_id, symbol, asset, COALESCE(raw->>'income', amount::text), \
-         CASE WHEN amount_usdt IS NULL THEN NULL ELSE COALESCE(raw->>'income', amount_usdt::text) END, \
-         event_time_ms, raw FROM {schema}.funding_fees"
-    );
-    if range.is_some() {
-        sql.push_str(" WHERE event_time_ms >= $1 AND event_time_ms < $2");
-    }
-    sql.push_str(" ORDER BY event_time_ms, record_id");
-    let rows: Vec<(
-        String,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        i64,
-        Value,
-    )> = if let Some((start_ms, end_ms)) = range {
-        sqlx::query_as(AssertSqlSafe(sql.as_str()))
-            .bind(start_ms)
-            .bind(end_ms)
-            .fetch_all(pool)
-            .await
-    } else {
-        sqlx::query_as(AssertSqlSafe(sql.as_str()))
-            .fetch_all(pool)
-            .await
-    }
-    .context("load stored funding rows for CSV")?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(record_id, symbol, asset, amount, amount_usdt, event_time_ms, raw)| FundingRow {
-                record_id,
-                symbol,
-                asset,
-                amount,
-                amount_usdt,
-                event_time_ms,
-                raw,
-            },
-        )
-        .collect())
-}
-
-fn write_daily_csv(strategy: &StrategyStorage, rows: &[FundingRow]) -> Result<usize> {
-    let mut daily = BTreeMap::<String, Vec<&FundingRow>>::new();
-    for row in rows {
-        let timestamp = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms)
-            .with_context(|| format!("invalid funding timestamp {}", row.event_time_ms))?;
-        daily
-            .entry(timestamp.format("%Y-%m-%d").to_string())
-            .or_default()
-            .push(row);
-    }
-    fs::create_dir_all(&strategy.funding_csv_dir).with_context(|| {
-        format!(
-            "create funding CSV directory {}",
-            strategy.funding_csv_dir.display()
-        )
-    })?;
-    let beijing = FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid offset");
-    for (date, rows) in &daily {
-        let path = strategy.funding_csv_dir.join(format!("{date}.csv"));
-        let temporary = path.with_extension(format!("csv.tmp.{}", std::process::id()));
-        let mut writer = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_path(&temporary)
-            .with_context(|| format!("create temporary CSV {}", temporary.display()))?;
-        writer.write_record([
-            "exchange",
-            "account",
-            "symbol",
-            "asset",
-            "amount",
-            "amountu",
-            "type",
-            "record_id",
-            "ts",
-            "dt_utc",
-            "dt_bj",
-            "raw",
-        ])?;
-        for row in rows {
-            let timestamp = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms)
-                .expect("funding timestamp was validated while grouping");
-            writer.serialize(LiangFundingCsvRow {
-                exchange: "binance",
-                account: &strategy.funding_csv_account,
-                symbol: row.symbol.as_deref().unwrap_or(""),
-                asset: &row.asset,
-                amount: &row.amount,
-                amountu: row.amount_usdt.as_deref().unwrap_or(""),
-                row_type: "FUNDING_FEE",
-                record_id: &row.record_id,
-                ts: row.event_time_ms,
-                dt_utc: timestamp.to_rfc3339_opts(SecondsFormat::Secs, false),
-                dt_bj: timestamp
-                    .with_timezone(&beijing)
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-                raw: serde_json::to_string(&row.raw).context("serialize funding raw JSON")?,
-            })?;
-        }
-        writer
-            .flush()
-            .with_context(|| format!("flush temporary CSV {}", temporary.display()))?;
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("replace funding CSV {}", path.display()))?;
-    }
-    Ok(daily.len())
-}
-
-#[derive(Serialize)]
-struct LiangFundingCsvRow<'a> {
-    exchange: &'static str,
-    account: &'a str,
-    symbol: &'a str,
-    asset: &'a str,
-    amount: &'a str,
-    amountu: &'a str,
-    #[serde(rename = "type")]
-    row_type: &'static str,
-    record_id: &'a str,
-    ts: i64,
-    dt_utc: String,
-    dt_bj: String,
-    raw: String,
-}
-
-fn utc_day_start_ms(timestamp_ms: i64) -> i64 {
-    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
-    timestamp_ms.div_euclid(DAY_MS) * DAY_MS
 }
 
 fn print_format(rows: &[FundingRow]) {

@@ -1,3 +1,4 @@
 /target
+/funding_*.csv
 /data/*.db*
 /data/*.sqlite*
