@@ -1,0 +1,26 @@
+[Unit]
+Description=Crypto NAV Manager API
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crypto_nav_manager
+ExecStart=/home/ubuntu/crypto_nav_manager/target/release/crypto_nav_manager
+Environment=CRYPTO_NAV_BIND=127.0.0.1:4200
+Environment=RUST_LOG=crypto_nav_manager=info,tower_http=info
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
