@@ -1,4 +1,7 @@
-use crate::pnl::{self, PnlCalculation, PnlSourceKind};
+use crate::{
+    contract_multipliers,
+    pnl::{self, PnlCalculation, PnlSourceKind},
+};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -141,6 +144,7 @@ pub async fn run() -> Result<()> {
         .run(&pool)
         .await
         .context("run PostgreSQL migrations")?;
+    contract_multipliers::spawn(pool.clone());
 
     let app = Router::new()
         .route("/api/health", get(health))

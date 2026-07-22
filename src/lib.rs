@@ -1,3 +1,4 @@
+pub mod contract_multipliers;
 pub mod exchange;
 pub mod fee_rate_store;
 pub mod fifo_pnl;
