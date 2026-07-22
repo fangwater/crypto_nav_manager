@@ -65,6 +65,39 @@ pub(crate) fn normalize_bitget(
         .collect()
 }
 
+pub(crate) fn normalize_bybit(
+    raw_rows: Vec<Value>,
+    market: &str,
+    instrument: Option<&str>,
+    fetched_at_ms: i64,
+) -> Result<Vec<TradingFeeRate>, ExchangeError> {
+    if raw_rows.is_empty() {
+        return Err(invalid("bybit", "fee-rate response contains no fee rates"));
+    }
+
+    raw_rows
+        .into_iter()
+        .map(|raw| {
+            let row_instrument = optional_string(&raw, "symbol")
+                .or_else(|| optional_string(&raw, "baseCoin"))
+                .or_else(|| instrument.map(str::to_string))
+                .unwrap_or_else(|| "*".to_string());
+            Ok(TradingFeeRate {
+                exchange: "bybit".to_string(),
+                account_mode: "unified".to_string(),
+                market: market.to_string(),
+                instrument: row_instrument,
+                maker_rate: required_string("bybit", &raw, "makerFeeRate")?,
+                taker_rate: required_string("bybit", &raw, "takerFeeRate")?,
+                fee_tier: None,
+                fee_group: None,
+                effective_at_ms: fetched_at_ms,
+                raw,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn normalize_okx(
     raw_rows: Vec<Value>,
     market: &str,
@@ -239,6 +272,27 @@ mod tests {
 
         assert_eq!(rows[0].maker_rate, "-0.00004");
         assert_eq!(rows[0].taker_rate, "0.00023");
+    }
+
+    #[test]
+    fn normalizes_bybit_rate() {
+        let rows = normalize_bybit(
+            vec![json!({
+                "symbol": "BTCUSDT",
+                "makerFeeRate": "0.0001",
+                "takerFeeRate": "0.0006"
+            })],
+            "linear",
+            None,
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(rows[0].exchange, "bybit");
+        assert_eq!(rows[0].account_mode, "unified");
+        assert_eq!(rows[0].instrument, "BTCUSDT");
+        assert_eq!(rows[0].maker_rate, "0.0001");
+        assert_eq!(rows[0].taker_rate, "0.0006");
     }
 
     #[test]

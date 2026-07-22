@@ -3,6 +3,7 @@ use crypto_nav_manager::{
     exchange::{
         binance::{BinanceAccountMode, BinanceClient, BinanceCredentials},
         bitget::{BitgetClient, BitgetCredentials},
+        bybit::{BybitCategory, BybitClient, BybitCredentials},
         gate::{GateClient, GateCredentials, GateFeeMarket},
         okx::{OkxClient, OkxCredentials, OkxInstrumentType},
     },
@@ -21,6 +22,7 @@ enum Exchange {
     BinancePortfolioMargin,
     Gate,
     Bitget,
+    Bybit,
     Okx,
 }
 
@@ -30,6 +32,7 @@ impl Exchange {
             Self::BinanceUsdm | Self::BinancePortfolioMargin => "binance",
             Self::Gate => "gate",
             Self::Bitget => "bitget",
+            Self::Bybit => "bybit",
             Self::Okx => "okx",
         }
     }
@@ -159,6 +162,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_value(
                     client
                         .fee_rates(ProductCategory::UsdtFutures, &args.symbol)
+                        .await?,
+                )?
+            }
+        }
+        Exchange::Bybit => {
+            let client = BybitClient::new(
+                dispatcher,
+                BybitCredentials::new(
+                    required_env("BYBIT_API_KEY")?,
+                    required_env("BYBIT_API_SECRET")?,
+                ),
+            );
+            if args.raw {
+                Value::Array(
+                    client
+                        .raw_fee_rates(BybitCategory::Linear, Some(&args.symbol))
+                        .await?,
+                )
+            } else {
+                serde_json::to_value(
+                    client
+                        .fee_rates(BybitCategory::Linear, Some(&args.symbol))
                         .await?,
                 )?
             }
