@@ -9,6 +9,7 @@ use crypto_nav_manager::{
     fee_rate_store::store_trading_fee_rates,
     models::{ProductCategory, TradingFeeRate},
     rest_dispatcher::{Dispatcher, DispatcherConfig},
+    rest_ip_pool::configured_or_exchange_local_ips,
 };
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -23,14 +24,26 @@ enum Exchange {
     Okx,
 }
 
+impl Exchange {
+    fn rest_name(self) -> &'static str {
+        match self {
+            Self::BinanceUsdm | Self::BinancePortfolioMargin => "binance",
+            Self::Gate => "gate",
+            Self::Bitget => "bitget",
+            Self::Okx => "okx",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Probe one exchange account's normalized trading fee rates")]
 struct Args {
     #[arg(long, value_enum)]
     exchange: Exchange,
 
+    /// Override the PostgreSQL-selected source IP. May be supplied more than once.
     #[arg(long)]
-    local_ip: IpAddr,
+    local_ip: Vec<IpAddr>,
 
     #[arg(long, default_value = "BTCUSDT")]
     symbol: String,
@@ -60,8 +73,29 @@ fn required_env(name: &'static str) -> Result<String, Box<dyn std::error::Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let options = match env::var("CRYPTO_NAV_DATABASE_URL") {
+        Ok(url) => url.parse::<PgConnectOptions>()?,
+        Err(env::VarError::NotPresent) => PgConnectOptions::new()
+            .host("/var/run/postgresql")
+            .username("ubuntu")
+            .database("crypto_nav_manager"),
+        Err(error) => return Err(error.into()),
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    let local_ips =
+        configured_or_exchange_local_ips(&pool, args.exchange.rest_name(), args.local_ip).await?;
+    eprintln!(
+        "exchange={} REST source IPs: {:?}",
+        args.exchange.rest_name(),
+        local_ips
+    );
     let dispatcher = Dispatcher::new(DispatcherConfig {
-        local_ips: vec![args.local_ip],
+        local_ips,
         ..DispatcherConfig::default()
     })?;
 
@@ -156,23 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(schema) = &args.db_schema {
         let rates: Vec<TradingFeeRate> = serde_json::from_value(value.clone())?;
-        let options = match env::var("CRYPTO_NAV_DATABASE_URL") {
-            Ok(url) => url.parse::<PgConnectOptions>()?,
-            Err(env::VarError::NotPresent) => PgConnectOptions::new()
-                .host("/var/run/postgresql")
-                .username("ubuntu")
-                .database("crypto_nav_manager"),
-            Err(error) => return Err(error.into()),
-        };
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
         let stored = store_trading_fee_rates(&pool, schema, &rates).await?;
-        pool.close().await;
         eprintln!("stored_rows={stored} schema={schema}");
     }
 
     println!("{}", serde_json::to_string_pretty(&value)?);
+    pool.close().await;
     Ok(())
 }

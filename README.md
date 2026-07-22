@@ -29,6 +29,38 @@ The listed IPs must already exist on a local network interface and have valid
 routes. Binding a source IP does not create extra public IPs by itself; outbound
 NAT must map them to distinct public addresses for IP-based exchange limits.
 
+## Exchange-aware source IPs
+
+PostgreSQL keeps the startup configuration in two tables:
+
+- `rest_egress_ips` lists source IPs that REST clients may bind.
+- `rest_egress_ip_envs` records only `IP + env + exchange` occupancy. It
+  intentionally does not store component names or PIDs.
+
+An exchange command reads the tables once before constructing its `Dispatcher`.
+It excludes every IP occupied by an env on the same exchange, then keeps the
+result as an in-memory pool for the lifetime of the process. Database changes
+take effect only after that process restarts. With the seeded snapshot, Binance
+uses `.232/.233/.234`, Gate uses `.229/.230/.234`, and Bybit can use all
+seven local IPs because its envs run on another host.
+
+Update occupancy with ordinary PostgreSQL statements. For example:
+
+```sql
+INSERT INTO rest_egress_ip_envs (ip, env, exchange)
+VALUES ('172.31.35.234', 'binance_example', 'binance')
+ON CONFLICT (ip, env) DO UPDATE
+SET exchange = EXCLUDED.exchange,
+    updated_at = CURRENT_TIMESTAMP;
+
+DELETE FROM rest_egress_ip_envs
+WHERE ip = '172.31.35.234'
+  AND env = 'binance_example';
+```
+
+The `--local-ip` option remains an explicit startup override for diagnostics
+and emergencies; when supplied, the program does not query the exchange pool.
+
 ## Account modes
 
 - Binance USD-M Futures
@@ -84,9 +116,7 @@ Sync Binance Portfolio Margin UM funding income with:
 
 ```bash
 cargo run --release --bin sync_binance_funding -- \
-  --strategy binance_fr_arb01 \
-  --local-ip 172.31.35.234 \
-  --local-ip 172.31.35.233
+  --strategy binance_fr_arb01
 ```
 
 The command loads the strategy's credentials from its registered `env_path`
@@ -95,8 +125,9 @@ the registered `st_ms`; later runs use the latest database event time with a
 24-hour overlap and idempotent `tranId` upserts. Pass `--full` to ignore the
 database cursor. Binance may still truncate online income history according to
 its server-side retention window, so compare the resulting minimum event time
-with `st_ms` before treating a backfill as complete. Repeating `--local-ip`
-provides an IP pool; the dispatcher accounts for request weight per IP. This
+with `st_ms` before treating a backfill as complete. By default it loads the
+Binance-safe IP pool once from PostgreSQL at startup; repeating `--local-ip`
+overrides that pool. The dispatcher accounts for request weight per IP. This
 command only writes PostgreSQL and never writes CSV files.
 
 Export one strategy's stored funding history from PostgreSQL with:

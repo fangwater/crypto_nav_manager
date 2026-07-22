@@ -5,6 +5,7 @@ use crypto_nav_manager::{
     exchange::binance::{BinanceAccountMode, BinanceClient, BinanceCredentials},
     models::TimeRange,
     rest_dispatcher::{Dispatcher, DispatcherConfig},
+    rest_ip_pool::configured_or_exchange_local_ips,
 };
 use serde_json::Value;
 use sqlx::{
@@ -29,8 +30,8 @@ struct Args {
     #[arg(long)]
     strategy: String,
 
-    /// Source IP used for Binance REST requests. May be supplied more than once.
-    #[arg(long, required = true)]
+    /// Override the PostgreSQL-selected source IP. May be supplied more than once.
+    #[arg(long)]
     local_ip: Vec<IpAddr>,
 
     /// Ignore the database cursor and request from the strategy's st_ms.
@@ -97,8 +98,13 @@ async fn main() -> Result<()> {
         format_timestamp(latest_ms)
     );
 
+    let local_ips = configured_or_exchange_local_ips(&pool, "binance", args.local_ip)
+        .await
+        .context("select Binance REST source IPs")?;
+    println!("REST source IPs: {:?}", local_ips);
+
     let dispatcher = Dispatcher::new(DispatcherConfig {
-        local_ips: args.local_ip,
+        local_ips,
         ..DispatcherConfig::default()
     })
     .context("create Binance REST dispatcher")?;
