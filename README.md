@@ -112,23 +112,27 @@ ORDER BY ts DESC, id DESC
 LIMIT 1;
 ```
 
-Sync Binance Portfolio Margin UM funding income with:
+Sync any registered FR, intra, or market-making strategy with the unified
+history command:
 
 ```bash
-cargo run --release --bin sync_binance_funding -- \
-  --strategy binance_fr_arb01
+# First scan of an empty dataset.
+cargo run --release --bin sync_history -- \
+  --strategy binance_fr_arb01 \
+  --full \
+  --symbol BTCUSDT
+
+# Subsequent incremental scan.
+cargo run --release --bin sync_history -- \
+  --strategy binance_fr_arb01 \
+  --symbol BTCUSDT
 ```
 
-The command loads the strategy's credentials from its registered `env_path`
-and writes to its own `funding_fees` table. With an empty table it starts at
-the registered `st_ms`; later runs use the latest database event time with a
-24-hour overlap and idempotent `tranId` upserts. Pass `--full` to ignore the
-database cursor. Binance may still truncate online income history according to
-its server-side retention window, so compare the resulting minimum event time
-with `st_ms` before treating a backfill as complete. By default it loads the
-Binance-safe IP pool once from PostgreSQL at startup; repeating `--local-ip`
-overrides that pool. The dispatcher accounts for request weight per IP. This
-command only writes PostgreSQL and never writes CSV files.
+The command infers the exchange, account mode, and strategy class from
+`strategy_envs`. Incremental scans overlap the last successful scan by 30
+minutes and upsert with exchange-native record IDs. Market-making strategies
+and Binance intra strategies do not query interest. Repeat `--strategy` to
+scan multiple accounts in one invocation.
 
 Export one strategy's stored funding history from PostgreSQL with:
 
