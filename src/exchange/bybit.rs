@@ -140,7 +140,7 @@ impl BybitClient {
         rows.retain(|row| {
             value_i64(row, "execTime").is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
         });
-        dedup(&mut rows, &["execId", "orderId", "symbol"]);
+        dedup(&mut rows, &["category", "symbol", "execId"]);
         sort_by_keys(&mut rows, &["execTime"]);
         Ok(rows)
     }
@@ -541,5 +541,26 @@ mod tests {
         assert!(!is_liquidation_order(
             &serde_json::json!({"createType": "CreateByAdl_PassThrough"})
         ));
+    }
+
+    #[test]
+    fn trade_dedup_keeps_distinct_executions_from_the_same_order() {
+        let mut rows = vec![
+            serde_json::json!({
+                "category": "linear", "symbol": "BTCUSDT",
+                "execId": "fill-1", "orderId": "order-9"
+            }),
+            serde_json::json!({
+                "category": "linear", "symbol": "BTCUSDT",
+                "execId": "fill-2", "orderId": "order-9"
+            }),
+            serde_json::json!({
+                "category": "linear", "symbol": "BTCUSDT",
+                "execId": "fill-1", "orderId": "order-9"
+            }),
+        ];
+
+        dedup(&mut rows, &["category", "symbol", "execId"]);
+        assert_eq!(rows.len(), 2);
     }
 }

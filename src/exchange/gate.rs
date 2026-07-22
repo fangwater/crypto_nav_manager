@@ -139,7 +139,7 @@ impl GateClient {
                 page = page.saturating_add(1);
             }
         }
-        dedup(&mut rows, &["id", "order_id", "currency_pair"]);
+        dedup(&mut rows, &["currency_pair", "id"]);
         sort_by_timestamp(&mut rows);
         Ok(rows)
     }
@@ -169,7 +169,7 @@ impl GateClient {
                 offset = offset.saturating_add(1_000);
             }
         }
-        dedup(&mut rows, &["trade_id", "order_id", "contract"]);
+        dedup(&mut rows, &["contract", "trade_id"]);
         sort_by_timestamp(&mut rows);
         Ok(rows)
     }
@@ -654,5 +654,24 @@ mod tests {
             },
         );
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn trade_dedup_separates_markets_and_keeps_partial_fills() {
+        let mut spot = vec![
+            serde_json::json!({"currency_pair": "BTC_USDT", "id": "1", "order_id": "9"}),
+            serde_json::json!({"currency_pair": "BTC_USDT", "id": "2", "order_id": "9"}),
+            serde_json::json!({"currency_pair": "BTC_USDT", "id": "1", "order_id": "9"}),
+        ];
+        dedup(&mut spot, &["currency_pair", "id"]);
+        assert_eq!(spot.len(), 2);
+
+        let mut futures = vec![
+            serde_json::json!({"contract": "BTC_USDT", "trade_id": "1", "order_id": "9"}),
+            serde_json::json!({"contract": "BTC_USDT", "trade_id": "2", "order_id": "9"}),
+            serde_json::json!({"contract": "BTC_USDT", "trade_id": "1", "order_id": "9"}),
+        ];
+        dedup(&mut futures, &["contract", "trade_id"]);
+        assert_eq!(futures.len(), 2);
     }
 }

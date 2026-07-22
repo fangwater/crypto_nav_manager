@@ -157,7 +157,7 @@ impl OkxClient {
             }
             after = next;
         }
-        dedup(&mut rows, &["tradeId", "ordId", "instId"]);
+        dedup(&mut rows, &["instType", "instId", "tradeId"]);
         sort_by_ts(&mut rows);
         Ok(rows)
     }
@@ -680,5 +680,26 @@ mod tests {
     #[test]
     fn liquidation_history_uses_full_and_partial_close_types() {
         assert_eq!(LIQUIDATION_CLOSE_TYPES, ["3", "4"]);
+    }
+
+    #[test]
+    fn fill_dedup_keeps_distinct_trades_from_the_same_order() {
+        let mut rows = vec![
+            serde_json::json!({
+                "instType": "SWAP", "instId": "BTC-USDT-SWAP",
+                "tradeId": "1", "ordId": "9"
+            }),
+            serde_json::json!({
+                "instType": "SWAP", "instId": "BTC-USDT-SWAP",
+                "tradeId": "2", "ordId": "9"
+            }),
+            serde_json::json!({
+                "instType": "SWAP", "instId": "BTC-USDT-SWAP",
+                "tradeId": "1", "ordId": "9"
+            }),
+        ];
+
+        dedup(&mut rows, &["instType", "instId", "tradeId"]);
+        assert_eq!(rows.len(), 2);
     }
 }

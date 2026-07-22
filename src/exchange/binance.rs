@@ -423,7 +423,7 @@ impl BinanceClient {
                 from_id = Some(last_id.saturating_add(1));
             }
         }
-        dedup(&mut all_rows, &["id", "orderId", "symbol"]);
+        dedup(&mut all_rows, &["symbol", "id"]);
         all_rows.sort_by_key(|row| value_i64(row, "time").unwrap_or_default());
         Ok(all_rows)
     }
@@ -656,5 +656,17 @@ mod tests {
                 end_ms: 199
             }
         );
+    }
+
+    #[test]
+    fn trade_dedup_keeps_distinct_fills_from_the_same_order() {
+        let mut rows = vec![
+            serde_json::json!({"symbol": "BTCUSDT", "id": 1, "orderId": 9}),
+            serde_json::json!({"symbol": "BTCUSDT", "id": 2, "orderId": 9}),
+            serde_json::json!({"symbol": "BTCUSDT", "id": 1, "orderId": 9}),
+        ];
+
+        dedup(&mut rows, &["symbol", "id"]);
+        assert_eq!(rows.len(), 2);
     }
 }
