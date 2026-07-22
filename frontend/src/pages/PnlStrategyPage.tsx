@@ -63,7 +63,6 @@ const marketMakingPositionSeriesOptions = positionSeriesOptions
 
 function kindLabel(kind: Strategy['strategyKind']) {
   if (kind === 'funding_rate') return '资金费套利'
-  if (kind === 'cta') return 'CTA'
   if (kind === 'market_making') return '做市'
   return '所内套利'
 }

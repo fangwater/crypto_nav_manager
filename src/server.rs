@@ -321,6 +321,7 @@ async fn get_strategy_pnl(
         inputs,
         PnlCalculation {
             source,
+            exchange: strategy.exchange,
             strategy_start_ms: strategy.st_ms,
             start_ms,
             end_ms,

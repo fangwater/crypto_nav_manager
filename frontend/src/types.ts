@@ -4,7 +4,7 @@ export interface Strategy {
   displayName: string
   dbSchema: string
   host: string
-  strategyKind: 'funding_rate' | 'intra_exchange' | 'market_making' | 'cta'
+  strategyKind: 'funding_rate' | 'intra_exchange' | 'market_making'
   exchange: 'binance' | 'bybit' | 'gate' | 'bitget' | 'okx'
   accountMode: string
   envPath: string

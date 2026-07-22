@@ -12,33 +12,39 @@ const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PnlSourceKind {
-    BybitLiang,
+    Intra,
+    FundingRate,
     MarketMaking,
 }
 
 impl PnlSourceKind {
     pub fn for_strategy(strategy_kind: &str, exchange: &str, account_mode: &str) -> Option<Self> {
         match (strategy_kind, exchange, account_mode) {
-            ("market_making", "bybit" | "binance" | "gate" | "okx", _) => Some(Self::MarketMaking),
-            (_, "bybit", "unified") => Some(Self::BybitLiang),
+            ("intra_exchange", "bybit" | "gate", "unified") => Some(Self::Intra),
+            ("funding_rate", "bybit" | "gate", "unified") => Some(Self::FundingRate),
+            ("market_making", "binance", "usdm_futures")
+            | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
             _ => None,
         }
     }
 
     fn adapter_name(self) -> &'static str {
         match self {
-            Self::BybitLiang => "bybit_liang_trades_v1",
+            Self::Intra | Self::FundingRate => "spot_swap_history_v1",
             Self::MarketMaking => "market_making_futures_v1",
         }
     }
 
-    fn interest_included(self) -> bool {
-        matches!(self, Self::BybitLiang)
+    fn interest_included(self, exchange: &str) -> bool {
+        matches!(
+            (self, exchange),
+            (Self::Intra | Self::FundingRate, "bybit" | "gate")
+        )
     }
 
     fn exposure(self, spot_position_usdt: f64, futures_position_usdt: f64) -> f64 {
         match self {
-            Self::BybitLiang => spot_position_usdt + futures_position_usdt,
+            Self::Intra | Self::FundingRate => spot_position_usdt + futures_position_usdt,
             Self::MarketMaking => futures_position_usdt.abs(),
         }
     }
@@ -85,6 +91,7 @@ pub struct PnlInputs {
 #[derive(Clone, Debug)]
 pub struct PnlCalculation {
     pub source: PnlSourceKind,
+    pub exchange: String,
     pub strategy_start_ms: i64,
     pub start_ms: i64,
     pub end_ms: i64,
@@ -331,13 +338,14 @@ pub async fn load_inputs(
     end_ms: i64,
 ) -> Result<PnlInputs> {
     validate_identifier(schema)?;
-    match source {
-        PnlSourceKind::BybitLiang => {
-            load_bybit_liang_inputs(pool, schema, strategy_start_ms, end_ms).await
+    match (source, exchange) {
+        (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate") => {
+            load_spot_swap_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
         }
-        PnlSourceKind::MarketMaking => {
+        (PnlSourceKind::MarketMaking, exchange) => {
             load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
         }
+        _ => bail!("unsupported PnL source {source:?} for exchange {exchange}"),
     }
 }
 
@@ -548,7 +556,7 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
             returned_points,
             returned_symbol_points,
             sampled: returned_points < original_points || sampled_symbol_points,
-            interest_included: request.source.interest_included(),
+            interest_included: request.source.interest_included(&request.exchange),
         },
     })
 }
@@ -734,7 +742,7 @@ fn validate_identifier(value: &str) -> Result<()> {
 }
 
 #[derive(Debug, FromRow)]
-struct BybitTradeRow {
+struct SpotSwapTradeRow {
     key: String,
     symbol: String,
     side: String,
@@ -746,14 +754,14 @@ struct BybitTradeRow {
 }
 
 #[derive(Debug, FromRow)]
-struct BybitFundingRow {
+struct SpotSwapFundingRow {
     symbol: String,
     funding: f64,
     ts: i64,
 }
 
 #[derive(Debug, FromRow)]
-struct BybitInterestRow {
+struct SpotSwapInterestRow {
     currency: String,
     interest: f64,
     ts: i64,
@@ -890,12 +898,18 @@ fn market_making_amount_u(
     Ok(amount_u)
 }
 
-async fn load_bybit_liang_inputs(
+async fn load_spot_swap_inputs(
     pool: &PgPool,
     schema: &str,
+    exchange: &str,
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
+    let (spot_key, futures_key) = match exchange {
+        "bybit" => ("bybitspot", "bybitswap"),
+        "gate" => ("gatespot", "gateswap"),
+        _ => bail!("unsupported spot/swap PnL exchange {exchange}"),
+    };
     let trade_sql = format!(
         r#"SELECT key, symbol, side, price::float8 AS price,
                   amountu::float8 AS amount_u, fees::float8 AS fee,
@@ -918,12 +932,12 @@ async fn load_bybit_liang_inputs(
            ORDER BY "transactionTime", currency, id"#
     );
 
-    let rows = sqlx::query_as::<_, BybitTradeRow>(AssertSqlSafe(trade_sql))
+    let rows = sqlx::query_as::<_, SpotSwapTradeRow>(AssertSqlSafe(trade_sql))
         .bind(strategy_start_ms)
         .bind(end_ms)
         .fetch_all(pool)
         .await
-        .with_context(|| format!("load trades from {schema}"))?;
+        .with_context(|| format!("load {exchange} trades from {schema}"))?;
     let mut trades = Vec::with_capacity(rows.len());
     let mut last_spot_prices = HashMap::new();
     for row in rows {
@@ -933,7 +947,7 @@ async fn load_bybit_liang_inputs(
             _ => bail!("unsupported trade side {:?}", row.side),
         };
         let symbol = row.symbol.to_ascii_uppercase();
-        if row.key == "bybitspot" {
+        if row.key == spot_key {
             last_spot_prices.insert(symbol.clone(), row.price);
         }
         let commission_asset = row.commission_asset.to_ascii_uppercase();
@@ -946,9 +960,9 @@ async fn load_bybit_liang_inputs(
             None
         };
         let leg = match row.key.as_str() {
-            "bybitspot" => PositionLeg::Spot,
-            "bybitswap" => PositionLeg::Futures,
-            _ => bail!("unsupported Bybit trade key {:?}", row.key),
+            key if key == spot_key => PositionLeg::Spot,
+            key if key == futures_key => PositionLeg::Futures,
+            _ => bail!("unsupported {exchange} trade key {:?}", row.key),
         };
         trades.push(NormalizedTrade {
             symbol,
@@ -961,12 +975,12 @@ async fn load_bybit_liang_inputs(
         });
     }
 
-    let funding = sqlx::query_as::<_, BybitFundingRow>(AssertSqlSafe(funding_sql))
+    let funding = sqlx::query_as::<_, SpotSwapFundingRow>(AssertSqlSafe(funding_sql))
         .bind(strategy_start_ms)
         .bind(end_ms)
         .fetch_all(pool)
         .await
-        .with_context(|| format!("load funding from {schema}"))?
+        .with_context(|| format!("load {exchange} funding from {schema}"))?
         .into_iter()
         .map(|row| FundingEvent {
             symbol: row.symbol.to_ascii_uppercase(),
@@ -975,12 +989,12 @@ async fn load_bybit_liang_inputs(
         })
         .collect();
 
-    let interest = sqlx::query_as::<_, BybitInterestRow>(AssertSqlSafe(interest_sql))
+    let interest = sqlx::query_as::<_, SpotSwapInterestRow>(AssertSqlSafe(interest_sql))
         .bind(strategy_start_ms)
         .bind(end_ms)
         .fetch_all(pool)
         .await
-        .with_context(|| format!("load interest from {schema}"))?
+        .with_context(|| format!("load {exchange} interest from {schema}"))?
         .into_iter()
         .map(|row| {
             let currency = row.currency.to_ascii_uppercase();
@@ -1037,7 +1051,8 @@ mod tests {
 
     fn request(start_ms: i64, end_ms: i64) -> PnlCalculation {
         PnlCalculation {
-            source: PnlSourceKind::BybitLiang,
+            source: PnlSourceKind::Intra,
+            exchange: "bybit".to_string(),
             strategy_start_ms: 1_000,
             start_ms,
             end_ms,
@@ -1154,5 +1169,27 @@ mod tests {
             market_making_amount_u("bybit", 100.0, 5.0, None, Some(99.0)).unwrap(),
             500.0
         );
+    }
+
+    #[test]
+    fn matches_supported_spot_swap_strategy_pairs() {
+        assert_eq!(
+            PnlSourceKind::for_strategy("intra_exchange", "bybit", "unified"),
+            Some(PnlSourceKind::Intra)
+        );
+        assert_eq!(
+            PnlSourceKind::for_strategy("intra_exchange", "gate", "unified"),
+            Some(PnlSourceKind::Intra)
+        );
+        assert_eq!(
+            PnlSourceKind::for_strategy("funding_rate", "gate", "unified"),
+            Some(PnlSourceKind::FundingRate)
+        );
+        assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
+        assert_eq!(
+            PnlSourceKind::FundingRate.adapter_name(),
+            "spot_swap_history_v1"
+        );
+        assert!(PnlSourceKind::FundingRate.interest_included("gate"));
     }
 }

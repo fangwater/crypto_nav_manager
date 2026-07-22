@@ -659,7 +659,7 @@ async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
     }
     let class = match kind.as_str() {
         "funding_rate" => StrategyClass::Fr,
-        "intra_exchange" | "cta" => StrategyClass::Intra,
+        "intra_exchange" => StrategyClass::Intra,
         "market_making" => StrategyClass::Mm,
         value => bail!("unsupported strategy kind for {slug}: {value}"),
     };

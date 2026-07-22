@@ -93,7 +93,9 @@ export function StrategyPage() {
               <p>
                 {strategy.strategyKind === 'funding_rate'
                   ? '资金费套利'
-                  : '所内套利'}
+                  : strategy.strategyKind === 'market_making'
+                    ? '做市'
+                    : '所内套利'}
               </p>
               <h1>{strategy.displayName}</h1>
             </div>

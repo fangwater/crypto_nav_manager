@@ -64,7 +64,7 @@ VALUES
         'bybit-intra-arb02', 'bybit cta', 'bybit_intra_arb02', 'sg',
         '/home/ubuntu/bybit-intra-arb02/env.sh',
         '/home/ubuntu/liang_torch/binance_fr/bybit_spot_swap_cta01',
-        'bybit', 'unified', 'cta',
+        'bybit', 'unified', 'intra_exchange',
         '["BYBIT_API_KEY", "BYBIT_API_SECRET"]'::jsonb,
         '/intra/bybit-intra-arb02/config', 50
     ),

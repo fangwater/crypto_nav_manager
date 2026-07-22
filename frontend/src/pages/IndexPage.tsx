@@ -10,12 +10,13 @@ import { Link } from 'react-router-dom'
 import { getStrategies } from '../api'
 import type { Strategy } from '../types'
 
-type Filter = 'all' | 'funding_rate' | 'intra_exchange'
+type Filter = 'all' | 'funding_rate' | 'intra_exchange' | 'market_making'
 
 const filters: Array<{ value: Filter; label: string }> = [
   { value: 'all', label: '全部' },
   { value: 'funding_rate', label: '资金费' },
   { value: 'intra_exchange', label: '所内套利' },
+  { value: 'market_making', label: '做市' },
 ]
 
 function modeLabel(mode: string) {
@@ -32,7 +33,9 @@ function modeLabel(mode: string) {
 }
 
 function kindLabel(kind: Strategy['strategyKind']) {
-  return kind === 'funding_rate' ? '资金费套利' : '所内套利'
+  if (kind === 'funding_rate') return '资金费套利'
+  if (kind === 'market_making') return '做市'
+  return '所内套利'
 }
 
 export function IndexPage() {
