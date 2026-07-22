@@ -312,6 +312,7 @@ async fn get_strategy_pnl(
         &state.pool,
         source,
         &strategy.db_schema,
+        &strategy.exchange,
         strategy.st_ms,
         end_ms,
     )

@@ -9,8 +9,8 @@ use reqwest::{
     header::{HeaderName, HeaderValue},
 };
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, QueryBuilder};
-use std::time::Duration;
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
+use std::{collections::HashMap, time::Duration};
 use tracing::{error, info};
 
 const MARKET: &str = "usdt_futures";
@@ -29,6 +29,112 @@ struct ContractSpec {
     contract_factor: String,
     status: Option<String>,
     raw: Value,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MultiplierSnapshot {
+    effective_at_ms: i64,
+    multiplier: f64,
+}
+
+#[derive(Debug, FromRow)]
+struct MultiplierRow {
+    symbol: String,
+    contract_multiplier: f64,
+    effective_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContractMultiplierBook {
+    exchange: String,
+    by_symbol: HashMap<String, Vec<MultiplierSnapshot>>,
+}
+
+impl ContractMultiplierBook {
+    pub async fn load(pool: &PgPool, exchange: &str) -> Result<Self> {
+        if !matches!(exchange, "gate" | "okx") {
+            bail!("contract multipliers are not supported for exchange {exchange}");
+        }
+
+        let rows = sqlx::query_as::<_, MultiplierRow>(
+            r#"SELECT symbol, contract_multiplier::float8 AS contract_multiplier,
+                      effective_at_ms
+               FROM contract_multipliers
+               WHERE exchange = $1 AND market = $2
+               ORDER BY symbol, effective_at_ms"#,
+        )
+        .bind(exchange)
+        .bind(MARKET)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load {exchange} contract multipliers"))?;
+        Self::from_rows(exchange, rows)
+    }
+
+    fn from_rows(exchange: &str, rows: Vec<MultiplierRow>) -> Result<Self> {
+        if rows.is_empty() {
+            bail!("no contract multipliers found for {exchange}/{MARKET}");
+        }
+
+        let mut by_symbol: HashMap<String, Vec<MultiplierSnapshot>> = HashMap::new();
+        for row in rows {
+            if !row.contract_multiplier.is_finite() || row.contract_multiplier <= 0.0 {
+                bail!(
+                    "invalid {exchange} contract multiplier for {} at {}: {}",
+                    row.symbol,
+                    row.effective_at_ms,
+                    row.contract_multiplier
+                );
+            }
+            let snapshots = by_symbol
+                .entry(row.symbol.to_ascii_uppercase())
+                .or_default();
+            if let Some(previous) = snapshots.last()
+                && previous.effective_at_ms == row.effective_at_ms
+            {
+                if previous.multiplier != row.contract_multiplier {
+                    bail!(
+                        "conflicting {exchange} contract multipliers for {} at {}",
+                        row.symbol,
+                        row.effective_at_ms
+                    );
+                }
+                continue;
+            }
+            snapshots.push(MultiplierSnapshot {
+                effective_at_ms: row.effective_at_ms,
+                multiplier: row.contract_multiplier,
+            });
+        }
+
+        Ok(Self {
+            exchange: exchange.to_string(),
+            by_symbol,
+        })
+    }
+
+    pub fn multiplier_at(&self, symbol: &str, trade_ts: i64) -> Result<f64> {
+        let symbol = symbol.to_ascii_uppercase();
+        let snapshots = self.by_symbol.get(&symbol).with_context(|| {
+            format!(
+                "missing {} contract multiplier for {symbol} at {trade_ts}",
+                self.exchange
+            )
+        })?;
+        let index = snapshots.partition_point(|snapshot| snapshot.effective_at_ms <= trade_ts);
+        let snapshot = if index == 0 {
+            snapshots.first()
+        } else {
+            snapshots.get(index - 1)
+        }
+        .with_context(|| {
+            format!(
+                "missing {} contract multiplier snapshot for {symbol} at {trade_ts}",
+                self.exchange
+            )
+        })?;
+        Ok(snapshot.multiplier)
+    }
 }
 
 pub fn spawn(pool: PgPool) {
@@ -404,5 +510,35 @@ mod tests {
         assert_eq!(normalize_symbol("BTC-USDT").unwrap(), "BTCUSDT");
         assert_eq!(normalize_symbol("币安人生_USDT").unwrap(), "币安人生USDT");
         assert!(normalize_symbol("BTC;DROP").is_err());
+    }
+
+    #[test]
+    fn selects_multiplier_snapshot_for_trade_time() {
+        let book = ContractMultiplierBook::from_rows(
+            "gate",
+            vec![
+                MultiplierRow {
+                    symbol: "BTCUSDT".to_string(),
+                    contract_multiplier: 0.001,
+                    effective_at_ms: 2_000,
+                },
+                MultiplierRow {
+                    symbol: "BTCUSDT".to_string(),
+                    contract_multiplier: 0.01,
+                    effective_at_ms: 3_000,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(book.multiplier_at("btcusdt", 1_000).unwrap(), 0.001);
+        assert_eq!(book.multiplier_at("BTCUSDT", 2_500).unwrap(), 0.001);
+        assert_eq!(book.multiplier_at("BTCUSDT", 3_500).unwrap(), 0.01);
+        assert!(book.multiplier_at("ETHUSDT", 3_500).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_exchange_multiplier_rows() {
+        assert!(ContractMultiplierBook::from_rows("okx", Vec::new()).is_err());
     }
 }

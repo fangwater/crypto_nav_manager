@@ -1,4 +1,7 @@
-use crate::fifo_pnl::{FifoPnl, PnlSnapshot, Side};
+use crate::{
+    contract_multipliers::ContractMultiplierBook,
+    fifo_pnl::{FifoPnl, PnlSnapshot, Side},
+};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sqlx::{AssertSqlSafe, FromRow, PgPool};
@@ -16,7 +19,7 @@ pub enum PnlSourceKind {
 impl PnlSourceKind {
     pub fn for_strategy(strategy_kind: &str, exchange: &str, account_mode: &str) -> Option<Self> {
         match (strategy_kind, exchange, account_mode) {
-            ("market_making", "bybit" | "binance", _) => Some(Self::MarketMaking),
+            ("market_making", "bybit" | "binance" | "gate" | "okx", _) => Some(Self::MarketMaking),
             (_, "bybit", "unified") => Some(Self::BybitLiang),
             _ => None,
         }
@@ -323,6 +326,7 @@ pub async fn load_inputs(
     pool: &PgPool,
     source: PnlSourceKind,
     schema: &str,
+    exchange: &str,
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
@@ -332,7 +336,7 @@ pub async fn load_inputs(
             load_bybit_liang_inputs(pool, schema, strategy_start_ms, end_ms).await
         }
         PnlSourceKind::MarketMaking => {
-            load_market_making_inputs(pool, schema, strategy_start_ms, end_ms).await
+            load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
         }
     }
 }
@@ -760,7 +764,8 @@ struct MarketMakingTradeRow {
     symbol: String,
     side: String,
     price: f64,
-    amount_u: f64,
+    quantity: f64,
+    quote_quantity: Option<f64>,
     fee_usdt: Option<f64>,
     ts: i64,
 }
@@ -775,12 +780,14 @@ struct MarketMakingFundingRow {
 async fn load_market_making_inputs(
     pool: &PgPool,
     schema: &str,
+    exchange: &str,
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
     let trade_sql = format!(
         r#"SELECT symbol, side, price::float8 AS price,
-                  COALESCE(NULLIF(quote_quantity, 0), price * quantity)::float8 AS amount_u,
+                  quantity::float8 AS quantity,
+                  quote_quantity::float8 AS quote_quantity,
                   fee_usdt::float8 AS fee_usdt, event_time_ms AS ts
            FROM {schema}.trades
            WHERE event_time_ms >= $1 AND event_time_ms <= $2
@@ -795,12 +802,18 @@ async fn load_market_making_inputs(
            ORDER BY event_time_ms, symbol, record_id"#
     );
 
-    let trades = sqlx::query_as::<_, MarketMakingTradeRow>(AssertSqlSafe(trade_sql))
+    let rows = sqlx::query_as::<_, MarketMakingTradeRow>(AssertSqlSafe(trade_sql))
         .bind(strategy_start_ms)
         .bind(end_ms)
         .fetch_all(pool)
         .await
-        .with_context(|| format!("load market-making trades from {schema}"))?
+        .with_context(|| format!("load market-making trades from {schema}"))?;
+    let multiplier_book = if matches!(exchange, "gate" | "okx") && !rows.is_empty() {
+        Some(ContractMultiplierBook::load(pool, exchange).await?)
+    } else {
+        None
+    };
+    let trades = rows
         .into_iter()
         .map(|row| {
             let side = match row.side.to_ascii_lowercase().as_str() {
@@ -808,12 +821,24 @@ async fn load_market_making_inputs(
                 "sell" => Side::Sell,
                 _ => bail!("unsupported market-making trade side {:?}", row.side),
             };
+            let symbol = row.symbol.to_ascii_uppercase();
+            let multiplier = multiplier_book
+                .as_ref()
+                .map(|book| book.multiplier_at(&symbol, row.ts))
+                .transpose()?;
+            let amount_u = market_making_amount_u(
+                exchange,
+                row.price,
+                row.quantity,
+                row.quote_quantity,
+                multiplier,
+            )?;
             Ok(NormalizedTrade {
-                symbol: row.symbol.to_ascii_uppercase(),
+                symbol,
                 side,
                 leg: PositionLeg::Futures,
                 price: row.price,
-                amount_u: row.amount_u,
+                amount_u,
                 fee_usdt: row.fee_usdt,
                 ts: row.ts,
             })
@@ -839,6 +864,30 @@ async fn load_market_making_inputs(
         funding,
         interest: Vec::new(),
     })
+}
+
+fn market_making_amount_u(
+    exchange: &str,
+    price: f64,
+    quantity: f64,
+    quote_quantity: Option<f64>,
+    contract_multiplier: Option<f64>,
+) -> Result<f64> {
+    let amount_u = match exchange {
+        "gate" | "okx" => {
+            let multiplier = contract_multiplier
+                .with_context(|| format!("missing {exchange} contract multiplier"))?;
+            price * quantity.abs() * multiplier
+        }
+        "binance" | "bybit" => quote_quantity
+            .filter(|amount| *amount != 0.0)
+            .unwrap_or(price * quantity),
+        _ => bail!("unsupported market-making exchange {exchange}"),
+    };
+    if !amount_u.is_finite() || amount_u <= 0.0 {
+        bail!("invalid {exchange} market-making amount_u: {amount_u}");
+    }
+    Ok(amount_u)
 }
 
 async fn load_bybit_liang_inputs(
@@ -1080,5 +1129,30 @@ mod tests {
         assert_eq!(response.summary.open_amount_usdt, 800.0);
         assert!(!response.source.interest_included);
         assert_eq!(response.source.adapter, "market_making_futures_v1");
+    }
+
+    #[test]
+    fn gate_and_okx_market_making_amount_uses_contract_multiplier() {
+        assert_eq!(
+            market_making_amount_u("gate", 100.0, 5.0, Some(9_999.0), Some(0.01)).unwrap(),
+            5.0
+        );
+        assert_eq!(
+            market_making_amount_u("okx", 25.0, -4.0, None, Some(0.1)).unwrap(),
+            10.0
+        );
+        assert!(market_making_amount_u("gate", 100.0, 5.0, None, None).is_err());
+    }
+
+    #[test]
+    fn binance_and_bybit_market_making_amount_does_not_use_multiplier() {
+        assert_eq!(
+            market_making_amount_u("binance", 100.0, 5.0, Some(42.0), Some(99.0)).unwrap(),
+            42.0
+        );
+        assert_eq!(
+            market_making_amount_u("bybit", 100.0, 5.0, None, Some(99.0)).unwrap(),
+            500.0
+        );
     }
 }
