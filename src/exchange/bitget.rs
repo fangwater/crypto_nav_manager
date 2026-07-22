@@ -142,6 +142,71 @@ impl BitgetClient {
         Ok(rows)
     }
 
+    /// Queries this UTA account's liquidation orders from private order history.
+    pub async fn liquidation_orders(
+        &self,
+        category: ProductCategory,
+        symbol: Option<&str>,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
+        let mut rows = Vec::new();
+
+        for chunk in range.chunks(THIRTY_DAYS_MS)? {
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut params = vec![
+                    ("category".to_string(), category.bitget_value().to_string()),
+                    ("startTime".to_string(), chunk.start_ms.to_string()),
+                    ("endTime".to_string(), chunk.end_ms.to_string()),
+                    ("limit".to_string(), PAGE_LIMIT.to_string()),
+                ];
+                if let Some(symbol) = symbol {
+                    params.push(("symbol".to_string(), symbol.to_string()));
+                }
+                if let Some(cursor) = &cursor {
+                    params.push(("cursor".to_string(), cursor.clone()));
+                }
+
+                let value = self
+                    .private_get("/api/v3/trade/history-orders", params, 1)
+                    .await?;
+                let body = value
+                    .get("data")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| ExchangeError::InvalidResponse {
+                        exchange: EXCHANGE,
+                        message: "history-orders response is missing data object".to_string(),
+                    })?;
+                let page = body
+                    .get("list")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let next_cursor = body
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let page_len = page.len();
+                rows.extend(page.into_iter().filter(|row| {
+                    is_liquidation_order(row)
+                        && row_time_ms(row)
+                            .is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
+                }));
+
+                if page_len < PAGE_LIMIT || next_cursor.is_none() || next_cursor == cursor {
+                    break;
+                }
+                cursor = next_cursor;
+            }
+        }
+
+        dedup(&mut rows, &["orderId", "symbol", "updatedTime"]);
+        sort_by_ms(&mut rows, &["updatedTime", "createdTime"]);
+        Ok(rows)
+    }
+
     pub async fn financial_records(
         &self,
         category: ProductCategory,
@@ -399,6 +464,23 @@ fn dedup(rows: &mut Vec<Value>, keys: &[&str]) {
     });
 }
 
+fn is_liquidation_order(row: &Value) -> bool {
+    if row.get("execType").and_then(Value::as_str) == Some("liquidation") {
+        return true;
+    }
+
+    row.get("delegateType")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "liquidation" || value.starts_with("liquidation_take_over_"))
+}
+
+fn row_time_ms(row: &Value) -> Option<i64> {
+    ["updatedTime", "createdTime"].into_iter().find_map(|key| {
+        row.get(key)
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+    })
+}
+
 fn sort_by_ms(rows: &mut [Value], keys: &[&str]) {
     rows.sort_by_key(|row| {
         keys.iter()
@@ -450,5 +532,18 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn identifies_only_private_liquidation_orders() {
+        assert!(is_liquidation_order(
+            &serde_json::json!({"execType": "liquidation"})
+        ));
+        assert!(is_liquidation_order(
+            &serde_json::json!({"delegateType": "liquidation_take_over_long"})
+        ));
+        assert!(!is_liquidation_order(
+            &serde_json::json!({"execType": "normal", "delegateType": "market"})
+        ));
     }
 }

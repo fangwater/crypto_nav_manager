@@ -193,6 +193,49 @@ impl GateClient {
             .await
     }
 
+    /// Queries this account's USDT futures liquidation history.
+    pub async fn liquidation_history(
+        &self,
+        contract: Option<&str>,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
+        let mut rows = Vec::new();
+
+        for chunk in range.chunks(THIRTY_DAYS_MS)? {
+            let mut offset = 0_usize;
+            loop {
+                let mut params = vec![
+                    ("from".to_string(), (chunk.start_ms / 1_000).to_string()),
+                    ("to".to_string(), (chunk.end_ms / 1_000).to_string()),
+                    ("limit".to_string(), "100".to_string()),
+                    ("offset".to_string(), offset.to_string()),
+                ];
+                if let Some(contract) = contract {
+                    params.push(("contract".to_string(), contract.to_string()));
+                }
+                let batch = root_array(
+                    EXCHANGE,
+                    self.private_get("/futures/usdt/liquidates", params, 1)
+                        .await?,
+                )?;
+                let batch_len = batch.len();
+                rows.extend(batch.into_iter().filter(|row| {
+                    liquidation_time_ms(row)
+                        .is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
+                }));
+                if batch_len < 100 {
+                    break;
+                }
+                offset = offset.saturating_add(100);
+            }
+        }
+
+        dedup(&mut rows, &["order_id", "contract", "time"]);
+        sort_by_timestamp(&mut rows);
+        Ok(rows)
+    }
+
     pub async fn raw_fee_rates(
         &self,
         market: GateFeeMarket,
@@ -475,6 +518,16 @@ fn dedup(rows: &mut Vec<Value>, keys: &[&str]) {
     });
 }
 
+fn liquidation_time_ms(row: &Value) -> Option<i64> {
+    row.get("time_ms")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+        .or_else(|| {
+            row.get("time")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+                .map(|seconds: i64| seconds.saturating_mul(1_000))
+        })
+}
+
 fn sort_by_timestamp(rows: &mut [Value]) {
     rows.sort_by_key(|row| {
         ["create_time_ms", "time_ms", "time"]
@@ -505,5 +558,17 @@ mod tests {
         let debug = format!("{credentials:?}");
         assert!(!debug.contains("actual-public-value"));
         assert!(!debug.contains("actual-secret-value"));
+    }
+
+    #[test]
+    fn liquidation_time_supports_seconds_and_milliseconds() {
+        assert_eq!(
+            liquidation_time_ms(&serde_json::json!({"time": 1_700_000_000})),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            liquidation_time_ms(&serde_json::json!({"time_ms": 1_700_000_000_123_i64})),
+            Some(1_700_000_000_123)
+        );
     }
 }

@@ -57,6 +57,7 @@ pub enum AccountMode {
     BinancePortfolioMargin,
     GateUnified,
     BitgetUnified,
+    BybitUnified,
     OkxUnified,
 }
 

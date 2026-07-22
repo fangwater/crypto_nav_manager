@@ -16,6 +16,7 @@ use sha2::Sha256;
 use std::collections::HashSet;
 
 const EXCHANGE: &str = "okx";
+const LIQUIDATION_CLOSE_TYPES: [&str; 2] = ["3", "4"];
 const BASE: &str = "https://www.okx.com";
 const PAGE_LIMIT: usize = 100;
 
@@ -158,6 +159,38 @@ impl OkxClient {
         }
         dedup(&mut rows, &["tradeId", "ordId", "instId"]);
         sort_by_ts(&mut rows);
+        Ok(rows)
+    }
+
+    /// Queries this account's full and partial liquidation position history.
+    pub async fn liquidation_history(
+        &self,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        if instrument_type == OkxInstrumentType::Spot {
+            return Err(ExchangeError::InvalidQuery(
+                "OKX position history does not support SPOT".to_string(),
+            ));
+        }
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
+        let mut rows = Vec::new();
+
+        for close_type in LIQUIDATION_CLOSE_TYPES {
+            rows.extend(
+                self.position_history_by_close_type(
+                    instrument_type,
+                    instrument_id,
+                    close_type,
+                    range,
+                )
+                .await?,
+            );
+        }
+
+        dedup(&mut rows, &["posId", "instId", "uTime", "type"]);
+        sort_by_keys(&mut rows, &["uTime"]);
         Ok(rows)
     }
 
@@ -362,6 +395,61 @@ impl OkxClient {
         }
         dedup(&mut rows, &["instId", "fundingTime"]);
         sort_by_keys(&mut rows, &["fundingTime", "ts"]);
+        Ok(rows)
+    }
+
+    async fn position_history_by_close_type(
+        &self,
+        instrument_type: OkxInstrumentType,
+        instrument_id: Option<&str>,
+        close_type: &str,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        let mut rows = Vec::new();
+        let mut after = Some(range.end_ms.saturating_add(1).to_string());
+
+        loop {
+            let mut params = vec![
+                ("instType".to_string(), instrument_type.value().to_string()),
+                ("type".to_string(), close_type.to_string()),
+                ("limit".to_string(), PAGE_LIMIT.to_string()),
+            ];
+            if let Some(instrument_id) = instrument_id {
+                params.push(("instId".to_string(), instrument_id.to_string()));
+            }
+            if let Some(after) = &after {
+                params.push(("after".to_string(), after.clone()));
+            }
+
+            let value = self
+                .private_get("/api/v5/account/positions-history", params, 1)
+                .await?;
+            let page = data_array(EXCHANGE, &value)?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            let last_ts = page
+                .last()
+                .and_then(|row| value_i64(row, "uTime"))
+                .ok_or_else(|| ExchangeError::InvalidResponse {
+                    exchange: EXCHANGE,
+                    message: "positions-history page has no numeric uTime".to_string(),
+                })?;
+            rows.extend(page.into_iter().filter(|row| {
+                value_i64(row, "uTime").is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
+            }));
+
+            if page_len < PAGE_LIMIT || last_ts < range.start_ms {
+                break;
+            }
+            let next = Some(last_ts.to_string());
+            if next == after {
+                break;
+            }
+            after = next;
+        }
+
         Ok(rows)
     }
 
@@ -587,5 +675,10 @@ mod tests {
         assert!(!debug.contains("actual-public-value"));
         assert!(!debug.contains("actual-secret-value"));
         assert!(!debug.contains("actual-passphrase-value"));
+    }
+
+    #[test]
+    fn liquidation_history_uses_full_and_partial_close_types() {
+        assert_eq!(LIQUIDATION_CLOSE_TYPES, ["3", "4"]);
     }
 }
