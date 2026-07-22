@@ -1,0 +1,1084 @@
+use crate::fifo_pnl::{FifoPnl, PnlSnapshot, Side};
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use sqlx::{AssertSqlSafe, FromRow, PgPool};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PnlSourceKind {
+    BybitLiang,
+    MarketMaking,
+}
+
+impl PnlSourceKind {
+    pub fn for_strategy(strategy_kind: &str, exchange: &str, account_mode: &str) -> Option<Self> {
+        match (strategy_kind, exchange, account_mode) {
+            ("market_making", "bybit" | "binance", _) => Some(Self::MarketMaking),
+            (_, "bybit", "unified") => Some(Self::BybitLiang),
+            _ => None,
+        }
+    }
+
+    fn adapter_name(self) -> &'static str {
+        match self {
+            Self::BybitLiang => "bybit_liang_trades_v1",
+            Self::MarketMaking => "market_making_futures_v1",
+        }
+    }
+
+    fn interest_included(self) -> bool {
+        matches!(self, Self::BybitLiang)
+    }
+
+    fn exposure(self, spot_position_usdt: f64, futures_position_usdt: f64) -> f64 {
+        match self {
+            Self::BybitLiang => spot_position_usdt + futures_position_usdt,
+            Self::MarketMaking => futures_position_usdt.abs(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NormalizedTrade {
+    pub symbol: String,
+    pub side: Side,
+    pub leg: PositionLeg,
+    pub price: f64,
+    pub amount_u: f64,
+    pub fee_usdt: Option<f64>,
+    pub ts: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PositionLeg {
+    Spot,
+    Futures,
+}
+
+#[derive(Clone, Debug)]
+pub struct FundingEvent {
+    pub symbol: String,
+    pub amount_usdt: f64,
+    pub ts: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterestEvent {
+    pub symbol: String,
+    pub cost_usdt: Option<f64>,
+    pub ts: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PnlInputs {
+    pub trades: Vec<NormalizedTrade>,
+    pub funding: Vec<FundingEvent>,
+    pub interest: Vec<InterestEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PnlCalculation {
+    pub source: PnlSourceKind,
+    pub strategy_start_ms: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub selected_symbols: Vec<String>,
+    pub max_points: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlResponse {
+    pub strategy_start_ms: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub selected_symbols: Vec<String>,
+    pub available_symbols: Vec<String>,
+    pub summary: PnlSummary,
+    pub symbols: Vec<SymbolPnlSummary>,
+    pub points: Vec<PnlPoint>,
+    pub symbol_points: Vec<SymbolPnlSeries>,
+    pub source: PnlSourceInfo,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlSummary {
+    pub trade_count: u64,
+    pub volume_usdt: f64,
+    pub fee_before_pnl_usdt: f64,
+    pub trading_fee_usdt: f64,
+    pub fee_after_pnl_usdt: f64,
+    pub funding_pnl_usdt: f64,
+    pub interest_cost_usdt: f64,
+    pub floating_pnl_usdt: f64,
+    pub total_pnl_usdt: f64,
+    pub return_bps_on_volume: f64,
+    pub open_amount_usdt: f64,
+    pub unconverted_fee_count: u64,
+    pub unconverted_interest_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolPnlSummary {
+    pub symbol: String,
+    #[serde(flatten)]
+    pub pnl: PnlSummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolPnlSeries {
+    pub symbol: String,
+    pub points: Vec<PnlPoint>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlPoint {
+    pub ts: i64,
+    pub fee_before_pnl_usdt: f64,
+    pub fee_after_pnl_usdt: f64,
+    pub funding_pnl_usdt: f64,
+    pub interest_cost_usdt: f64,
+    pub floating_pnl_usdt: f64,
+    pub total_pnl_usdt: f64,
+    pub spot_position_usdt: f64,
+    pub futures_position_usdt: f64,
+    pub exposure_usdt: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlSourceInfo {
+    pub adapter: &'static str,
+    pub loaded_trade_rows: usize,
+    pub loaded_funding_rows: usize,
+    pub loaded_interest_rows: usize,
+    pub returned_points: usize,
+    pub returned_symbol_points: usize,
+    pub sampled: bool,
+    pub interest_included: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Metrics {
+    trade_count: u64,
+    volume_usdt: f64,
+    fee_before_pnl_usdt: f64,
+    trading_fee_usdt: f64,
+    fee_after_pnl_usdt: f64,
+    funding_pnl_usdt: f64,
+    interest_cost_usdt: f64,
+    floating_pnl_usdt: f64,
+    total_pnl_usdt: f64,
+    open_amount_usdt: f64,
+    spot_position_usdt: f64,
+    futures_position_usdt: f64,
+    unconverted_fee_count: u64,
+    unconverted_interest_count: u64,
+}
+
+impl Metrics {
+    fn difference(self, baseline: Self) -> PnlSummary {
+        let volume = self.volume_usdt - baseline.volume_usdt;
+        let total = self.total_pnl_usdt - baseline.total_pnl_usdt;
+        PnlSummary {
+            trade_count: self.trade_count.saturating_sub(baseline.trade_count),
+            volume_usdt: clean_zero(volume),
+            fee_before_pnl_usdt: clean_zero(
+                self.fee_before_pnl_usdt - baseline.fee_before_pnl_usdt,
+            ),
+            trading_fee_usdt: clean_zero(self.trading_fee_usdt - baseline.trading_fee_usdt),
+            fee_after_pnl_usdt: clean_zero(self.fee_after_pnl_usdt - baseline.fee_after_pnl_usdt),
+            funding_pnl_usdt: clean_zero(self.funding_pnl_usdt - baseline.funding_pnl_usdt),
+            interest_cost_usdt: clean_zero(self.interest_cost_usdt - baseline.interest_cost_usdt),
+            floating_pnl_usdt: clean_zero(self.floating_pnl_usdt - baseline.floating_pnl_usdt),
+            total_pnl_usdt: clean_zero(total),
+            return_bps_on_volume: if volume.abs() > f64::EPSILON {
+                total / volume * 10_000.0
+            } else {
+                0.0
+            },
+            open_amount_usdt: clean_zero(self.open_amount_usdt),
+            unconverted_fee_count: self
+                .unconverted_fee_count
+                .saturating_sub(baseline.unconverted_fee_count),
+            unconverted_interest_count: self
+                .unconverted_interest_count
+                .saturating_sub(baseline.unconverted_interest_count),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SymbolState {
+    fifo: FifoPnl,
+    funding_pnl_usdt: f64,
+    interest_cost_usdt: f64,
+    trade_count: u64,
+    volume_usdt: f64,
+    spot_position_usdt: f64,
+    futures_position_usdt: f64,
+    unconverted_fee_count: u64,
+    unconverted_interest_count: u64,
+    cached_snapshot: Option<PnlSnapshot>,
+}
+
+impl SymbolState {
+    fn apply_trade(&mut self, trade: &NormalizedTrade) -> Result<()> {
+        let fee = trade.fee_usdt.unwrap_or_else(|| {
+            self.unconverted_fee_count += 1;
+            0.0
+        });
+        self.fifo
+            .apply_fill(trade.side, trade.price, trade.amount_u, fee)
+            .context("apply normalized trade to FIFO")?;
+        self.trade_count += 1;
+        self.volume_usdt += trade.amount_u;
+        let signed_amount_u = match trade.side {
+            Side::Buy => trade.amount_u,
+            Side::Sell => -trade.amount_u,
+        };
+        match trade.leg {
+            PositionLeg::Spot => self.spot_position_usdt += signed_amount_u,
+            PositionLeg::Futures => self.futures_position_usdt += signed_amount_u,
+        }
+        self.cached_snapshot = Some(
+            self.fifo
+                .snapshot(trade.price, trade.price)
+                .context("mark FIFO at the latest trade price")?,
+        );
+        Ok(())
+    }
+
+    fn metrics(&self) -> Metrics {
+        let snapshot = self.cached_snapshot.unwrap_or(PnlSnapshot {
+            gross_realized_pnl: 0.0,
+            cumulative_fees: 0.0,
+            realized_pnl: 0.0,
+            floating_pnl: 0.0,
+            total_pnl: 0.0,
+            long_amount_u: 0.0,
+            short_amount_u: 0.0,
+            net_open_amount_u: 0.0,
+        });
+        Metrics {
+            trade_count: self.trade_count,
+            volume_usdt: self.volume_usdt,
+            fee_before_pnl_usdt: snapshot.gross_realized_pnl,
+            trading_fee_usdt: snapshot.cumulative_fees,
+            fee_after_pnl_usdt: snapshot.realized_pnl,
+            funding_pnl_usdt: self.funding_pnl_usdt,
+            interest_cost_usdt: self.interest_cost_usdt,
+            floating_pnl_usdt: snapshot.floating_pnl,
+            total_pnl_usdt: snapshot.total_pnl + self.funding_pnl_usdt - self.interest_cost_usdt,
+            open_amount_usdt: clean_zero(self.spot_position_usdt + self.futures_position_usdt),
+            spot_position_usdt: self.spot_position_usdt,
+            futures_position_usdt: self.futures_position_usdt,
+            unconverted_fee_count: self.unconverted_fee_count,
+            unconverted_interest_count: self.unconverted_interest_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PnlEvent {
+    Trade(NormalizedTrade),
+    Funding(FundingEvent),
+    Interest(InterestEvent),
+}
+
+impl PnlEvent {
+    fn ts(&self) -> i64 {
+        match self {
+            Self::Trade(value) => value.ts,
+            Self::Funding(value) => value.ts,
+            Self::Interest(value) => value.ts,
+        }
+    }
+
+    fn symbol(&self) -> &str {
+        match self {
+            Self::Trade(value) => &value.symbol,
+            Self::Funding(value) => &value.symbol,
+            Self::Interest(value) => &value.symbol,
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Trade(_) => 0,
+            Self::Funding(_) => 1,
+            Self::Interest(_) => 2,
+        }
+    }
+}
+
+pub async fn load_inputs(
+    pool: &PgPool,
+    source: PnlSourceKind,
+    schema: &str,
+    strategy_start_ms: i64,
+    end_ms: i64,
+) -> Result<PnlInputs> {
+    validate_identifier(schema)?;
+    match source {
+        PnlSourceKind::BybitLiang => {
+            load_bybit_liang_inputs(pool, schema, strategy_start_ms, end_ms).await
+        }
+        PnlSourceKind::MarketMaking => {
+            load_market_making_inputs(pool, schema, strategy_start_ms, end_ms).await
+        }
+    }
+}
+
+pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlResponse> {
+    if request.start_ms < request.strategy_start_ms {
+        bail!("start_ms must be greater than or equal to strategy st_ms");
+    }
+    if request.end_ms < request.start_ms {
+        bail!("end_ms must be greater than or equal to start_ms");
+    }
+
+    let loaded_trade_rows = inputs.trades.len();
+    let loaded_funding_rows = inputs.funding.len();
+    let loaded_interest_rows = inputs.interest.len();
+    let mut available = BTreeSet::new();
+    for trade in &inputs.trades {
+        available.insert(trade.symbol.clone());
+    }
+    for funding in &inputs.funding {
+        available.insert(funding.symbol.clone());
+    }
+    for interest in &inputs.interest {
+        available.insert(interest.symbol.clone());
+    }
+    let available_symbols = available.into_iter().collect::<Vec<_>>();
+
+    let selected_symbols = if request.selected_symbols.is_empty() {
+        available_symbols.clone()
+    } else {
+        let available = available_symbols.iter().cloned().collect::<HashSet<_>>();
+        let mut selected = request
+            .selected_symbols
+            .into_iter()
+            .map(|symbol| symbol.to_ascii_uppercase())
+            .filter(|symbol| available.contains(symbol))
+            .collect::<Vec<_>>();
+        selected.sort();
+        selected.dedup();
+        selected
+    };
+    if selected_symbols.is_empty() && !available_symbols.is_empty() {
+        bail!("none of the requested symbols exist in the selected time range");
+    }
+    let selected_set = selected_symbols.iter().cloned().collect::<HashSet<_>>();
+
+    let mut events =
+        Vec::with_capacity(loaded_trade_rows + loaded_funding_rows + loaded_interest_rows);
+    events.extend(inputs.trades.into_iter().map(PnlEvent::Trade));
+    events.extend(inputs.funding.into_iter().map(PnlEvent::Funding));
+    events.extend(inputs.interest.into_iter().map(PnlEvent::Interest));
+    events.sort_by(|left, right| {
+        left.ts()
+            .cmp(&right.ts())
+            .then_with(|| left.rank().cmp(&right.rank()))
+            .then_with(|| left.symbol().cmp(right.symbol()))
+    });
+
+    let mut states = available_symbols
+        .iter()
+        .cloned()
+        .map(|symbol| (symbol, SymbolState::default()))
+        .collect::<HashMap<_, _>>();
+
+    let split = events.partition_point(|event| event.ts() < request.start_ms);
+    for event in &events[..split] {
+        apply_event(&mut states, event)?;
+    }
+    let baselines = states
+        .iter()
+        .map(|(symbol, state)| (symbol.clone(), state.metrics()))
+        .collect::<HashMap<_, _>>();
+
+    let mut points = vec![aggregate_point(
+        request.start_ms,
+        &states,
+        &baselines,
+        &selected_set,
+        request.source,
+    )];
+    let mut points_by_symbol = selected_symbols
+        .iter()
+        .cloned()
+        .map(|symbol| {
+            let start_point = symbol_point(
+                request.start_ms,
+                &symbol,
+                &states,
+                &baselines,
+                request.source,
+            );
+            (symbol, vec![start_point])
+        })
+        .collect::<HashMap<_, _>>();
+    for event in &events[split..] {
+        if event.ts() > request.end_ms {
+            break;
+        }
+        apply_event(&mut states, event)?;
+        if selected_set.contains(event.symbol()) {
+            push_or_replace_point(
+                &mut points,
+                aggregate_point(
+                    event.ts(),
+                    &states,
+                    &baselines,
+                    &selected_set,
+                    request.source,
+                ),
+            );
+            if let Some(symbol_points) = points_by_symbol.get_mut(event.symbol()) {
+                push_or_replace_point(
+                    symbol_points,
+                    symbol_point(
+                        event.ts(),
+                        event.symbol(),
+                        &states,
+                        &baselines,
+                        request.source,
+                    ),
+                );
+            }
+        }
+    }
+    push_or_replace_point(
+        &mut points,
+        aggregate_point(
+            request.end_ms,
+            &states,
+            &baselines,
+            &selected_set,
+            request.source,
+        ),
+    );
+    for symbol in &selected_symbols {
+        if let Some(symbol_points) = points_by_symbol.get_mut(symbol) {
+            push_or_replace_point(
+                symbol_points,
+                symbol_point(request.end_ms, symbol, &states, &baselines, request.source),
+            );
+        }
+    }
+
+    let mut symbols = available_symbols
+        .iter()
+        .map(|symbol| {
+            let current = states
+                .get(symbol)
+                .map(SymbolState::metrics)
+                .unwrap_or_default();
+            let baseline = baselines.get(symbol).copied().unwrap_or_default();
+            SymbolPnlSummary {
+                symbol: symbol.clone(),
+                pnl: current.difference(baseline),
+            }
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_by(|left, right| {
+        right
+            .pnl
+            .total_pnl_usdt
+            .partial_cmp(&left.pnl.total_pnl_usdt)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+
+    let mut summary = aggregate_summary(&symbols, &selected_set);
+    summary.open_amount_usdt = points
+        .last()
+        .map(|point| point.exposure_usdt)
+        .unwrap_or_default();
+    let original_points = points.len();
+    let points = downsample_extrema(points, request.max_points.max(2));
+    let returned_points = points.len();
+
+    let symbol_max_points = request.max_points.clamp(100, 800);
+    let mut sampled_symbol_points = false;
+    let mut returned_symbol_points = 0;
+    let symbol_points = selected_symbols
+        .iter()
+        .map(|symbol| {
+            let original = points_by_symbol.remove(symbol).unwrap_or_default();
+            let original_len = original.len();
+            let points = downsample_extrema(original, symbol_max_points);
+            sampled_symbol_points |= points.len() < original_len;
+            returned_symbol_points += points.len();
+            SymbolPnlSeries {
+                symbol: symbol.clone(),
+                points,
+            }
+        })
+        .collect();
+
+    Ok(PnlResponse {
+        strategy_start_ms: request.strategy_start_ms,
+        start_ms: request.start_ms,
+        end_ms: request.end_ms,
+        selected_symbols,
+        available_symbols,
+        summary,
+        symbols,
+        points,
+        symbol_points,
+        source: PnlSourceInfo {
+            adapter: request.source.adapter_name(),
+            loaded_trade_rows,
+            loaded_funding_rows,
+            loaded_interest_rows,
+            returned_points,
+            returned_symbol_points,
+            sampled: returned_points < original_points || sampled_symbol_points,
+            interest_included: request.source.interest_included(),
+        },
+    })
+}
+
+fn apply_event(states: &mut HashMap<String, SymbolState>, event: &PnlEvent) -> Result<()> {
+    let state = states
+        .get_mut(event.symbol())
+        .context("PnL event symbol is missing from state map")?;
+    match event {
+        PnlEvent::Trade(trade) => state.apply_trade(trade),
+        PnlEvent::Funding(funding) => {
+            state.funding_pnl_usdt += funding.amount_usdt;
+            Ok(())
+        }
+        PnlEvent::Interest(interest) => {
+            if let Some(cost) = interest.cost_usdt {
+                state.interest_cost_usdt += cost;
+            } else {
+                state.unconverted_interest_count += 1;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn aggregate_point(
+    ts: i64,
+    states: &HashMap<String, SymbolState>,
+    baselines: &HashMap<String, Metrics>,
+    selected: &HashSet<String>,
+    source: PnlSourceKind,
+) -> PnlPoint {
+    let mut point = PnlPoint {
+        ts,
+        ..PnlPoint::default()
+    };
+    for symbol in selected {
+        let current = states
+            .get(symbol)
+            .map(SymbolState::metrics)
+            .unwrap_or_default();
+        let baseline = baselines.get(symbol).copied().unwrap_or_default();
+        point.fee_before_pnl_usdt += current.fee_before_pnl_usdt - baseline.fee_before_pnl_usdt;
+        point.fee_after_pnl_usdt += current.fee_after_pnl_usdt - baseline.fee_after_pnl_usdt;
+        point.funding_pnl_usdt += current.funding_pnl_usdt - baseline.funding_pnl_usdt;
+        point.interest_cost_usdt += current.interest_cost_usdt - baseline.interest_cost_usdt;
+        point.floating_pnl_usdt += current.floating_pnl_usdt - baseline.floating_pnl_usdt;
+        point.total_pnl_usdt += current.total_pnl_usdt - baseline.total_pnl_usdt;
+        point.spot_position_usdt += current.spot_position_usdt;
+        point.futures_position_usdt += current.futures_position_usdt;
+        point.exposure_usdt +=
+            source.exposure(current.spot_position_usdt, current.futures_position_usdt);
+    }
+    point.fee_before_pnl_usdt = clean_zero(point.fee_before_pnl_usdt);
+    point.fee_after_pnl_usdt = clean_zero(point.fee_after_pnl_usdt);
+    point.funding_pnl_usdt = clean_zero(point.funding_pnl_usdt);
+    point.interest_cost_usdt = clean_zero(point.interest_cost_usdt);
+    point.floating_pnl_usdt = clean_zero(point.floating_pnl_usdt);
+    point.total_pnl_usdt = clean_zero(point.total_pnl_usdt);
+    point.spot_position_usdt = clean_zero(point.spot_position_usdt);
+    point.futures_position_usdt = clean_zero(point.futures_position_usdt);
+    point.exposure_usdt = clean_zero(point.exposure_usdt);
+    point
+}
+
+fn symbol_point(
+    ts: i64,
+    symbol: &str,
+    states: &HashMap<String, SymbolState>,
+    baselines: &HashMap<String, Metrics>,
+    source: PnlSourceKind,
+) -> PnlPoint {
+    let current = states
+        .get(symbol)
+        .map(SymbolState::metrics)
+        .unwrap_or_default();
+    let baseline = baselines.get(symbol).copied().unwrap_or_default();
+    PnlPoint {
+        ts,
+        fee_before_pnl_usdt: clean_zero(current.fee_before_pnl_usdt - baseline.fee_before_pnl_usdt),
+        fee_after_pnl_usdt: clean_zero(current.fee_after_pnl_usdt - baseline.fee_after_pnl_usdt),
+        funding_pnl_usdt: clean_zero(current.funding_pnl_usdt - baseline.funding_pnl_usdt),
+        interest_cost_usdt: clean_zero(current.interest_cost_usdt - baseline.interest_cost_usdt),
+        floating_pnl_usdt: clean_zero(current.floating_pnl_usdt - baseline.floating_pnl_usdt),
+        total_pnl_usdt: clean_zero(current.total_pnl_usdt - baseline.total_pnl_usdt),
+        spot_position_usdt: clean_zero(current.spot_position_usdt),
+        futures_position_usdt: clean_zero(current.futures_position_usdt),
+        exposure_usdt: clean_zero(
+            source.exposure(current.spot_position_usdt, current.futures_position_usdt),
+        ),
+    }
+}
+
+fn aggregate_summary(symbols: &[SymbolPnlSummary], selected: &HashSet<String>) -> PnlSummary {
+    let mut total = PnlSummary::default();
+    for row in symbols.iter().filter(|row| selected.contains(&row.symbol)) {
+        total.trade_count += row.pnl.trade_count;
+        total.volume_usdt += row.pnl.volume_usdt;
+        total.fee_before_pnl_usdt += row.pnl.fee_before_pnl_usdt;
+        total.trading_fee_usdt += row.pnl.trading_fee_usdt;
+        total.fee_after_pnl_usdt += row.pnl.fee_after_pnl_usdt;
+        total.funding_pnl_usdt += row.pnl.funding_pnl_usdt;
+        total.interest_cost_usdt += row.pnl.interest_cost_usdt;
+        total.floating_pnl_usdt += row.pnl.floating_pnl_usdt;
+        total.total_pnl_usdt += row.pnl.total_pnl_usdt;
+        total.open_amount_usdt += row.pnl.open_amount_usdt;
+        total.unconverted_fee_count += row.pnl.unconverted_fee_count;
+        total.unconverted_interest_count += row.pnl.unconverted_interest_count;
+    }
+    total.return_bps_on_volume = if total.volume_usdt.abs() > f64::EPSILON {
+        total.total_pnl_usdt / total.volume_usdt * 10_000.0
+    } else {
+        0.0
+    };
+    total
+}
+
+fn push_or_replace_point(points: &mut Vec<PnlPoint>, point: PnlPoint) {
+    if let Some(last) = points.last_mut()
+        && last.ts == point.ts
+    {
+        *last = point;
+        return;
+    }
+    points.push(point);
+}
+
+fn downsample_extrema(points: Vec<PnlPoint>, max_points: usize) -> Vec<PnlPoint> {
+    const VALUE_SELECTORS: [fn(&PnlPoint) -> f64; 4] = [
+        |point| point.total_pnl_usdt,
+        |point| point.spot_position_usdt,
+        |point| point.futures_position_usdt,
+        |point| point.exposure_usdt,
+    ];
+
+    if points.len() <= max_points || max_points < 10 {
+        return points;
+    }
+    let interior = &points[1..points.len() - 1];
+    let bucket_count = ((max_points - 2) / (VALUE_SELECTORS.len() * 2)).max(1);
+    let bucket_size = interior.len().div_ceil(bucket_count);
+    let mut sampled = Vec::with_capacity(max_points);
+    sampled.push(points[0]);
+    for bucket in interior.chunks(bucket_size) {
+        let mut extrema = Vec::with_capacity(VALUE_SELECTORS.len() * 2);
+        for value in VALUE_SELECTORS {
+            if let Some(point) = bucket.iter().min_by(|left, right| {
+                value(left)
+                    .partial_cmp(&value(right))
+                    .unwrap_or(Ordering::Equal)
+            }) {
+                extrema.push(*point);
+            }
+            if let Some(point) = bucket.iter().max_by(|left, right| {
+                value(left)
+                    .partial_cmp(&value(right))
+                    .unwrap_or(Ordering::Equal)
+            }) {
+                extrema.push(*point);
+            }
+        }
+        extrema.sort_by_key(|point| point.ts);
+        extrema.dedup_by_key(|point| point.ts);
+        sampled.extend(extrema);
+    }
+    sampled.push(*points.last().expect("non-empty points"));
+    sampled
+}
+
+fn clean_zero(value: f64) -> f64 {
+    if value.abs() < 1e-12 { 0.0 } else { value }
+}
+
+fn validate_identifier(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        bail!("invalid PostgreSQL identifier");
+    }
+    Ok(())
+}
+
+#[derive(Debug, FromRow)]
+struct BybitTradeRow {
+    key: String,
+    symbol: String,
+    side: String,
+    price: f64,
+    amount_u: f64,
+    fee: f64,
+    commission_asset: String,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct BybitFundingRow {
+    symbol: String,
+    funding: f64,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct BybitInterestRow {
+    currency: String,
+    interest: f64,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct MarketMakingTradeRow {
+    symbol: String,
+    side: String,
+    price: f64,
+    amount_u: f64,
+    fee_usdt: Option<f64>,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct MarketMakingFundingRow {
+    symbol: String,
+    amount_usdt: f64,
+    ts: i64,
+}
+
+async fn load_market_making_inputs(
+    pool: &PgPool,
+    schema: &str,
+    strategy_start_ms: i64,
+    end_ms: i64,
+) -> Result<PnlInputs> {
+    let trade_sql = format!(
+        r#"SELECT symbol, side, price::float8 AS price,
+                  COALESCE(NULLIF(quote_quantity, 0), price * quantity)::float8 AS amount_u,
+                  fee_usdt::float8 AS fee_usdt, event_time_ms AS ts
+           FROM {schema}.trades
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, trade_id"#
+    );
+    let funding_sql = format!(
+        r#"SELECT symbol, COALESCE(amount_usdt, amount)::float8 AS amount_usdt,
+                  event_time_ms AS ts
+           FROM {schema}.funding
+           WHERE symbol IS NOT NULL
+             AND event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, record_id"#
+    );
+
+    let trades = sqlx::query_as::<_, MarketMakingTradeRow>(AssertSqlSafe(trade_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load market-making trades from {schema}"))?
+        .into_iter()
+        .map(|row| {
+            let side = match row.side.to_ascii_lowercase().as_str() {
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
+                _ => bail!("unsupported market-making trade side {:?}", row.side),
+            };
+            Ok(NormalizedTrade {
+                symbol: row.symbol.to_ascii_uppercase(),
+                side,
+                leg: PositionLeg::Futures,
+                price: row.price,
+                amount_u: row.amount_u,
+                fee_usdt: row.fee_usdt,
+                ts: row.ts,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let funding = sqlx::query_as::<_, MarketMakingFundingRow>(AssertSqlSafe(funding_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load market-making funding from {schema}"))?
+        .into_iter()
+        .map(|row| FundingEvent {
+            symbol: row.symbol.to_ascii_uppercase(),
+            amount_usdt: row.amount_usdt,
+            ts: row.ts,
+        })
+        .collect();
+
+    Ok(PnlInputs {
+        trades,
+        funding,
+        interest: Vec::new(),
+    })
+}
+
+async fn load_bybit_liang_inputs(
+    pool: &PgPool,
+    schema: &str,
+    strategy_start_ms: i64,
+    end_ms: i64,
+) -> Result<PnlInputs> {
+    let trade_sql = format!(
+        r#"SELECT key, symbol, side, price::float8 AS price,
+                  amountu::float8 AS amount_u, fees::float8 AS fee,
+                  "commissionAsset" AS commission_asset, ts
+           FROM {schema}.trades
+           WHERE ts >= $1 AND ts <= $2
+           ORDER BY ts, symbol, id"#
+    );
+    let funding_sql = format!(
+        r#"SELECT symbol, funding::float8 AS funding,
+                  "transactionTime" AS ts
+           FROM {schema}.funding
+           WHERE "transactionTime" >= $1 AND "transactionTime" <= $2
+           ORDER BY "transactionTime", symbol, id"#
+    );
+    let interest_sql = format!(
+        r#"SELECT currency, interest::float8 AS interest, "transactionTime" AS ts
+           FROM {schema}.interest
+           WHERE "transactionTime" >= $1 AND "transactionTime" <= $2
+           ORDER BY "transactionTime", currency, id"#
+    );
+
+    let rows = sqlx::query_as::<_, BybitTradeRow>(AssertSqlSafe(trade_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load trades from {schema}"))?;
+    let mut trades = Vec::with_capacity(rows.len());
+    let mut last_spot_prices = HashMap::new();
+    for row in rows {
+        let side = match row.side.as_str() {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => bail!("unsupported trade side {:?}", row.side),
+        };
+        let symbol = row.symbol.to_ascii_uppercase();
+        if row.key == "bybitspot" {
+            last_spot_prices.insert(symbol.clone(), row.price);
+        }
+        let commission_asset = row.commission_asset.to_ascii_uppercase();
+        let base_asset = symbol.strip_suffix("USDT").unwrap_or("");
+        let fee_usdt = if STABLECOINS.contains(&commission_asset.as_str()) {
+            Some(row.fee)
+        } else if !base_asset.is_empty() && commission_asset == base_asset {
+            Some(row.fee * row.price)
+        } else {
+            None
+        };
+        let leg = match row.key.as_str() {
+            "bybitspot" => PositionLeg::Spot,
+            "bybitswap" => PositionLeg::Futures,
+            _ => bail!("unsupported Bybit trade key {:?}", row.key),
+        };
+        trades.push(NormalizedTrade {
+            symbol,
+            side,
+            leg,
+            price: row.price,
+            amount_u: row.amount_u,
+            fee_usdt,
+            ts: row.ts,
+        });
+    }
+
+    let funding = sqlx::query_as::<_, BybitFundingRow>(AssertSqlSafe(funding_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load funding from {schema}"))?
+        .into_iter()
+        .map(|row| FundingEvent {
+            symbol: row.symbol.to_ascii_uppercase(),
+            amount_usdt: row.funding,
+            ts: row.ts,
+        })
+        .collect();
+
+    let interest = sqlx::query_as::<_, BybitInterestRow>(AssertSqlSafe(interest_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load interest from {schema}"))?
+        .into_iter()
+        .map(|row| {
+            let currency = row.currency.to_ascii_uppercase();
+            let symbol = if STABLECOINS.contains(&currency.as_str()) {
+                currency.clone()
+            } else {
+                format!("{currency}USDT")
+            };
+            let conversion_price = if STABLECOINS.contains(&currency.as_str()) {
+                Some(1.0)
+            } else {
+                last_spot_prices.get(&symbol).copied()
+            };
+            InterestEvent {
+                symbol,
+                cost_usdt: conversion_price.map(|price| (-row.interest * price).max(0.0)),
+                ts: row.ts,
+            }
+        })
+        .collect();
+
+    Ok(PnlInputs {
+        trades,
+        funding,
+        interest,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trade(
+        symbol: &str,
+        side: Side,
+        price: f64,
+        amount_u: f64,
+        fee: f64,
+        ts: i64,
+    ) -> NormalizedTrade {
+        NormalizedTrade {
+            symbol: symbol.to_string(),
+            side,
+            leg: match side {
+                Side::Buy => PositionLeg::Spot,
+                Side::Sell => PositionLeg::Futures,
+            },
+            price,
+            amount_u,
+            fee_usdt: Some(fee),
+            ts,
+        }
+    }
+
+    fn request(start_ms: i64, end_ms: i64) -> PnlCalculation {
+        PnlCalculation {
+            source: PnlSourceKind::BybitLiang,
+            strategy_start_ms: 1_000,
+            start_ms,
+            end_ms,
+            selected_symbols: Vec::new(),
+            max_points: 1_000,
+        }
+    }
+
+    #[test]
+    fn combines_amount_fifo_actual_fees_last_trade_mark_and_funding() {
+        let inputs = PnlInputs {
+            trades: vec![
+                trade("BTCUSDT", Side::Buy, 100.0, 1_000.0, 2.0, 1_100),
+                trade("BTCUSDT", Side::Sell, 110.0, 400.0, 1.0, 1_200),
+            ],
+            funding: vec![FundingEvent {
+                symbol: "BTCUSDT".to_string(),
+                amount_usdt: 5.0,
+                ts: 1_300,
+            }],
+            interest: vec![InterestEvent {
+                symbol: "BTCUSDT".to_string(),
+                cost_usdt: Some(2.0),
+                ts: 1_350,
+            }],
+        };
+
+        let response = calculate(inputs, request(1_000, 1_400)).unwrap();
+
+        assert!((response.summary.fee_before_pnl_usdt - 40.0).abs() < 1e-9);
+        assert!((response.summary.trading_fee_usdt - 3.0).abs() < 1e-9);
+        assert!((response.summary.fee_after_pnl_usdt - 37.0).abs() < 1e-9);
+        assert!((response.summary.funding_pnl_usdt - 5.0).abs() < 1e-9);
+        assert!((response.summary.interest_cost_usdt - 2.0).abs() < 1e-9);
+        assert!((response.summary.floating_pnl_usdt - 60.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
+        let final_point = response.points.last().unwrap();
+        assert_eq!(final_point.spot_position_usdt, 1_000.0);
+        assert_eq!(final_point.futures_position_usdt, -400.0);
+        assert_eq!(final_point.exposure_usdt, 600.0);
+        assert_eq!(response.symbol_points.len(), 1);
+        let symbol_series = &response.symbol_points[0];
+        assert_eq!(symbol_series.symbol, "BTCUSDT");
+        assert_eq!(symbol_series.points.first().unwrap().total_pnl_usdt, 0.0);
+        assert_eq!(
+            symbol_series.points.last().unwrap().total_pnl_usdt,
+            response.symbols[0].pnl.total_pnl_usdt
+        );
+        assert_eq!(
+            response.source.returned_symbol_points,
+            symbol_series.points.len()
+        );
+    }
+
+    #[test]
+    fn market_making_exposure_is_gross_absolute_futures_position() {
+        let inputs = PnlInputs {
+            trades: vec![
+                NormalizedTrade {
+                    symbol: "BTCUSDT".to_string(),
+                    side: Side::Sell,
+                    leg: PositionLeg::Futures,
+                    price: 100.0,
+                    amount_u: 500.0,
+                    fee_usdt: Some(0.0),
+                    ts: 1_100,
+                },
+                NormalizedTrade {
+                    symbol: "ETHUSDT".to_string(),
+                    side: Side::Buy,
+                    leg: PositionLeg::Futures,
+                    price: 10.0,
+                    amount_u: 300.0,
+                    fee_usdt: Some(0.0),
+                    ts: 1_200,
+                },
+            ],
+            ..PnlInputs::default()
+        };
+        let mut calculation = request(1_000, 1_300);
+        calculation.source = PnlSourceKind::MarketMaking;
+
+        let response = calculate(inputs, calculation).unwrap();
+        let final_point = response.points.last().unwrap();
+
+        assert_eq!(final_point.spot_position_usdt, 0.0);
+        assert_eq!(final_point.futures_position_usdt, -200.0);
+        assert_eq!(final_point.exposure_usdt, 800.0);
+        assert_eq!(response.summary.open_amount_usdt, 800.0);
+        assert!(!response.source.interest_included);
+        assert_eq!(response.source.adapter, "market_making_futures_v1");
+    }
+}

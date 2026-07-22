@@ -1,15 +1,17 @@
+use crate::pnl::{self, PnlCalculation, PnlSourceKind};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
     FromRow, PgPool,
+    migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::Path, str::FromStr};
@@ -21,6 +23,7 @@ const DEFAULT_BIND: &str = "127.0.0.1:4200";
 const DEFAULT_DB_HOST: &str = "/var/run/postgresql";
 const DEFAULT_DB_NAME: &str = "crypto_nav_manager";
 const DEFAULT_DB_USER: &str = "ubuntu";
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 struct AppState {
@@ -71,6 +74,24 @@ struct HealthResponse {
     strategies: usize,
 }
 
+#[derive(Debug, FromRow)]
+struct PnlStrategyRecord {
+    db_schema: String,
+    st_ms: i64,
+    exchange: String,
+    account_mode: String,
+    strategy_kind: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlQuery {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    symbols: Option<String>,
+    max_points: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
@@ -116,7 +137,7 @@ pub async fn run() -> Result<()> {
         .await
         .context("connect PostgreSQL")?;
 
-    sqlx::migrate!("./migrations")
+    MIGRATOR
         .run(&pool)
         .await
         .context("run PostgreSQL migrations")?;
@@ -125,6 +146,7 @@ pub async fn run() -> Result<()> {
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
         .route("/api/strategies/{slug}", get(get_strategy))
+        .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
         .with_state(AppState { pool })
         .layer(TraceLayer::new_for_http());
 
@@ -211,6 +233,98 @@ async fn get_strategy(
         )
             .into_response()),
     }
+}
+async fn get_strategy_pnl(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Query(query): Query<PnlQuery>,
+) -> Result<Response, ApiError> {
+    let strategy = sqlx::query_as::<_, PnlStrategyRecord>(
+        r#"
+        SELECT db_schema, st_ms, exchange, account_mode, strategy_kind
+        FROM strategy_envs
+        WHERE enabled AND slug = $1
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(strategy) = strategy else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "strategy not found",
+            }),
+        )
+            .into_response());
+    };
+
+    let Some(source) = PnlSourceKind::for_strategy(
+        &strategy.strategy_kind,
+        &strategy.exchange,
+        &strategy.account_mode,
+    ) else {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: "PnL data source is not available for this strategy",
+            }),
+        )
+            .into_response());
+    };
+
+    let start_ms = query.start_ms.unwrap_or(strategy.st_ms);
+    let end_ms = query
+        .end_ms
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    if start_ms < strategy.st_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "startMs must be greater than or equal to strategy stMs",
+            }),
+        )
+            .into_response());
+    }
+    if end_ms < start_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "endMs must be greater than or equal to startMs",
+            }),
+        )
+            .into_response());
+    }
+
+    let selected_symbols = query
+        .symbols
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    let inputs = pnl::load_inputs(
+        &state.pool,
+        source,
+        &strategy.db_schema,
+        strategy.st_ms,
+        end_ms,
+    )
+    .await?;
+    let response = pnl::calculate(
+        inputs,
+        PnlCalculation {
+            source,
+            strategy_start_ms: strategy.st_ms,
+            start_ms,
+            end_ms,
+            selected_symbols,
+            max_points: query.max_points.unwrap_or(3_000).clamp(200, 10_000),
+        },
+    )?;
+
+    Ok(Json(response).into_response())
 }
 
 fn strategy_response(row: StrategyRecord) -> Result<StrategyResponse> {

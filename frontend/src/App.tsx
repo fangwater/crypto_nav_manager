@@ -4,8 +4,8 @@ import './App.css'
 import { IndexPage } from './pages/IndexPage'
 
 const StrategyPage = lazy(() =>
-  import('./pages/StrategyPage').then((module) => ({
-    default: module.StrategyPage,
+  import('./pages/PnlStrategyPage').then((module) => ({
+    default: module.PnlStrategyPage,
   })),
 )
 
