@@ -96,7 +96,26 @@ impl GateClient {
         self.private_get("/unified/accounts", Vec::new(), 1).await
     }
 
+    pub async fn unified_mode(&self) -> Result<Value, ExchangeError> {
+        self.private_get("/unified/unified_mode", Vec::new(), 1)
+            .await
+    }
+
+    pub async fn futures_account(&self) -> Result<Value, ExchangeError> {
+        self.private_get("/futures/usdt/accounts", Vec::new(), 1)
+            .await
+    }
+
+    pub async fn futures_positions(&self) -> Result<Vec<Value>, ExchangeError> {
+        root_array(
+            EXCHANGE,
+            self.private_get("/futures/usdt/positions", Vec::new(), 1)
+                .await?,
+        )
+    }
+
     pub async fn spot_trades(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut page = 1_u32;
@@ -113,7 +132,7 @@ impl GateClient {
                     self.private_get("/spot/my_trades", params, 1).await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch);
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 100 {
                     break;
                 }
@@ -126,6 +145,7 @@ impl GateClient {
     }
 
     pub async fn futures_trades(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut offset = 0_u32;
@@ -142,7 +162,7 @@ impl GateClient {
                         .await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch);
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 1_000 {
                     break;
                 }
@@ -159,6 +179,7 @@ impl GateClient {
         range: TimeRange,
         book_type: GateBookType,
     ) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut offset = 0_u32;
@@ -176,7 +197,7 @@ impl GateClient {
                         .await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch);
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 1_000 {
                     break;
                 }
@@ -220,10 +241,7 @@ impl GateClient {
                         .await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch.into_iter().filter(|row| {
-                    liquidation_time_ms(row)
-                        .is_some_and(|ts| range.start_ms <= ts && ts <= range.end_ms)
-                }));
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 100 {
                     break;
                 }
@@ -263,6 +281,7 @@ impl GateClient {
     }
 
     pub async fn interest_records(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut page = 1_u32;
@@ -280,7 +299,7 @@ impl GateClient {
                         .await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch);
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 100 {
                     break;
                 }
@@ -297,6 +316,7 @@ impl GateClient {
         currency: &str,
         range: TimeRange,
     ) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut page = 1_u32;
@@ -313,7 +333,7 @@ impl GateClient {
                     self.private_get("/spot/account_book", params, 1).await?,
                 )?;
                 let batch_len = batch.len();
-                rows.extend(batch);
+                extend_in_range(&mut rows, batch, range);
                 if batch_len < 1_000 {
                     break;
                 }
@@ -356,6 +376,9 @@ impl GateClient {
         range: Option<TimeRange>,
         limit: u32,
     ) -> Result<Vec<Value>, ExchangeError> {
+        let range = range
+            .map(|range| TimeRange::new(range.start_ms, range.end_ms))
+            .transpose()?;
         let mut params = vec![
             ("contract".to_string(), contract.to_string()),
             ("limit".to_string(), limit.clamp(1, 1_000).to_string()),
@@ -364,11 +387,18 @@ impl GateClient {
             params.push(("from".to_string(), (range.start_ms / 1_000).to_string()));
             params.push(("to".to_string(), (range.end_ms / 1_000).to_string()));
         }
-        root_array(
+        let mut rows = root_array(
             EXCHANGE,
             self.public_get("/futures/usdt/funding_rate", params, 1)
                 .await?,
-        )
+        )?;
+        if let Some(range) = range {
+            rows.retain(|row| {
+                timestamp_ms(row).is_some_and(|timestamp| in_range(range, timestamp))
+            });
+        }
+        sort_by_timestamp(&mut rows);
+        Ok(rows)
     }
 
     pub async fn futures_contracts(&self) -> Result<Vec<Value>, ExchangeError> {
@@ -518,26 +548,53 @@ fn dedup(rows: &mut Vec<Value>, keys: &[&str]) {
     });
 }
 
-fn liquidation_time_ms(row: &Value) -> Option<i64> {
-    row.get("time_ms")
-        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-        .or_else(|| {
-            row.get("time")
-                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-                .map(|seconds: i64| seconds.saturating_mul(1_000))
-        })
+fn extend_in_range(rows: &mut Vec<Value>, batch: Vec<Value>, range: TimeRange) {
+    rows.extend(
+        batch
+            .into_iter()
+            .filter(|row| timestamp_ms(row).is_some_and(|timestamp| in_range(range, timestamp))),
+    );
+}
+
+fn in_range(range: TimeRange, timestamp_ms: i64) -> bool {
+    range.start_ms <= timestamp_ms && timestamp_ms <= range.end_ms
+}
+
+fn timestamp_ms(row: &Value) -> Option<i64> {
+    [
+        "create_time_ms",
+        "time_ms",
+        "transaction_time_ms",
+        "transaction_time",
+        "create_time",
+        "time",
+        "timestamp",
+        "t",
+    ]
+    .into_iter()
+    .find_map(|key| row.get(key).and_then(timestamp_value_ms))
+}
+
+fn timestamp_value_ms(value: &Value) -> Option<i64> {
+    let number = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(number) => number.parse::<f64>().ok(),
+        _ => None,
+    }?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+
+    let milliseconds = if number < 100_000_000_000.0 {
+        number * 1_000.0
+    } else {
+        number
+    };
+    (milliseconds <= i64::MAX as f64).then(|| milliseconds.round() as i64)
 }
 
 fn sort_by_timestamp(rows: &mut [Value]) {
-    rows.sort_by_key(|row| {
-        ["create_time_ms", "time_ms", "time"]
-            .into_iter()
-            .find_map(|key| {
-                row.get(key)
-                    .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-            })
-            .unwrap_or_default()
-    });
+    rows.sort_by_key(|row| timestamp_ms(row).unwrap_or_default());
 }
 
 #[cfg(test)]
@@ -561,14 +618,41 @@ mod tests {
     }
 
     #[test]
-    fn liquidation_time_supports_seconds_and_milliseconds() {
+    fn timestamp_supports_seconds_milliseconds_and_fractional_seconds() {
         assert_eq!(
-            liquidation_time_ms(&serde_json::json!({"time": 1_700_000_000})),
+            timestamp_ms(&serde_json::json!({"time": 1_700_000_000})),
             Some(1_700_000_000_000)
         );
         assert_eq!(
-            liquidation_time_ms(&serde_json::json!({"time_ms": 1_700_000_000_123_i64})),
+            timestamp_ms(&serde_json::json!({"time_ms": 1_700_000_000_123_i64})),
             Some(1_700_000_000_123)
         );
+        assert_eq!(
+            timestamp_ms(&serde_json::json!({"create_time_ms": "1700000000.123"})),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            timestamp_ms(&serde_json::json!({"t": "1700000000"})),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn exact_millisecond_range_filter_drops_boundary_overflow() {
+        let mut rows = Vec::new();
+        extend_in_range(
+            &mut rows,
+            vec![
+                serde_json::json!({"time_ms": 1_700_000_000_122_i64}),
+                serde_json::json!({"time_ms": 1_700_000_000_123_i64}),
+                serde_json::json!({"time_ms": 1_700_000_000_124_i64}),
+                serde_json::json!({"time": "invalid"}),
+            ],
+            TimeRange {
+                start_ms: 1_700_000_000_123,
+                end_ms: 1_700_000_000_123,
+            },
+        );
+        assert_eq!(rows.len(), 1);
     }
 }

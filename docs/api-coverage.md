@@ -61,7 +61,9 @@ UM futures transaction history 异步下载或本地历史 CSV。
 | 能力 | REST API |
 | --- | --- |
 | 账户净值、资产、负债 | GET /api/v4/unified/accounts |
+| Unified 账户模式 | GET /api/v4/unified/unified_mode |
 | 现货成交 | GET /api/v4/spot/my_trades，account=unified |
+| USDT 合约账户、仓位 | GET /api/v4/futures/usdt/accounts；GET /api/v4/futures/usdt/positions |
 | USDT 合约成交 | GET /api/v4/futures/usdt/my_trades_timerange |
 | 本账户 USDT 合约强平历史 | GET /api/v4/futures/usdt/liquidates（私有鉴权） |
 | 资金费、手续费、已实现盈亏 | GET /api/v4/futures/usdt/account_book，type=fund/fee/pnl |
@@ -75,6 +77,8 @@ UM futures transaction history 异步下载或本地历史 CSV。
 
 Gate 合约私有请求自动带 X-Gate-Size-Decimal: 1，避免整数张数响应丢失小数精度。强平查询使用私有
 `/liquidates`，不会误用返回市场全量数据的公共 `/liq_orders`。
+历史接口按 Gate 的秒级参数查询后，再统一解析秒、毫秒及小数秒时间字段并按调用方的毫秒范围严格过滤，
+避免首尾边界同一秒内的范围外记录进入同步结果。
 
 ## Bitget UTA v3
 
