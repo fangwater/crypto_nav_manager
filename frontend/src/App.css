@@ -1598,6 +1598,11 @@
   color: #14594c;
 }
 
+.fee-table-expand:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
 .fee-table {
   width: 100%;
   min-width: 720px;

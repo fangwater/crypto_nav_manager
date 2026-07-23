@@ -134,7 +134,13 @@ struct AccountFeeRatesResponse {
     strategy_kind: String,
     sort_order: i32,
     rates: Vec<FeeRateResponse>,
+    hidden_rate_count: usize,
+    hidden_instrument_count: usize,
 }
+
+const BYBIT_DEFAULT_INSTRUMENTS: [&str; 6] = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT",
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,6 +207,7 @@ pub async fn run() -> Result<()> {
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
         .route("/api/fee-rates", get(list_fee_rates))
+        .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
         .route("/api/strategies/{slug}", get(get_strategy))
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
@@ -295,21 +302,81 @@ async fn list_fee_rates(
     let mut accounts = Vec::with_capacity(strategies.len());
     for strategy in strategies {
         let rates = load_latest_fee_rates(&state.pool, &strategy.db_schema).await?;
-        accounts.push(AccountFeeRatesResponse {
-            display_name: strategy
-                .alias
-                .clone()
-                .unwrap_or_else(|| strategy.slug.clone()),
-            slug: strategy.slug,
-            exchange: strategy.exchange,
-            account_mode: strategy.account_mode,
-            strategy_kind: strategy.strategy_kind,
-            sort_order: strategy.sort_order,
-            rates,
-        });
+        accounts.push(account_fee_rates_response(strategy, rates, true));
     }
 
     Ok(Json(accounts))
+}
+
+async fn get_account_fee_rates(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let strategy = sqlx::query_as::<_, StrategyRecord>(
+        r#"
+        SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
+               st_ms, strategy_kind, exchange, account_mode, required_keys,
+               config_url, sort_order
+        FROM strategy_envs
+        WHERE enabled AND slug = $1
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(strategy) = strategy else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "strategy not found",
+            }),
+        )
+            .into_response());
+    };
+    let rates = load_latest_fee_rates(&state.pool, &strategy.db_schema).await?;
+    Ok(Json(account_fee_rates_response(strategy, rates, false)).into_response())
+}
+
+fn account_fee_rates_response(
+    strategy: StrategyRecord,
+    mut rates: Vec<FeeRateResponse>,
+    collapse_bybit: bool,
+) -> AccountFeeRatesResponse {
+    let mut hidden_rate_count = 0;
+    let mut hidden_instruments = HashSet::new();
+    if collapse_bybit && strategy.exchange == "bybit" {
+        rates.retain(|rate| {
+            let keep = is_default_bybit_instrument(&rate.instrument);
+            if !keep {
+                hidden_rate_count += 1;
+                hidden_instruments.insert(rate.instrument.clone());
+            }
+            keep
+        });
+    }
+    AccountFeeRatesResponse {
+        display_name: strategy
+            .alias
+            .clone()
+            .unwrap_or_else(|| strategy.slug.clone()),
+        slug: strategy.slug,
+        exchange: strategy.exchange,
+        account_mode: strategy.account_mode,
+        strategy_kind: strategy.strategy_kind,
+        sort_order: strategy.sort_order,
+        rates,
+        hidden_rate_count,
+        hidden_instrument_count: hidden_instruments.len(),
+    }
+}
+
+fn is_default_bybit_instrument(instrument: &str) -> bool {
+    let compact = instrument
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    BYBIT_DEFAULT_INSTRUMENTS.contains(&compact.as_str())
 }
 
 async fn sync_account_fee_rates(
@@ -647,7 +714,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{assigned_env_keys, valid_schema};
+    use super::{assigned_env_keys, is_default_bybit_instrument, valid_schema};
 
     #[test]
     fn detects_only_non_empty_assignments() {
@@ -674,5 +741,15 @@ mod tests {
         assert!(!valid_schema(""));
         assert!(!valid_schema("public.trading_fee_rates"));
         assert!(!valid_schema("fee-rates"));
+    }
+
+    #[test]
+    fn limits_default_bybit_instruments() {
+        for instrument in [
+            "BTCUSDT", "ETH-USDT", "sol_usdt", "XRPUSDT", "BNBUSDT", "DOGEUSDT",
+        ] {
+            assert!(is_default_bybit_instrument(instrument));
+        }
+        assert!(!is_default_bybit_instrument("ADAUSDT"));
     }
 }

@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getFeeRates, syncFeeRates } from '../api'
+import { getAccountFeeRates, getFeeRates, syncFeeRates } from '../api'
 import type { AccountFeeRates, Strategy, TradingFeeRate } from '../types'
 
 type ExchangeFilter = 'all' | Strategy['exchange']
@@ -133,34 +133,58 @@ function AccountRates({
   onSync,
 }: AccountRatesProps) {
   const [expanded, setExpanded] = useState(false)
+  const [expandedRates, setExpandedRates] = useState<TradingFeeRate[] | null>(
+    null,
+  )
+  const [expanding, setExpanding] = useState(false)
+  const [expandError, setExpandError] = useState<string>()
   const updatedAt = latestTime(account.rates)
-  const { defaultRates, otherRates } = useMemo(() => {
-    if (account.exchange !== 'bybit') {
-      return { defaultRates: account.rates, otherRates: [] }
-    }
-    const defaults: TradingFeeRate[] = []
-    const others: TradingFeeRate[] = []
-    for (const rate of account.rates) {
-      if (bybitDefaultSymbolIndex(rate.instrument) >= 0) defaults.push(rate)
-      else others.push(rate)
-    }
-    defaults.sort((left, right) => {
-      const symbolDifference =
-        bybitDefaultSymbolIndex(left.instrument) -
-        bybitDefaultSymbolIndex(right.instrument)
+  const visibleRates = useMemo(() => {
+    const rates = expanded && expandedRates ? expandedRates : account.rates
+    if (account.exchange !== 'bybit') return rates
+    return rates.slice().sort((left, right) => {
+      const leftIndex = bybitDefaultSymbolIndex(left.instrument)
+      const rightIndex = bybitDefaultSymbolIndex(right.instrument)
+      if (leftIndex >= 0 || rightIndex >= 0) {
+        if (leftIndex < 0) return 1
+        if (rightIndex < 0) return -1
+        const symbolDifference = leftIndex - rightIndex
+        if (symbolDifference) return symbolDifference
+      }
       return (
-        symbolDifference ||
-        marketOrder(left.market) - marketOrder(right.market)
+        marketOrder(left.market) - marketOrder(right.market) ||
+        left.instrument.localeCompare(right.instrument)
       )
     })
-    return { defaultRates: defaults, otherRates: others }
-  }, [account.exchange, account.rates])
-  const visibleRates = expanded
-    ? defaultRates.concat(otherRates)
-    : defaultRates
-  const otherInstrumentCount = new Set(
-    otherRates.map((rate) => rate.instrument),
-  ).size
+  }, [account.exchange, account.rates, expanded, expandedRates])
+
+  useEffect(() => {
+    setExpanded(false)
+    setExpandedRates(null)
+    setExpandError(undefined)
+  }, [updatedAt])
+
+  async function toggleExpanded() {
+    if (expanded) {
+      setExpanded(false)
+      return
+    }
+    if (expandedRates) {
+      setExpanded(true)
+      return
+    }
+    setExpanding(true)
+    setExpandError(undefined)
+    try {
+      const fullAccount = await getAccountFeeRates(account.slug)
+      setExpandedRates(fullAccount.rates)
+      setExpanded(true)
+    } catch (reason: unknown) {
+      setExpandError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setExpanding(false)
+    }
+  }
   return (
     <article className="fee-account">
       <header className="fee-account__header">
@@ -199,10 +223,10 @@ function AccountRates({
         </div>
       </header>
 
-      {syncError && (
+      {(syncError || expandError) && (
         <div className="fee-account-sync-error">
           <CircleAlert size={14} />
-          <span>{syncError}</span>
+          <span>{syncError ?? expandError}</span>
         </div>
       )}
 
@@ -254,22 +278,27 @@ function AccountRates({
               </tbody>
             </table>
           </div>
-          {otherRates.length > 0 && (
+          {account.hiddenInstrumentCount > 0 && (
             <div className="fee-table-actions">
               <button
                 className="fee-table-expand"
                 type="button"
                 aria-expanded={expanded}
-                onClick={() => setExpanded((current) => !current)}
+                disabled={expanding}
+                onClick={toggleExpanded}
               >
-                {expanded ? (
+                {expanding ? (
+                  <RefreshCw size={15} className="is-spinning" />
+                ) : expanded ? (
                   <ChevronUp size={15} />
                 ) : (
                   <ChevronDown size={15} />
                 )}
-                {expanded
+                {expanding
+                  ? '加载中'
+                  : expanded
                   ? '收起其他币种'
-                  : `展开其他币种 (${otherInstrumentCount})`}
+                  : `展开其他币种 (${account.hiddenInstrumentCount})`}
               </button>
             </div>
           )}

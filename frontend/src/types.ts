@@ -36,6 +36,8 @@ export interface AccountFeeRates {
   strategyKind: Strategy['strategyKind']
   sortOrder: number
   rates: TradingFeeRate[]
+  hiddenRateCount: number
+  hiddenInstrumentCount: number
 }
 export interface PnlSummary {
   tradeCount: number

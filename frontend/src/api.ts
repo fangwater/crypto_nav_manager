@@ -30,6 +30,12 @@ export function getFeeRates(signal?: AbortSignal): Promise<AccountFeeRates[]> {
   return getJson<AccountFeeRates[]>('/fee-rates', signal)
 }
 
+export function getAccountFeeRates(slug: string): Promise<AccountFeeRates> {
+  return getJson<AccountFeeRates>(
+    '/fee-rates/' + encodeURIComponent(slug),
+  )
+}
+
 export async function syncFeeRates(slug: string): Promise<void> {
   const response = await fetch(
     API_BASE + '/fee-rates/' + encodeURIComponent(slug) + '/sync',
