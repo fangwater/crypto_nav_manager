@@ -36,6 +36,7 @@ enum Dataset {
     Trades,
     Funding,
     Interest,
+    Rebates,
 }
 
 impl Dataset {
@@ -45,6 +46,7 @@ impl Dataset {
             Self::Trades => "trades",
             Self::Funding => "funding",
             Self::Interest => "interest",
+            Self::Rebates => "rebates",
         }
     }
 }
@@ -111,6 +113,7 @@ impl Strategy {
                 self.class != StrategyClass::Mm
                     && !(self.class == StrategyClass::Intra && self.exchange == "binance")
             }
+            Dataset::Rebates => self.exchange == "binance" && self.class == StrategyClass::Intra,
         }
     }
 }
@@ -156,6 +159,18 @@ struct CashRow {
     asset: String,
     amount: String,
     event_time_ms: i64,
+    raw: Value,
+}
+
+#[derive(Debug)]
+struct RebateRow {
+    record_id: String,
+    transaction_id: Option<String>,
+    asset: String,
+    amount: String,
+    event_time_ms: i64,
+    description: String,
+    direction: Option<i16>,
     raw: Value,
 }
 
@@ -225,7 +240,10 @@ async fn main() -> Result<()> {
                         dataset.name()
                     );
                 }
-                println!("skip interest: disabled for this strategy class");
+                println!(
+                    "skip {}: disabled for this exchange/strategy class",
+                    dataset.name()
+                );
                 continue;
             }
             sync_dataset(
@@ -249,7 +267,12 @@ async fn main() -> Result<()> {
 
 fn selected_datasets(dataset: Dataset) -> Vec<Dataset> {
     match dataset {
-        Dataset::All => vec![Dataset::Trades, Dataset::Funding, Dataset::Interest],
+        Dataset::All => vec![
+            Dataset::Trades,
+            Dataset::Funding,
+            Dataset::Interest,
+            Dataset::Rebates,
+        ],
         value => vec![value],
     }
 }
@@ -341,6 +364,19 @@ async fn sync_dataset(
             let affected = commit_cash(pool, strategy, dataset, storage, &rows, end_ms).await?;
             println!(
                 "interest complete: fetched={}, upserted={affected}",
+                rows.len()
+            );
+        }
+        Dataset::Rebates => {
+            let raw = fetch_rebates(client, range).await?;
+            let mut rows = raw
+                .into_iter()
+                .map(normalize_binance_rebate)
+                .collect::<Result<Vec<_>>>()?;
+            rows.sort_by_key(|row| row.event_time_ms);
+            let affected = commit_rebates(pool, strategy, &rows, end_ms).await?;
+            println!(
+                "rebates complete: fetched={}, upserted={affected}",
                 rows.len()
             );
         }
@@ -549,6 +585,16 @@ async fn fetch_interest(client: &ExchangeClient, range: TimeRange) -> Result<Vec
         ExchangeClient::Okx(client) => client.interest_accrued(None, range).await,
     }
     .context("fetch interest history")
+}
+
+async fn fetch_rebates(client: &ExchangeClient, range: TimeRange) -> Result<Vec<Value>> {
+    let ExchangeClient::Binance(client) = client else {
+        bail!("rebate history is only supported for Binance");
+    };
+    client
+        .asset_dividends(range)
+        .await
+        .context("fetch Binance wallet distributions")
 }
 
 async fn load_gate_multipliers(client: &ExchangeClient) -> Result<HashMap<String, f64>> {
@@ -1134,6 +1180,33 @@ fn normalize_cash(exchange: &str, dataset: Dataset, raw: Value) -> Result<CashRo
         raw,
     })
 }
+
+fn normalize_binance_rebate(raw: Value) -> Result<RebateRow> {
+    let record_id = text_field(&raw, &["id"])?;
+    let amount = number_field(&raw, &["amount"])?;
+    parse_number(&amount)?;
+    let event_time_ms = timestamp_field(&raw, &["divTime"])?;
+    if event_time_ms <= 0 {
+        bail!("invalid rebate timestamp for Binance/{record_id}");
+    }
+    let direction = optional_text(&raw, &["direction"])
+        .map(|value| {
+            value
+                .parse::<i16>()
+                .context("parse Binance rebate direction")
+        })
+        .transpose()?;
+    Ok(RebateRow {
+        record_id,
+        transaction_id: optional_text(&raw, &["tranId"]),
+        asset: text_field(&raw, &["asset"])?.to_ascii_uppercase(),
+        amount,
+        event_time_ms,
+        description: text_field(&raw, &["enInfo"])?,
+        direction,
+        raw,
+    })
+}
 async fn trade_storage(pool: &PgPool, schema: &str) -> Result<TradeStorage> {
     if column_exists(pool, schema, "trades", "sid").await? {
         return Ok(TradeStorage::Liang);
@@ -1220,6 +1293,7 @@ async fn latest_dataset_time(
                 CashStorage::Text(table) => (table, "transactionTime".to_string()),
             }
         }
+        Dataset::Rebates => ("rebates".to_string(), "event_time_ms".to_string()),
         Dataset::All => unreachable!(),
     };
     if !valid_schema(&strategy.schema) || !valid_identifier(&table) || !valid_identifier(&column) {
@@ -1556,6 +1630,61 @@ async fn commit_cash(
     Ok(affected)
 }
 
+async fn commit_rebates(
+    pool: &PgPool,
+    strategy: &Strategy,
+    rows: &[RebateRow],
+    end_ms: i64,
+) -> Result<u64> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin rebate sync transaction")?;
+    let mut affected = 0;
+    for batch in rows.chunks(BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO {}.rebates \
+             (record_id,transaction_id,asset,amount,amount_usdt,event_time_ms,\
+              description,direction,raw) ",
+            strategy.schema
+        );
+        let mut query = QueryBuilder::<Postgres>::new(sql);
+        query.push_values(batch, |mut values, row| {
+            let amount_usdt = matches!(row.asset.as_str(), "USD" | "USDC" | "USDT")
+                .then_some(row.amount.as_str());
+            values
+                .push_bind(&row.record_id)
+                .push_bind(&row.transaction_id)
+                .push_bind(&row.asset)
+                .push_bind(&row.amount)
+                .push_unseparated("::numeric")
+                .push_bind(amount_usdt)
+                .push_unseparated("::numeric")
+                .push_bind(row.event_time_ms)
+                .push_bind(&row.description)
+                .push_bind(row.direction)
+                .push_bind(&row.raw);
+        });
+        query.push(
+            " ON CONFLICT (record_id) DO UPDATE SET \
+             transaction_id=EXCLUDED.transaction_id,asset=EXCLUDED.asset,\
+             amount=EXCLUDED.amount,amount_usdt=EXCLUDED.amount_usdt,\
+             event_time_ms=EXCLUDED.event_time_ms,description=EXCLUDED.description,\
+             direction=EXCLUDED.direction,raw=EXCLUDED.raw,\
+             fetched_at=CURRENT_TIMESTAMP",
+        );
+        affected += query
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .context("upsert Binance rebate batch")?
+            .rows_affected();
+    }
+    advance_watermark(&mut transaction, &strategy.slug, Dataset::Rebates, end_ms).await?;
+    transaction.commit().await.context("commit rebate sync")?;
+    Ok(affected)
+}
+
 fn text_field(value: &Value, fields: &[&str]) -> Result<String> {
     fields
         .iter()
@@ -1775,6 +1904,13 @@ mod tests {
     }
 
     #[test]
+    fn rebate_policy_only_enables_binance_intra() {
+        assert!(strategy("binance", StrategyClass::Intra).supports(Dataset::Rebates));
+        assert!(!strategy("binance", StrategyClass::Fr).supports(Dataset::Rebates));
+        assert!(!strategy("bybit", StrategyClass::Intra).supports(Dataset::Rebates));
+    }
+
+    #[test]
     fn incremental_range_prefers_success_watermark() {
         assert_eq!(
             scan_start(1_000_000, Some(2_000_000), Some(3_000_000), false, 600_000).unwrap(),
@@ -1872,6 +2008,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gate.fee_amount, "-0.10");
+    }
+
+    #[test]
+    fn binance_wallet_distribution_normalizes_as_rebate() {
+        let row = normalize_binance_rebate(serde_json::json!({
+            "id": 1637366104_i64,
+            "amount": "0.2267047",
+            "asset": "USDT",
+            "divTime": 1784795703000_i64,
+            "enInfo": "Spot MM Rebate-Spot 26-07-23 07:00",
+            "tranId": 2968885920_i64,
+            "direction": 1
+        }))
+        .unwrap();
+        assert_eq!(row.record_id, "1637366104");
+        assert_eq!(row.transaction_id.as_deref(), Some("2968885920"));
+        assert_eq!(row.amount, "0.2267047");
+        assert_eq!(row.asset, "USDT");
+        assert_eq!(row.direction, Some(1));
+        assert_eq!(row.event_time_ms, 1784795703000_i64);
     }
 
     #[test]

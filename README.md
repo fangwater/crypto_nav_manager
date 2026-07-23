@@ -81,9 +81,10 @@ connection for another deployment.
 
 `strategy_envs` is an index of strategy aliases, execution hosts, env files,
 CSV output directories, strategy run start time (`st_ms`), and per-strategy
-PostgreSQL schemas. Strategy schemas
-contain four independent business datasets: trades, funding fees, borrow
-interest, and trading fee rates. Profiles are migrated to their existing Liang Torch names one at a
+PostgreSQL schemas. Strategy schemas contain independent business datasets
+for trades, funding fees, borrow interest, and trading fee rates. Binance
+intra schemas also store hourly Spot MM rebates from wallet distributions.
+Profiles are migrated to their existing Liang Torch names one at a
 time so their CSV consumers do not need a compatibility translation.
 
 The Binance FR profiles use per-strategy `trades` tables with the exact Liang
@@ -131,8 +132,10 @@ cargo run --release --bin sync_history -- \
 The command infers the exchange, account mode, and strategy class from
 `strategy_envs`. Incremental scans overlap the last successful scan by 30
 minutes and upsert with exchange-native record IDs. Market-making strategies
-and Binance intra strategies do not query interest. Repeat `--strategy` to
-scan multiple accounts in one invocation.
+and Binance intra strategies do not query interest. Binance intra `all` scans
+also include the `rebates` dataset; run `--dataset rebates --full` to backfill
+wallet distributions from the strategy's `st_ms`. Repeat `--strategy` to scan
+multiple accounts in one invocation.
 
 Sync current trading fee rates for every enabled strategy account:
 

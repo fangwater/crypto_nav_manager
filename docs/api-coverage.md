@@ -32,6 +32,7 @@
 | 资金费收入 | GET /papi/v1/um/income，incomeType=FUNDING_FEE | Portfolio Margin |
 | UM 合约手续费率 | GET /fapi/v1/commissionRate；GET /papi/v1/um/commissionRate | USD-M Futures；Portfolio Margin |
 | 借贷计息历史 | GET /papi/v1/margin/marginInterestHistory | Portfolio Margin |
+| Spot MM 小时返佣入账 | GET /sapi/v1/asset/assetDividend | USD-M Futures 标准账户 |
 | 标记价、当前资金费率 | GET /fapi/v1/premiumIndex | 公共 |
 | 合约、现货估值价格 | GET /fapi/v2/ticker/price；GET /api/v3/ticker/price | 公共 |
 | Portfolio Margin 抵押率 | GET /sapi/v1/portfolio/collateralRate | API key |
@@ -39,7 +40,8 @@
 成交按交易所允许的时间窗口分块并继续使用 fromId 分页。资金费按 `page` 分页，使用同一
 `incomeType` 内唯一的 `tranId` 去重并按时间排序。在线 income 文档标明只保留最近三个月；
 实际可返回窗口可能更长，但不能据此假定从任意 `startTime` 开始的数据都完整。更早数据需走
-UM futures transaction history 异步下载或本地历史 CSV。
+UM futures transaction history 异步下载或本地历史 CSV。Spot MM 返佣从策略 `st_ms` 开始同步；
+assetDividend 窗口若达到 500 条上限则自动二分，并按分发记录 `id` 幂等写入 `rebates` 表。
 
 ## Bybit UTA v5
 

@@ -18,6 +18,8 @@ const PAPI_BASE: &str = "https://papi.binance.com";
 const API_BASE: &str = "https://api.binance.com";
 const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const ASSET_DIVIDEND_MAX_SPAN_MS: i64 = 180 * ONE_DAY_MS;
+const ASSET_DIVIDEND_LIMIT: usize = 500;
 const LIMIT: usize = 1_000;
 const FORCE_ORDER_LIMIT: usize = 100;
 
@@ -257,6 +259,54 @@ impl BinanceClient {
             BinanceAccountMode::UsdmFutures => self.usdm_funding_fees(range).await,
             BinanceAccountMode::PortfolioMargin => self.portfolio_margin_funding_fees(range).await,
         }
+    }
+
+    /// Queries Spot wallet distributions, including hourly Spot MM rebates.
+    /// Saturated windows are split recursively because this endpoint has no
+    /// page cursor and returns at most 500 rows.
+    pub async fn asset_dividends(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        self.require_standard_account()?;
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
+        let mut pending = range.chunks(ASSET_DIVIDEND_MAX_SPAN_MS)?;
+        pending.reverse();
+        let mut rows = Vec::new();
+
+        while let Some(window) = pending.pop() {
+            let params = vec![
+                ("startTime".to_string(), window.start_ms.to_string()),
+                ("endTime".to_string(), window.end_ms.to_string()),
+                ("limit".to_string(), ASSET_DIVIDEND_LIMIT.to_string()),
+            ];
+            let value = self
+                .signed_get(API_BASE, "/sapi/v1/asset/assetDividend", params, 10)
+                .await?;
+            let total = value_i64(&value, "total");
+            let page = value
+                .get("rows")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| ExchangeError::InvalidResponse {
+                    exchange: EXCHANGE,
+                    message: "asset dividend response is missing rows".to_string(),
+                })?;
+            let page_len = page.len();
+
+            if asset_dividend_page_is_saturated(total, page_len) {
+                let (left, right) = split_asset_dividend_range(window)?;
+                pending.push(right);
+                pending.push(left);
+                continue;
+            }
+
+            rows.extend(page.into_iter().filter(|row| {
+                value_i64(row, "divTime")
+                    .is_some_and(|ts| window.start_ms <= ts && ts <= window.end_ms)
+            }));
+        }
+
+        dedup(&mut rows, &["id"]);
+        rows.sort_by_key(|row| value_i64(row, "divTime").unwrap_or_default());
+        Ok(rows)
     }
 
     async fn usdm_funding_fees(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
@@ -726,6 +776,35 @@ fn split_force_order_range(range: TimeRange) -> Result<(TimeRange, TimeRange), E
     ))
 }
 
+fn asset_dividend_page_is_saturated(total: Option<i64>, page_len: usize) -> bool {
+    total
+        .map(|total| total > page_len as i64)
+        .unwrap_or(page_len == ASSET_DIVIDEND_LIMIT)
+}
+
+fn split_asset_dividend_range(range: TimeRange) -> Result<(TimeRange, TimeRange), ExchangeError> {
+    if range.start_ms == range.end_ms {
+        return Err(ExchangeError::InvalidResponse {
+            exchange: EXCHANGE,
+            message: format!(
+                "asset dividends exceeded the {} row limit at timestamp {}",
+                ASSET_DIVIDEND_LIMIT, range.start_ms
+            ),
+        });
+    }
+    let middle = range.start_ms + (range.end_ms - range.start_ms) / 2;
+    Ok((
+        TimeRange {
+            start_ms: range.start_ms,
+            end_ms: middle,
+        },
+        TimeRange {
+            start_ms: middle + 1,
+            end_ms: range.end_ms,
+        },
+    ))
+}
+
 fn dedup(rows: &mut Vec<Value>, keys: &[&str]) {
     let mut seen = std::collections::HashSet::new();
     rows.retain(|row| {
@@ -797,5 +876,25 @@ mod tests {
 
         dedup(&mut rows, &["symbol", "id"]);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn asset_dividend_saturation_uses_reported_total() {
+        assert!(asset_dividend_page_is_saturated(Some(501), 500));
+        assert!(!asset_dividend_page_is_saturated(Some(500), 500));
+        assert!(asset_dividend_page_is_saturated(None, 500));
+        assert!(!asset_dividend_page_is_saturated(None, 499));
+    }
+
+    #[test]
+    fn saturated_asset_dividend_ranges_split_without_overlap() {
+        let (left, right) = split_asset_dividend_range(TimeRange {
+            start_ms: 100,
+            end_ms: 199,
+        })
+        .expect("range should split");
+        assert_eq!(left.end_ms, 149);
+        assert_eq!(right.start_ms, 150);
+        assert_eq!(right.end_ms, 199);
     }
 }
