@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   CircleAlert,
   Database,
+  Percent,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -83,9 +84,15 @@ export function IndexPage() {
               <p>净值管理系统</p>
             </div>
           </div>
-          <div className="system-state">
-            <span className="status-dot status-dot--ready" />
-            服务在线
+          <div className="header-actions">
+            <Link className="header-nav-link" to="/fee-rates">
+              <Percent size={16} />
+              手续费
+            </Link>
+            <div className="system-state">
+              <span className="status-dot status-dot--ready" />
+              服务在线
+            </div>
           </div>
         </div>
       </header>

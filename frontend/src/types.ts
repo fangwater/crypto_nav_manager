@@ -16,6 +16,27 @@ export interface Strategy {
   credentialsReady: boolean
   missingKeys: string[]
 }
+
+export interface TradingFeeRate {
+  market: string
+  instrument: string
+  makerRate: string
+  takerRate: string
+  feeTier: string | null
+  feeGroup: string | null
+  effectiveAtMs: number
+  fetchedAtMs: number
+}
+
+export interface AccountFeeRates {
+  slug: string
+  displayName: string
+  exchange: Strategy['exchange']
+  accountMode: string
+  strategyKind: Strategy['strategyKind']
+  sortOrder: number
+  rates: TradingFeeRate[]
+}
 export interface PnlSummary {
   tradeCount: number
   volumeUsdt: number

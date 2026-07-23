@@ -1,7 +1,7 @@
 use super::{
     ExchangeError,
     common::{Params, get_json, header_value, now_ms, query_string, root_array},
-    fee_rates::normalize_binance,
+    fee_rates::{normalize_binance, normalize_binance_spot},
 };
 use crate::{
     models::{TimeRange, TradingFeeRate},
@@ -281,6 +281,28 @@ impl BinanceClient {
             BinanceAccountMode::PortfolioMargin => "portfolio_margin",
         };
         normalize_binance(raw, account_mode, now_ms())
+    }
+
+    pub async fn raw_spot_fee_rates(&self, symbol: &str) -> Result<Value, ExchangeError> {
+        self.signed_get(
+            API_BASE,
+            "/api/v3/account/commission",
+            vec![("symbol".to_string(), symbol.to_ascii_uppercase())],
+            20,
+        )
+        .await
+    }
+
+    pub async fn spot_fee_rates(&self, symbol: &str) -> Result<Vec<TradingFeeRate>, ExchangeError> {
+        let account_mode = match self.mode {
+            BinanceAccountMode::UsdmFutures => "usdm_futures",
+            BinanceAccountMode::PortfolioMargin => "portfolio_margin",
+        };
+        normalize_binance_spot(
+            self.raw_spot_fee_rates(symbol).await?,
+            account_mode,
+            now_ms(),
+        )
     }
 
     pub async fn margin_interest(

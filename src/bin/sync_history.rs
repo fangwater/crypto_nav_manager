@@ -24,7 +24,7 @@ use std::{
     env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const BATCH_SIZE: usize = 1_000;
@@ -580,11 +580,16 @@ async fn build_client(
     let local_ips = configured_or_exchange_local_ips(pool, &strategy.exchange, local_ip.to_vec())
         .await
         .with_context(|| format!("select {} REST source IPs", strategy.exchange))?;
-    let dispatcher = Dispatcher::new(DispatcherConfig {
+    let mut dispatcher_config = DispatcherConfig {
         local_ips,
         ..DispatcherConfig::default()
-    })
-    .with_context(|| format!("create {} REST dispatcher", strategy.exchange))?;
+    };
+    if strategy.exchange == "bitget" {
+        // Bitget history limits are UID-scoped, so immediate alternate-IP retries do not help.
+        dispatcher_config.max_rate_limit_retries = 0;
+    }
+    let dispatcher = Dispatcher::new(dispatcher_config)
+        .with_context(|| format!("create {} REST dispatcher", strategy.exchange))?;
     let values = read_env(&strategy.env_path)?;
     let client = match strategy.exchange.as_str() {
         "binance" => {
@@ -616,14 +621,17 @@ async fn build_client(
                 env_required_any(&values, &["GATE_API_SECRET", "GATE_SECRET_KEY"])?,
             ),
         )),
-        "bitget" => ExchangeClient::Bitget(BitgetClient::new(
-            dispatcher,
-            BitgetCredentials::new(
-                env_required(&values, "BITGET_API_KEY")?,
-                env_required_any(&values, &["BITGET_API_SECRET", "BITGET_SECRET_KEY"])?,
-                env_required_any(&values, &["BITGET_API_PASSPHRASE", "BITGET_PASSPHRASE"])?,
-            ),
-        )),
+        "bitget" => ExchangeClient::Bitget(
+            BitgetClient::new(
+                dispatcher,
+                BitgetCredentials::new(
+                    env_required(&values, "BITGET_API_KEY")?,
+                    env_required_any(&values, &["BITGET_API_SECRET", "BITGET_SECRET_KEY"])?,
+                    env_required_any(&values, &["BITGET_API_PASSPHRASE", "BITGET_PASSPHRASE"])?,
+                ),
+            )
+            .with_history_request_policy(Duration::from_millis(250), 3),
+        ),
         "okx" | "okex" => ExchangeClient::Okx(OkxClient::new(
             dispatcher,
             OkxCredentials::new(
@@ -934,6 +942,9 @@ fn bitget_fee(raw: &Value) -> (String, String) {
 
 fn normalize_okx_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
     let exec_type = optional_text(&raw, &["execType"]).unwrap_or_default();
+    // OKX reports charges as negative and rebates as positive. Internally fees
+    // are signed costs, so paid fees are positive and rebates are negative.
+    let fee_amount = negate_decimal(&number_field(&raw, &["fee"]).unwrap_or_else(|_| "0".into()))?;
     make_trade(
         leg,
         if leg == Leg::Spot { "margin" } else { "swap" },
@@ -949,7 +960,7 @@ fn normalize_okx_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
         number_field(&raw, &["fillPx"])?,
         number_field(&raw, &["fillSz"])?,
         None,
-        number_field(&raw, &["fee"]).unwrap_or_else(|_| "0".into()),
+        fee_amount,
         optional_text(&raw, &["feeCcy"]).unwrap_or_else(|| "USDT".into()),
         optional_number(&raw, &["fillPnl"]),
         timestamp_field(&raw, &["ts", "fillTime"])?,
@@ -1001,7 +1012,7 @@ fn make_trade(
         price,
         quantity: absolute_decimal(&quantity)?,
         quote_quantity,
-        fee_amount: absolute_decimal(&fee_amount)?,
+        fee_amount: signed_decimal(&fee_amount)?,
         fee_asset: fee_asset.to_ascii_uppercase(),
         realized_pnl,
         event_time_ms,
@@ -1636,6 +1647,29 @@ fn absolute_decimal(value: &str) -> Result<String> {
         .to_string())
 }
 
+fn signed_decimal(value: &str) -> Result<String> {
+    let number = parse_number(value)?;
+    if number == 0.0 {
+        return Ok("0".to_string());
+    }
+    Ok(value
+        .trim()
+        .strip_prefix('+')
+        .unwrap_or(value.trim())
+        .to_string())
+}
+
+fn negate_decimal(value: &str) -> Result<String> {
+    let value = signed_decimal(value)?;
+    if value == "0" {
+        return Ok(value);
+    }
+    Ok(match value.strip_prefix('-') {
+        Some(value) => value.to_string(),
+        None => format!("-{value}"),
+    })
+}
+
 fn decimal_string(value: f64) -> String {
     let mut text = format!("{value:.18}");
     while text.contains('.') && text.ends_with('0') {
@@ -1781,10 +1815,90 @@ mod tests {
         .unwrap();
         assert_eq!(row.trade_id, "131");
         assert_eq!(row.quantity, "0.01");
-        assert_eq!(row.fee_amount, "0.6417006");
+        assert_eq!(row.fee_amount, "-0.6417006");
         assert_eq!(row.fee_asset, "USDT");
         assert_eq!(row.role, "maker");
         assert_eq!(row.realized_pnl.as_deref(), Some("-0.002"));
+    }
+
+    #[test]
+    fn non_okx_trade_fees_preserve_rebate_sign() {
+        let binance = normalize_binance_trade(
+            Leg::Derivative,
+            serde_json::json!({
+                "symbol": "BTCUSDT",
+                "id": "1",
+                "orderId": "2",
+                "side": "BUY",
+                "price": "100000",
+                "qty": "0.01",
+                "commission": "-0.10",
+                "commissionAsset": "USDT",
+                "time": 1750141421721_i64
+            }),
+        )
+        .unwrap();
+        assert_eq!(binance.fee_amount, "-0.10");
+
+        let bybit = normalize_bybit_trade(
+            Leg::Derivative,
+            serde_json::json!({
+                "symbol": "BTCUSDT",
+                "execId": "1",
+                "orderId": "2",
+                "side": "Buy",
+                "execPrice": "100000",
+                "execQty": "0.01",
+                "execFee": "-0.10",
+                "feeCurrency": "USDT",
+                "execTime": "1750141421721"
+            }),
+        )
+        .unwrap();
+        assert_eq!(bybit.fee_amount, "-0.10");
+
+        let gate = normalize_gate_trade(
+            Leg::Derivative,
+            serde_json::json!({
+                "contract": "BTC_USDT",
+                "trade_id": "1",
+                "order_id": "2",
+                "size": "1",
+                "price": "100000",
+                "fee": "-0.10",
+                "create_time_ms": 1750141421721_i64
+            }),
+            &HashMap::from([("BTC_USDT".to_string(), 0.001)]),
+        )
+        .unwrap();
+        assert_eq!(gate.fee_amount, "-0.10");
+    }
+
+    #[test]
+    fn okx_trade_fee_is_converted_to_signed_cost() {
+        let normalize = |fee: &str| {
+            normalize_okx_trade(
+                Leg::Derivative,
+                serde_json::json!({
+                    "instId": "BTC-USDT-SWAP",
+                    "tradeId": "1",
+                    "ordId": "2",
+                    "side": "buy",
+                    "execType": "M",
+                    "fillPx": "100000",
+                    "fillSz": "0.01",
+                    "fee": fee,
+                    "feeCcy": "USDT",
+                    "ts": "1750141421721"
+                }),
+            )
+            .unwrap()
+            .fee_amount
+        };
+
+        assert_eq!(normalize("-0.10"), "0.10");
+        assert_eq!(normalize("0.05"), "-0.05");
+        assert_eq!(normalize("0"), "0");
     }
 
     #[test]

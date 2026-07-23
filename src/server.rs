@@ -86,6 +86,43 @@ struct PnlStrategyRecord {
     strategy_kind: String,
 }
 
+#[derive(Debug, FromRow)]
+struct FeeRateRecord {
+    market: String,
+    instrument: String,
+    maker_rate: String,
+    taker_rate: String,
+    fee_tier: Option<String>,
+    fee_group: Option<String>,
+    effective_at_ms: i64,
+    fetched_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeeRateResponse {
+    market: String,
+    instrument: String,
+    maker_rate: String,
+    taker_rate: String,
+    fee_tier: Option<String>,
+    fee_group: Option<String>,
+    effective_at_ms: i64,
+    fetched_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountFeeRatesResponse {
+    slug: String,
+    display_name: String,
+    exchange: String,
+    account_mode: String,
+    strategy_kind: String,
+    sort_order: i32,
+    rates: Vec<FeeRateResponse>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PnlQuery {
@@ -149,6 +186,7 @@ pub async fn run() -> Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
+        .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/strategies/{slug}", get(get_strategy))
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
         .with_state(AppState { pool })
@@ -208,6 +246,86 @@ async fn list_strategies(
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
         .map_err(ApiError)
+}
+
+async fn list_fee_rates(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AccountFeeRatesResponse>>, ApiError> {
+    let strategies = sqlx::query_as::<_, StrategyRecord>(
+        r#"
+        SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
+               st_ms, strategy_kind, exchange, account_mode, required_keys,
+               config_url, sort_order
+        FROM strategy_envs
+        WHERE enabled
+        ORDER BY sort_order, slug
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut accounts = Vec::with_capacity(strategies.len());
+    for strategy in strategies {
+        let rates = load_latest_fee_rates(&state.pool, &strategy.db_schema).await?;
+        accounts.push(AccountFeeRatesResponse {
+            display_name: strategy
+                .alias
+                .clone()
+                .unwrap_or_else(|| strategy.slug.clone()),
+            slug: strategy.slug,
+            exchange: strategy.exchange,
+            account_mode: strategy.account_mode,
+            strategy_kind: strategy.strategy_kind,
+            sort_order: strategy.sort_order,
+            rates,
+        });
+    }
+
+    Ok(Json(accounts))
+}
+
+async fn load_latest_fee_rates(pool: &PgPool, schema: &str) -> Result<Vec<FeeRateResponse>> {
+    if !valid_schema(schema) {
+        anyhow::bail!("invalid strategy schema: {schema}");
+    }
+    let table = format!("{schema}.trading_fee_rates");
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(&table)
+        .fetch_one(pool)
+        .await?;
+    if exists.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let query = format!(
+        r#"
+        SELECT market, instrument,
+               maker_rate::text AS maker_rate,
+               taker_rate::text AS taker_rate,
+               fee_tier, NULLIF(fee_group, '') AS fee_group,
+               effective_at_ms,
+               (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms
+        FROM {schema}.trading_fee_rates
+        WHERE fetched_at = (SELECT MAX(fetched_at) FROM {schema}.trading_fee_rates)
+        ORDER BY market, instrument, fee_group
+        "#
+    );
+    let rows = sqlx::query_as::<_, FeeRateRecord>(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| FeeRateResponse {
+            market: row.market,
+            instrument: row.instrument,
+            maker_rate: row.maker_rate,
+            taker_rate: row.taker_rate,
+            fee_tier: row.fee_tier,
+            fee_group: row.fee_group,
+            effective_at_ms: row.effective_at_ms,
+            fetched_at_ms: row.fetched_at_ms,
+        })
+        .collect())
 }
 
 async fn get_strategy(
@@ -396,6 +514,16 @@ fn assigned_env_keys(content: &str) -> HashMap<String, bool> {
         .collect()
 }
 
+fn valid_schema(schema: &str) -> bool {
+    let mut characters = schema.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase())
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -422,7 +550,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::assigned_env_keys;
+    use super::{assigned_env_keys, valid_schema};
 
     #[test]
     fn detects_only_non_empty_assignments() {
@@ -441,5 +569,13 @@ mod tests {
         assert_eq!(keys.get("IPC_NAMESPACE"), Some(&true));
         assert!(!keys.contains_key("INVALID-LINE"));
         assert!(!format!("{keys:?}").contains("abc"));
+    }
+
+    #[test]
+    fn validates_dynamic_strategy_schema() {
+        assert!(valid_schema("binance_intra_arb01"));
+        assert!(!valid_schema(""));
+        assert!(!valid_schema("public.trading_fee_rates"));
+        assert!(!valid_schema("fee-rates"));
     }
 }

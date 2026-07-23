@@ -9,6 +9,12 @@ const StrategyPage = lazy(() =>
   })),
 )
 
+const FeeRatesPage = lazy(() =>
+  import('./pages/FeeRatesPage').then((module) => ({
+    default: module.FeeRatesPage,
+  })),
+)
+
 export default function App() {
   return (
     <Suspense
@@ -20,6 +26,7 @@ export default function App() {
     >
       <Routes>
         <Route path="/" element={<IndexPage />} />
+        <Route path="/fee-rates" element={<FeeRatesPage />} />
         <Route path="/strategies/:slug" element={<StrategyPage />} />
       </Routes>
     </Suspense>

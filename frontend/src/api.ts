@@ -1,4 +1,4 @@
-import type { Strategy, StrategyPnl } from './types'
+import type { AccountFeeRates, Strategy, StrategyPnl } from './types'
 
 const API_BASE = '/nav-api'
 
@@ -24,6 +24,10 @@ export function getStrategies(): Promise<Strategy[]> {
 
 export function getStrategy(slug: string): Promise<Strategy> {
   return getJson<Strategy>('/strategies/' + encodeURIComponent(slug))
+}
+
+export function getFeeRates(signal?: AbortSignal): Promise<AccountFeeRates[]> {
+  return getJson<AccountFeeRates[]>('/fee-rates', signal)
 }
 
 export interface StrategyPnlQuery {

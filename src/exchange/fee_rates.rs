@@ -21,19 +21,44 @@ pub(crate) fn normalize_binance(
     }])
 }
 
+pub(crate) fn normalize_binance_spot(
+    raw: Value,
+    account_mode: &str,
+    fetched_at_ms: i64,
+) -> Result<Vec<TradingFeeRate>, ExchangeError> {
+    let standard = raw
+        .get("standardCommission")
+        .ok_or_else(|| invalid("binance", "spot fee response is missing standardCommission"))?;
+    Ok(vec![TradingFeeRate {
+        exchange: "binance".to_string(),
+        account_mode: account_mode.to_string(),
+        market: "spot".to_string(),
+        instrument: required_string("binance", &raw, "symbol")?,
+        maker_rate: required_string("binance", standard, "maker")?,
+        taker_rate: required_string("binance", standard, "taker")?,
+        fee_tier: Some("standard_commission".to_string()),
+        fee_group: None,
+        effective_at_ms: fetched_at_ms,
+        raw,
+    }])
+}
+
 pub(crate) fn normalize_gate(
     raw: Value,
     market: &str,
     instrument: &str,
     fetched_at_ms: i64,
 ) -> Result<Vec<TradingFeeRate>, ExchangeError> {
+    let fee = raw.get(instrument).unwrap_or(&raw);
+    let maker_rate = required_string("gate", fee, "maker_fee")?;
+    let taker_rate = required_string("gate", fee, "taker_fee")?;
     Ok(vec![TradingFeeRate {
         exchange: "gate".to_string(),
         account_mode: "unified".to_string(),
         market: market.to_string(),
         instrument: instrument.to_string(),
-        maker_rate: required_string("gate", &raw, "maker_fee")?,
-        taker_rate: required_string("gate", &raw, "taker_fee")?,
+        maker_rate,
+        taker_rate,
         fee_tier: None,
         fee_group: None,
         effective_at_ms: fetched_at_ms,
@@ -239,11 +264,40 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_binance_spot_standard_commission() {
+        let rows = normalize_binance_spot(
+            json!({
+                "symbol": "LINKUSDT",
+                "standardCommission": {
+                    "maker": "0.00000000",
+                    "taker": "0.00023000",
+                    "buyer": "0.00000000",
+                    "seller": "0.00000000"
+                },
+                "specialCommission": {"maker": "0", "taker": "0"},
+                "taxCommission": {"maker": "0", "taker": "0"},
+                "discount": {"enabledForAccount": true, "discount": "0.75"}
+            }),
+            "usdm_futures",
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(rows[0].market, "spot");
+        assert_eq!(rows[0].instrument, "LINKUSDT");
+        assert_eq!(rows[0].maker_rate, "0.00000000");
+        assert_eq!(rows[0].taker_rate, "0.00023000");
+        assert_eq!(rows[0].fee_tier.as_deref(), Some("standard_commission"));
+    }
+
+    #[test]
     fn normalizes_gate_market_and_preserves_rebate_sign() {
         let rows = normalize_gate(
             json!({
-                "maker_fee": "-0.000075",
-                "taker_fee": "0.000175"
+                "BTC_USDT": {
+                    "maker_fee": "-0.000075",
+                    "taker_fee": "0.000175"
+                }
             }),
             "usdt_futures",
             "BTC_USDT",

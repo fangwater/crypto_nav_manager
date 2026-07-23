@@ -5,14 +5,18 @@ use super::{
 };
 use crate::{
     models::{ProductCategory, TimeRange, TradingFeeRate},
-    rest_dispatcher::Dispatcher,
+    rest_dispatcher::{DispatchError, Dispatcher},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, Mac};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::{
+    sync::Mutex,
+    time::{Instant, sleep, sleep_until},
+};
 
 const EXCHANGE: &str = "bitget";
 const BASE: &str = "https://api.bitget.com";
@@ -57,6 +61,25 @@ impl std::fmt::Debug for BitgetCredentials {
 pub struct BitgetClient {
     dispatcher: Dispatcher,
     credentials: BitgetCredentials,
+    history_policy: Option<HistoryRequestPolicy>,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryRequestPolicy {
+    min_interval: Duration,
+    max_429_retries: usize,
+    next_request_at: Arc<Mutex<Instant>>,
+}
+
+impl HistoryRequestPolicy {
+    async fn wait_turn(&self) {
+        let mut next_request_at = self.next_request_at.lock().await;
+        let now = Instant::now();
+        if *next_request_at > now {
+            sleep_until(*next_request_at).await;
+        }
+        *next_request_at = Instant::now() + self.min_interval;
+    }
 }
 
 impl BitgetClient {
@@ -64,7 +87,22 @@ impl BitgetClient {
         Self {
             dispatcher,
             credentials,
+            history_policy: None,
         }
+    }
+
+    /// Applies pacing and 429 retries only to paginated private history APIs.
+    pub fn with_history_request_policy(
+        mut self,
+        min_interval: Duration,
+        max_429_retries: usize,
+    ) -> Self {
+        self.history_policy = Some(HistoryRequestPolicy {
+            min_interval,
+            max_429_retries,
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
+        });
+        self
     }
 
     pub async fn account_info(&self) -> Result<Value, ExchangeError> {
@@ -109,7 +147,7 @@ impl BitgetClient {
                 if let Some(cursor) = &cursor {
                     params.push(("cursor".to_string(), cursor.clone()));
                 }
-                let value = self.private_get("/api/v3/trade/fills", params, 1).await?;
+                let value = self.history_get("/api/v3/trade/fills", params).await?;
                 let body = value
                     .get("data")
                     .and_then(Value::as_object)
@@ -169,7 +207,7 @@ impl BitgetClient {
                 }
 
                 let value = self
-                    .private_get("/api/v3/trade/history-orders", params, 1)
+                    .history_get("/api/v3/trade/history-orders", params)
                     .await?;
                 let body = value
                     .get("data")
@@ -230,7 +268,7 @@ impl BitgetClient {
                     params.push(("cursor".to_string(), cursor.clone()));
                 }
                 let value = self
-                    .private_get("/api/v3/account/financial-records", params, 1)
+                    .history_get("/api/v3/account/financial-records", params)
                     .await?;
                 let body = value
                     .get("data")
@@ -290,7 +328,7 @@ impl BitgetClient {
             ("symbol".to_string(), symbol.to_string()),
         ];
         let value = self
-            .private_get("/api/v3/account/all-fee-rate", params, 1)
+            .history_get("/api/v3/account/all-fee-rate", params)
             .await?;
         value
             .get("data")
@@ -344,6 +382,36 @@ impl BitgetClient {
     pub async fn discount_rates(&self) -> Result<Value, ExchangeError> {
         self.public_get("/api/v3/market/discount-rate", Vec::new(), 1)
             .await
+    }
+
+    async fn history_get(&self, path: &str, params: Params) -> Result<Value, ExchangeError> {
+        let Some(policy) = &self.history_policy else {
+            return self.private_get(path, params, 1).await;
+        };
+
+        for retry in 0..=policy.max_429_retries {
+            policy.wait_turn().await;
+            match self.private_get(path, params.clone(), 1).await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let Some(delay) = history_retry_delay(&error) else {
+                        return Err(error);
+                    };
+                    if retry == policy.max_429_retries {
+                        return Err(error);
+                    }
+                    eprintln!(
+                        "Bitget history rate limited; retry {}/{} after {:.1}s",
+                        retry + 1,
+                        policy.max_429_retries,
+                        delay.as_secs_f64()
+                    );
+                    sleep(delay).await;
+                }
+            }
+        }
+
+        unreachable!("history retry loop always returns")
     }
 
     async fn private_get(
@@ -427,6 +495,19 @@ fn sign_request(timestamp_ms: i64, method: &str, path: &str, body: &str, secret:
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
     mac.update(payload.as_bytes());
     BASE64.encode(mac.finalize().into_bytes())
+}
+
+fn history_retry_delay(error: &ExchangeError) -> Option<Duration> {
+    match error {
+        ExchangeError::Dispatch(DispatchError::RateLimited { retry_after, .. }) => {
+            Some(*retry_after)
+        }
+        ExchangeError::Dispatch(DispatchError::NoAvailableIp {
+            retry_after: Some(retry_after),
+        }) => Some(*retry_after),
+        ExchangeError::Api { code, .. } if code == "429" => Some(Duration::from_secs(60)),
+        _ => None,
+    }
 }
 
 fn check_api_error(value: Value) -> Result<Value, ExchangeError> {
@@ -545,5 +626,33 @@ mod tests {
         assert!(!is_liquidation_order(
             &serde_json::json!({"execType": "normal", "delegateType": "market"})
         ));
+    }
+    #[test]
+    fn history_request_policy_is_opt_in() {
+        let dispatcher = Dispatcher::new(crate::rest_dispatcher::DispatcherConfig {
+            local_ips: vec!["127.0.0.1".parse().unwrap()],
+            ..crate::rest_dispatcher::DispatcherConfig::default()
+        })
+        .unwrap();
+        let client = BitgetClient::new(
+            dispatcher,
+            BitgetCredentials::new("key", "secret", "passphrase"),
+        );
+        assert!(client.history_policy.is_none());
+
+        let client = client.with_history_request_policy(Duration::from_millis(250), 3);
+        let policy = client.history_policy.unwrap();
+        assert_eq!(policy.min_interval, Duration::from_millis(250));
+        assert_eq!(policy.max_429_retries, 3);
+    }
+
+    #[test]
+    fn retries_api_level_history_rate_limits() {
+        let error = ExchangeError::Api {
+            exchange: EXCHANGE,
+            code: "429".to_string(),
+            message: "too many requests".to_string(),
+        };
+        assert_eq!(history_retry_delay(&error), Some(Duration::from_secs(60)));
     }
 }
