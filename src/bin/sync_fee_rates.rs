@@ -12,6 +12,7 @@ use crypto_nav_manager::{
     models::{ProductCategory, TradingFeeRate},
     rest_dispatcher::{Dispatcher, DispatcherConfig},
     rest_ip_pool::configured_or_exchange_local_ips,
+    strategy_env::read_env_file,
 };
 use sqlx::{
     AssertSqlSafe, PgPool,
@@ -19,7 +20,7 @@ use sqlx::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    env, fs,
+    env,
     net::IpAddr,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,6 +28,9 @@ use std::{
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_SYMBOLS: usize = 7;
+const BINANCE_MM_SYMBOLS: [&str; 6] = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT",
+];
 
 #[derive(Debug, Parser)]
 #[command(about = "Sync current trading fee rates for registered strategy accounts")]
@@ -56,6 +60,7 @@ struct Args {
 struct Strategy {
     slug: String,
     schema: String,
+    host: String,
     env_path: PathBuf,
     exchange: String,
     account_mode: String,
@@ -129,8 +134,8 @@ async fn connect_pool() -> Result<PgPool> {
 }
 
 async fn load_strategies(pool: &PgPool, selected: &[String]) -> Result<Vec<Strategy>> {
-    let rows: Vec<(String, String, String, String, String, String, bool)> = sqlx::query_as(
-        "SELECT slug,db_schema,env_path,exchange,account_mode,strategy_kind,enabled \
+    let rows: Vec<(String, String, String, String, String, String, String, bool)> = sqlx::query_as(
+        "SELECT slug,db_schema,host,env_path,exchange,account_mode,strategy_kind,enabled \
          FROM strategy_envs ORDER BY sort_order,slug",
     )
     .fetch_all(pool)
@@ -140,7 +145,7 @@ async fn load_strategies(pool: &PgPool, selected: &[String]) -> Result<Vec<Strat
     let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let mut found = HashSet::new();
     let mut strategies = Vec::new();
-    for (slug, schema, env_path, exchange, account_mode, strategy_kind, enabled) in rows {
+    for (slug, schema, host, env_path, exchange, account_mode, strategy_kind, enabled) in rows {
         if selected.is_empty() {
             if !enabled {
                 continue;
@@ -161,6 +166,7 @@ async fn load_strategies(pool: &PgPool, selected: &[String]) -> Result<Vec<Strat
         strategies.push(Strategy {
             slug,
             schema,
+            host,
             env_path: PathBuf::from(env_path),
             exchange: exchange.to_ascii_lowercase(),
             account_mode,
@@ -193,12 +199,16 @@ async fn sync_strategy(
 ) -> Result<()> {
     ensure_fee_rate_table(pool, &strategy.schema).await?;
     let symbols = if override_symbols.is_empty() {
-        load_active_symbols(pool, strategy, active_days, fallback_symbol).await?
+        if strategy.exchange == "binance" && strategy.strategy_kind == "market_making" {
+            BINANCE_MM_SYMBOLS.into_iter().map(str::to_string).collect()
+        } else {
+            load_active_symbols(pool, strategy, active_days, fallback_symbol).await?
+        }
     } else {
         override_symbols.clone()
     };
     let dispatcher = build_dispatcher(pool, &strategy.exchange, local_ips).await?;
-    let credentials = read_env(&strategy.env_path)?;
+    let credentials = read_env(&strategy.host, &strategy.env_path)?;
     let mut rates = Vec::new();
     let mut market_successes = BTreeMap::new();
 
@@ -583,9 +593,8 @@ fn okx_instrument(symbol: &str) -> Result<String> {
     Ok(format!("{base}-USDT"))
 }
 
-fn read_env(path: &Path) -> Result<HashMap<String, String>> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("read env file {}", path.display()))?;
+fn read_env(host: &str, path: &Path) -> Result<HashMap<String, String>> {
+    let contents = read_env_file(host, path)?;
     let mut values = HashMap::new();
     for (line_number, original) in contents.lines().enumerate() {
         let mut line = original.trim();
@@ -681,6 +690,7 @@ mod tests {
         let strategy = Strategy {
             slug: "mm".to_string(),
             schema: "mm".to_string(),
+            host: "local".to_string(),
             env_path: PathBuf::new(),
             exchange: "binance".to_string(),
             account_mode: "usdm_futures".to_string(),
@@ -695,5 +705,16 @@ mod tests {
             }
             .includes_spot()
         );
+    }
+
+    #[test]
+    fn binance_market_making_uses_the_default_symbol_set() {
+        assert_eq!(
+            BINANCE_MM_SYMBOLS,
+            [
+                "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT"
+            ]
+        );
+        assert!(BINANCE_MM_SYMBOLS.len() <= MAX_SYMBOLS);
     }
 }

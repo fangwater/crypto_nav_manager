@@ -2,6 +2,7 @@ use crate::{
     contract_multipliers,
     mark_prices::MarkPriceCache,
     pnl::{self, PnlCalculation, PnlSourceKind},
+    strategy_env::read_env_file,
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -9,7 +10,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,9 +19,18 @@ use sqlx::{
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{collections::HashMap, env, fs, net::SocketAddr, path::Path, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    path::Path,
+    process::Command,
+    str::FromStr,
+    sync::Arc,
+};
+use tokio::{sync::Mutex, task::JoinSet};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_BIND: &str = "127.0.0.1:4200";
@@ -33,6 +43,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 struct AppState {
     pool: PgPool,
     mark_prices: MarkPriceCache,
+    fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -190,9 +201,14 @@ pub async fn run() -> Result<()> {
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
         .route("/api/fee-rates", get(list_fee_rates))
+        .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
         .route("/api/strategies/{slug}", get(get_strategy))
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
-        .with_state(AppState { pool, mark_prices })
+        .with_state(AppState {
+            pool,
+            mark_prices,
+            fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
+        })
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -244,11 +260,20 @@ async fn list_strategies(
     .fetch_all(&state.pool)
     .await?;
 
-    rows.into_iter()
-        .map(strategy_response)
-        .collect::<Result<Vec<_>, _>>()
-        .map(Json)
-        .map_err(ApiError)
+    let mut tasks = JoinSet::new();
+    for row in rows {
+        tasks.spawn_blocking(move || strategy_response(row));
+    }
+    let mut strategies = Vec::with_capacity(tasks.len());
+    while let Some(result) = tasks.join_next().await {
+        strategies.push(result.context("join strategy credential check")??);
+    }
+    strategies.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| left.slug.cmp(&right.slug))
+    });
+    Ok(Json(strategies))
 }
 
 async fn list_fee_rates(
@@ -285,6 +310,68 @@ async fn list_fee_rates(
     }
 
     Ok(Json(accounts))
+}
+
+async fn sync_account_fee_rates(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM strategy_envs WHERE enabled AND slug = $1)",
+    )
+    .bind(&slug)
+    .fetch_one(&state.pool)
+    .await?;
+    if !exists {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "strategy not found",
+            }),
+        )
+            .into_response());
+    }
+
+    {
+        let mut syncs = state.fee_rate_syncs.lock().await;
+        if !syncs.insert(slug.clone()) {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "fee rate sync already running",
+                }),
+            )
+                .into_response());
+        }
+    }
+
+    let process_slug = slug.clone();
+    let result = match tokio::task::spawn_blocking(move || run_fee_rate_sync(&process_slug)).await {
+        Ok(result) => result,
+        Err(error) => Err(error).context("join fee rate sync process"),
+    };
+    state.fee_rate_syncs.lock().await.remove(&slug);
+    result?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+fn run_fee_rate_sync(slug: &str) -> Result<()> {
+    let executable = env::current_exe()
+        .context("resolve NAV server executable")?
+        .with_file_name("sync_fee_rates");
+    let output = Command::new(&executable)
+        .args(["--strategy", slug])
+        .output()
+        .with_context(|| format!("run {} for {slug}", executable.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "fee rate sync for {slug} exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 async fn load_latest_fee_rates(pool: &PgPool, schema: &str) -> Result<Vec<FeeRateResponse>> {
@@ -349,7 +436,12 @@ async fn get_strategy(
     .await?;
 
     match row {
-        Some(row) => Ok(Json(strategy_response(row)?).into_response()),
+        Some(row) => {
+            let response = tokio::task::spawn_blocking(move || strategy_response(row))
+                .await
+                .context("join strategy credential check")??;
+            Ok(Json(response).into_response())
+        }
         None => Ok((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -460,13 +552,14 @@ fn strategy_response(row: StrategyRecord) -> Result<StrategyResponse> {
         serde_json::from_value(row.required_keys).context("decode required_keys")?;
     let display_name = row.alias.clone().unwrap_or_else(|| row.slug.clone());
     let env_path = Path::new(&row.env_path);
-    let env_exists = row.host == "local" && env_path.is_file();
-    let assigned = if env_exists {
-        fs::read_to_string(env_path)
-            .map(|content| assigned_env_keys(&content))
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
+    let content = read_env_file(&row.host, env_path);
+    let env_exists = content.is_ok();
+    let assigned = match content {
+        Ok(content) => assigned_env_keys(&content),
+        Err(error) => {
+            warn!(host = %row.host, path = %row.env_path, %error, "strategy env unavailable");
+            HashMap::new()
+        }
     };
     let missing_keys = required_keys
         .into_iter()

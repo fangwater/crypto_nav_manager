@@ -30,6 +30,22 @@ export function getFeeRates(signal?: AbortSignal): Promise<AccountFeeRates[]> {
   return getJson<AccountFeeRates[]>('/fee-rates', signal)
 }
 
+export async function syncFeeRates(slug: string): Promise<void> {
+  const response = await fetch(
+    API_BASE + '/fee-rates/' + encodeURIComponent(slug) + '/sync',
+    {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    },
+  )
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { error?: string }
+      | null
+    throw new Error(payload?.error ?? 'HTTP ' + response.status)
+  }
+}
+
 export interface StrategyPnlQuery {
   startMs: number
   endMs: number
@@ -55,4 +71,3 @@ export function getStrategyPnl(
     query.signal,
   )
 }
-

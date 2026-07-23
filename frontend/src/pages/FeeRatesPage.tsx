@@ -1,6 +1,8 @@
 import {
   Activity,
   ArrowLeft,
+  ChevronDown,
+  ChevronUp,
   CircleAlert,
   Clock3,
   Percent,
@@ -8,7 +10,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getFeeRates } from '../api'
+import { getFeeRates, syncFeeRates } from '../api'
 import type { AccountFeeRates, Strategy, TradingFeeRate } from '../types'
 
 type ExchangeFilter = 'all' | Strategy['exchange']
@@ -21,6 +23,25 @@ const exchanges: Array<{ value: ExchangeFilter; label: string }> = [
   { value: 'bitget', label: 'Bitget' },
   { value: 'okx', label: 'OKX' },
 ]
+
+const bybitDefaultSymbols = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE']
+
+function compactInstrument(instrument: string) {
+  return instrument.toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+function bybitDefaultSymbolIndex(instrument: string) {
+  const compact = compactInstrument(instrument)
+  return bybitDefaultSymbols.findIndex(
+    (symbol) => compact === symbol || compact === symbol + 'USDT',
+  )
+}
+
+function marketOrder(market: string) {
+  if (market === 'spot') return 0
+  if (market === 'linear') return 1
+  return 2
+}
 
 function exchangeBadge(exchange: Strategy['exchange']) {
   if (exchange === 'binance') return 'BN'
@@ -98,8 +119,48 @@ function FeeValue({ value }: { value: string }) {
   )
 }
 
-function AccountRates({ account }: { account: AccountFeeRates }) {
+interface AccountRatesProps {
+  account: AccountFeeRates
+  syncing: boolean
+  syncError?: string
+  onSync: (slug: string) => void
+}
+
+function AccountRates({
+  account,
+  syncing,
+  syncError,
+  onSync,
+}: AccountRatesProps) {
+  const [expanded, setExpanded] = useState(false)
   const updatedAt = latestTime(account.rates)
+  const { defaultRates, otherRates } = useMemo(() => {
+    if (account.exchange !== 'bybit') {
+      return { defaultRates: account.rates, otherRates: [] }
+    }
+    const defaults: TradingFeeRate[] = []
+    const others: TradingFeeRate[] = []
+    for (const rate of account.rates) {
+      if (bybitDefaultSymbolIndex(rate.instrument) >= 0) defaults.push(rate)
+      else others.push(rate)
+    }
+    defaults.sort((left, right) => {
+      const symbolDifference =
+        bybitDefaultSymbolIndex(left.instrument) -
+        bybitDefaultSymbolIndex(right.instrument)
+      return (
+        symbolDifference ||
+        marketOrder(left.market) - marketOrder(right.market)
+      )
+    })
+    return { defaultRates: defaults, otherRates: others }
+  }, [account.exchange, account.rates])
+  const visibleRates = expanded
+    ? defaultRates.concat(otherRates)
+    : defaultRates
+  const otherInstrumentCount = new Set(
+    otherRates.map((rate) => rate.instrument),
+  ).size
   return (
     <article className="fee-account">
       <header className="fee-account__header">
@@ -120,59 +181,99 @@ function AccountRates({ account }: { account: AccountFeeRates }) {
             </p>
           </div>
         </div>
-        <div className={'fee-sync-state' + (updatedAt ? '' : ' is-empty')}>
-          <Clock3 size={14} />
-          {updatedAt ? formatTime(updatedAt) : '待同步'}
+        <div className="fee-account__status">
+          <div className={'fee-sync-state' + (updatedAt ? '' : ' is-empty')}>
+            <Clock3 size={14} />
+            {updatedAt ? formatTime(updatedAt) : '待同步'}
+          </div>
+          <button
+            className="fee-account-sync"
+            type="button"
+            aria-label={'同步 ' + account.displayName}
+            title="同步此账户"
+            disabled={syncing}
+            onClick={() => onSync(account.slug)}
+          >
+            <RefreshCw size={15} className={syncing ? 'is-spinning' : ''} />
+          </button>
         </div>
       </header>
 
-      {account.rates.length ? (
-        <div className="fee-table-wrap">
-          <table className="fee-table">
-            <thead>
-              <tr>
-                <th>市场</th>
-                <th>币种</th>
-                <th>Maker</th>
-                <th>Taker</th>
-                <th>等级 / 分组</th>
-              </tr>
-            </thead>
-            <tbody>
-              {account.rates.map((rate) => (
-                <tr
-                  key={
-                    rate.market +
-                    ':' +
-                    rate.instrument +
-                    ':' +
-                    (rate.feeGroup ?? '')
-                  }
-                >
-                  <td>
-                    <span className="market-tag">
-                      {marketLabel(rate.market)}
-                    </span>
-                  </td>
-                  <td>
-                    <strong>{rate.instrument}</strong>
-                  </td>
-                  <td>
-                    <FeeValue value={rate.makerRate} />
-                  </td>
-                  <td>
-                    <FeeValue value={rate.takerRate} />
-                  </td>
-                  <td className="fee-tier">
-                    {[rate.feeTier, rate.feeGroup]
-                      .filter(Boolean)
-                      .join(' / ') || '—'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      {syncError && (
+        <div className="fee-account-sync-error">
+          <CircleAlert size={14} />
+          <span>{syncError}</span>
         </div>
+      )}
+
+      {account.rates.length ? (
+        <>
+          <div className="fee-table-wrap">
+            <table className="fee-table">
+              <thead>
+                <tr>
+                  <th>市场</th>
+                  <th>币种</th>
+                  <th>Maker</th>
+                  <th>Taker</th>
+                  <th>等级 / 分组</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRates.map((rate) => (
+                  <tr
+                    key={
+                      rate.market +
+                      ':' +
+                      rate.instrument +
+                      ':' +
+                      (rate.feeGroup ?? '')
+                    }
+                  >
+                    <td>
+                      <span className="market-tag">
+                        {marketLabel(rate.market)}
+                      </span>
+                    </td>
+                    <td>
+                      <strong>{rate.instrument}</strong>
+                    </td>
+                    <td>
+                      <FeeValue value={rate.makerRate} />
+                    </td>
+                    <td>
+                      <FeeValue value={rate.takerRate} />
+                    </td>
+                    <td className="fee-tier">
+                      {[rate.feeTier, rate.feeGroup]
+                        .filter(Boolean)
+                        .join(' / ') || '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {otherRates.length > 0 && (
+            <div className="fee-table-actions">
+              <button
+                className="fee-table-expand"
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((current) => !current)}
+              >
+                {expanded ? (
+                  <ChevronUp size={15} />
+                ) : (
+                  <ChevronDown size={15} />
+                )}
+                {expanded
+                  ? '收起其他币种'
+                  : `展开其他币种 (${otherInstrumentCount})`}
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         <div className="fee-empty">
           <Percent size={18} />
@@ -189,6 +290,10 @@ export function FeeRatesPage() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [syncingSlugs, setSyncingSlugs] = useState<Set<string>>(
+    new Set(),
+  )
+  const [syncErrors, setSyncErrors] = useState<Record<string, string>>({})
 
   function load(refresh = false) {
     const controller = new AbortController()
@@ -219,6 +324,28 @@ export function FeeRatesPage() {
     const controller = load()
     return () => controller.abort()
   }, [])
+
+  async function syncAccount(slug: string) {
+    setSyncingSlugs((current) => new Set(current).add(slug))
+    setSyncErrors((current) => {
+      const next = { ...current }
+      delete next[slug]
+      return next
+    })
+    try {
+      await syncFeeRates(slug)
+      setAccounts(await getFeeRates())
+    } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setSyncErrors((current) => ({ ...current, [slug]: message }))
+    } finally {
+      setSyncingSlugs((current) => {
+        const next = new Set(current)
+        next.delete(slug)
+        return next
+      })
+    }
+  }
 
   const visibleAccounts = useMemo(
     () =>
@@ -326,7 +453,13 @@ export function FeeRatesPage() {
         {!loading && !error && (
           <section className="fee-account-list" aria-live="polite">
             {visibleAccounts.map((account) => (
-              <AccountRates account={account} key={account.slug} />
+              <AccountRates
+                account={account}
+                key={account.slug}
+                syncing={syncingSlugs.has(account.slug)}
+                syncError={syncErrors[account.slug]}
+                onSync={syncAccount}
+              />
             ))}
           </section>
         )}

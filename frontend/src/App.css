@@ -1511,6 +1511,48 @@
   white-space: nowrap;
 }
 
+.fee-account__status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fee-account-sync {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--teal);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.fee-account-sync:hover:not(:disabled) {
+  border-color: #a7cac1;
+  background: #f4faf8;
+}
+
+.fee-account-sync:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.fee-account-sync-error {
+  min-height: 34px;
+  padding: 7px 16px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-bottom: 1px solid #efcbc7;
+  color: #9b3934;
+  background: #fff7f6;
+  font-size: 10px;
+}
+
 .fee-sync-state svg {
   color: var(--teal);
 }
@@ -1526,6 +1568,34 @@
 .fee-table-wrap {
   width: 100%;
   overflow-x: auto;
+}
+
+.fee-table-actions {
+  min-height: 44px;
+  padding: 6px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid var(--line-soft);
+  background: #fafbfc;
+}
+
+.fee-table-expand {
+  min-height: 30px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  color: var(--teal);
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.fee-table-expand:hover {
+  color: #14594c;
 }
 
 .fee-table {
