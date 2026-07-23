@@ -202,6 +202,11 @@ export function PnlStrategyPage() {
 
   useEffect(() => {
     if (!strategy || startMs === null || endMs === null) return
+    if (selectedSymbols?.length === 0) {
+      setLoadingPnl(false)
+      setPnlError(null)
+      return
+    }
     const controller = new AbortController()
     setLoadingPnl(true)
     setPnlError(null)
@@ -282,7 +287,6 @@ export function PnlStrategyPage() {
     const next = exists
       ? selectedSymbols.filter((item) => item !== symbol)
       : [...selectedSymbols, symbol].sort()
-    if (!next.length) return
     setSelectedSymbols(
       next.length === pnl.availableSymbols.length ? null : next,
     )
@@ -498,7 +502,7 @@ export function PnlStrategyPage() {
               </div>
               {chartMode === 'symbols' && (
                 <span className="symbol-series-count">
-                  {pnl?.selectedSymbols.length ?? 0} 条币种曲线
+                  {selectedSet.size} 条币种曲线
                 </span>
               )}
             </div>
@@ -508,7 +512,9 @@ export function PnlStrategyPage() {
               {pnl && (
                 <PnlChart
                   points={pnl.points}
-                  symbolPoints={pnl.symbolPoints}
+                  symbolPoints={
+                    selectedSymbols?.length === 0 ? [] : pnl.symbolPoints
+                  }
                   visibleSeries={visibleSeries}
                   mode={chartMode}
                 />
@@ -546,13 +552,22 @@ export function PnlStrategyPage() {
               <aside className="symbol-curve-picker" aria-label="分币曲线选择">
                 <div className="symbol-curve-picker__header">
                   <strong>币种</strong>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedSymbols(null)}
-                    disabled={selectedSymbols === null}
-                  >
-                    全选
-                  </button>
+                  <div className="symbol-curve-picker__actions">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSymbols(null)}
+                      disabled={selectedSymbols === null}
+                    >
+                      全选
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSymbols([])}
+                      disabled={selectedSymbols?.length === 0}
+                    >
+                      全不选
+                    </button>
+                  </div>
                 </div>
                 <div className="symbol-curve-picker__list">
                   {pnl.availableSymbols.map((symbol) => (
@@ -583,7 +598,7 @@ export function PnlStrategyPage() {
                 )}{' '}
                 points
               </span>
-              <span>{pnl.selectedSymbols.length} symbols</span>
+              <span>{selectedSet.size} symbols</span>
               {pnl.source.sampled && <span>sampled</span>}
             </div>
           )}
@@ -625,7 +640,9 @@ export function PnlStrategyPage() {
                 {pnl && (
                   <PositionChart
                     points={pnl.points}
-                    symbolPoints={pnl.symbolPoints}
+                    symbolPoints={
+                      selectedSymbols?.length === 0 ? [] : pnl.symbolPoints
+                    }
                     visibleSeries={activePositionSeries}
                     mode={chartMode}
                   />
@@ -663,13 +680,22 @@ export function PnlStrategyPage() {
                 <aside className="symbol-curve-picker" aria-label="分币仓位选择">
                   <div className="symbol-curve-picker__header">
                     <strong>币种</strong>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedSymbols(null)}
-                      disabled={selectedSymbols === null}
-                    >
-                      全选
-                    </button>
+                    <div className="symbol-curve-picker__actions">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSymbols(null)}
+                        disabled={selectedSymbols === null}
+                      >
+                        全选
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSymbols([])}
+                        disabled={selectedSymbols?.length === 0}
+                      >
+                        全不选
+                      </button>
+                    </div>
                   </div>
                   <div className="symbol-curve-picker__list">
                     {pnl.availableSymbols.map((symbol) => (
@@ -694,7 +720,7 @@ export function PnlStrategyPage() {
                     ? 'EXPOSURE = ABS(FUTURES POSITION)'
                     : 'EXPOSURE = SPOT + FUTURES'}
                 </span>
-                <span>{pnl.selectedSymbols.length} symbols</span>
+                <span>{selectedSet.size} symbols</span>
               </div>
             )}
           </section>

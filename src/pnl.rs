@@ -1,6 +1,7 @@
 use crate::{
     contract_multipliers::ContractMultiplierBook,
     fifo_pnl::{FifoPnl, PnlSnapshot, Side},
+    mark_prices::{MarkPriceCache, MarkPriceExchange},
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -20,7 +21,8 @@ pub enum PnlSourceKind {
 impl PnlSourceKind {
     pub fn for_strategy(strategy_kind: &str, exchange: &str, account_mode: &str) -> Option<Self> {
         match (strategy_kind, exchange, account_mode) {
-            ("intra_exchange", "bybit" | "gate", "unified") => Some(Self::Intra),
+            ("intra_exchange", "binance", "usdm_futures")
+            | ("intra_exchange", "bybit" | "gate", "unified") => Some(Self::Intra),
             ("funding_rate", "bybit" | "gate", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
@@ -334,11 +336,15 @@ pub async fn load_inputs(
     source: PnlSourceKind,
     schema: &str,
     exchange: &str,
+    mark_prices: &MarkPriceCache,
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
     validate_identifier(schema)?;
     match (source, exchange) {
+        (PnlSourceKind::Intra, "binance") => {
+            load_binance_intra_inputs(pool, schema, mark_prices, strategy_start_ms, end_ms).await
+        }
         (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate") => {
             load_spot_swap_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
         }
@@ -768,6 +774,25 @@ struct SpotSwapInterestRow {
 }
 
 #[derive(Debug, FromRow)]
+struct BinanceIntraTradeRow {
+    key: String,
+    symbol: String,
+    side: String,
+    price: f64,
+    amount_u: f64,
+    fee: f64,
+    commission_asset: String,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct BinanceIntraFundingRow {
+    symbol: String,
+    amount_usdt: f64,
+    ts: i64,
+}
+
+#[derive(Debug, FromRow)]
 struct MarketMakingTradeRow {
     symbol: String,
     side: String,
@@ -783,6 +808,114 @@ struct MarketMakingFundingRow {
     symbol: String,
     amount_usdt: f64,
     ts: i64,
+}
+
+async fn load_binance_intra_inputs(
+    pool: &PgPool,
+    schema: &str,
+    mark_prices: &MarkPriceCache,
+    strategy_start_ms: i64,
+    end_ms: i64,
+) -> Result<PnlInputs> {
+    let trade_sql = format!(
+        r#"SELECT key, symbol, side, price::float8 AS price,
+                  amountu::float8 AS amount_u, fees::float8 AS fee,
+                  "commissionAsset" AS commission_asset, ts
+           FROM {schema}.trades
+           WHERE ts >= $1 AND ts <= $2
+           ORDER BY ts, symbol, id"#
+    );
+    let funding_sql = format!(
+        r#"SELECT symbol, income::float8 AS amount_usdt, time AS ts
+           FROM {schema}.funding
+           WHERE time >= $1 AND time <= $2
+           ORDER BY time, symbol, "tranId""#
+    );
+
+    let rows = sqlx::query_as::<_, BinanceIntraTradeRow>(AssertSqlSafe(trade_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load Binance intra trades from {schema}"))?;
+    let trades = rows
+        .into_iter()
+        .map(|row| {
+            let side = match row.side.as_str() {
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
+                _ => bail!("unsupported Binance intra trade side {:?}", row.side),
+            };
+            let symbol = row.symbol.to_ascii_uppercase();
+            let fee_usdt = binance_fee_cost_usdt(
+                row.fee,
+                &row.commission_asset,
+                row.price,
+                &symbol,
+                mark_prices,
+            );
+            let leg = match row.key.as_str() {
+                "binancespot" => PositionLeg::Spot,
+                "binanceswap" => PositionLeg::Futures,
+                _ => bail!("unsupported Binance intra trade key {:?}", row.key),
+            };
+            Ok(NormalizedTrade {
+                symbol,
+                side,
+                leg,
+                price: row.price,
+                amount_u: row.amount_u,
+                fee_usdt,
+                ts: row.ts,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let funding = sqlx::query_as::<_, BinanceIntraFundingRow>(AssertSqlSafe(funding_sql))
+        .bind(strategy_start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load Binance intra funding from {schema}"))?
+        .into_iter()
+        .map(|row| FundingEvent {
+            symbol: row.symbol.to_ascii_uppercase(),
+            amount_usdt: row.amount_usdt,
+            ts: row.ts,
+        })
+        .collect();
+
+    Ok(PnlInputs {
+        trades,
+        funding,
+        interest: Vec::new(),
+    })
+}
+
+fn binance_fee_cost_usdt(
+    fee: f64,
+    commission_asset: &str,
+    trade_price: f64,
+    symbol: &str,
+    mark_prices: &MarkPriceCache,
+) -> Option<f64> {
+    if !fee.is_finite() {
+        return None;
+    }
+    let commission_asset = commission_asset.to_ascii_uppercase();
+    if STABLECOINS.contains(&commission_asset.as_str()) {
+        return Some(fee);
+    }
+    let base_asset = symbol.strip_suffix("USDT").unwrap_or("");
+    if !base_asset.is_empty() && commission_asset == base_asset {
+        return (trade_price.is_finite() && trade_price > 0.0).then_some(fee * trade_price);
+    }
+    mark_prices
+        .price(
+            MarkPriceExchange::Binance,
+            &format!("{commission_asset}USDT"),
+        )
+        .map(|price| fee * price)
 }
 
 async fn load_market_making_inputs(
@@ -1172,7 +1305,11 @@ mod tests {
     }
 
     #[test]
-    fn matches_supported_spot_swap_strategy_pairs() {
+    fn matches_only_supported_strategy_and_exchange_pairs() {
+        assert_eq!(
+            PnlSourceKind::for_strategy("intra_exchange", "binance", "usdm_futures"),
+            Some(PnlSourceKind::Intra)
+        );
         assert_eq!(
             PnlSourceKind::for_strategy("intra_exchange", "bybit", "unified"),
             Some(PnlSourceKind::Intra)
@@ -1186,10 +1323,41 @@ mod tests {
             Some(PnlSourceKind::FundingRate)
         );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
+    }
+
+    #[test]
+    fn spot_swap_source_metadata_depends_only_on_exchange_capability() {
+        assert_eq!(PnlSourceKind::Intra.adapter_name(), "spot_swap_history_v1");
         assert_eq!(
             PnlSourceKind::FundingRate.adapter_name(),
             "spot_swap_history_v1"
         );
+        assert!(!PnlSourceKind::Intra.interest_included("binance"));
+        assert!(PnlSourceKind::Intra.interest_included("bybit"));
         assert!(PnlSourceKind::FundingRate.interest_included("gate"));
+        assert_eq!(PnlSourceKind::FundingRate.exposure(1_000.0, -980.0), 20.0);
+    }
+
+    #[test]
+    fn binance_fee_uses_stable_base_or_cached_mark_price() {
+        let prices = MarkPriceCache::default();
+        prices.update(MarkPriceExchange::Binance, "BNBUSDT", 600.0, 1);
+
+        assert_eq!(
+            binance_fee_cost_usdt(1.5, "USDT", 100.0, "BTCUSDT", &prices),
+            Some(1.5)
+        );
+        assert_eq!(
+            binance_fee_cost_usdt(0.01, "BTC", 100.0, "BTCUSDT", &prices),
+            Some(1.0)
+        );
+        assert_eq!(
+            binance_fee_cost_usdt(0.002, "BNB", 100.0, "BTCUSDT", &prices),
+            Some(1.2)
+        );
+        assert_eq!(
+            binance_fee_cost_usdt(0.1, "UNKNOWN", 100.0, "BTCUSDT", &prices),
+            None
+        );
     }
 }

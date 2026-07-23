@@ -973,6 +973,12 @@
   cursor: default;
 }
 
+.symbol-curve-picker__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .symbol-curve-picker__list {
   min-height: 0;
   padding: 6px 0;

@@ -16,6 +16,7 @@ const EXCHANGE: &str = "binance";
 const FAPI_BASE: &str = "https://fapi.binance.com";
 const PAPI_BASE: &str = "https://papi.binance.com";
 const API_BASE: &str = "https://api.binance.com";
+const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const LIMIT: usize = 1_000;
 const FORCE_ORDER_LIMIT: usize = 100;
@@ -112,13 +113,31 @@ impl BinanceClient {
     ) -> Result<Vec<Value>, ExchangeError> {
         match self.mode {
             BinanceAccountMode::UsdmFutures => {
-                self.paged_trades(FAPI_BASE, "/fapi/v1/userTrades", symbol, range)
-                    .await
+                self.paged_trades(
+                    FAPI_BASE,
+                    "/fapi/v1/userTrades",
+                    symbol,
+                    range,
+                    SEVEN_DAYS_MS,
+                    5,
+                )
+                .await
             }
             BinanceAccountMode::PortfolioMargin => Err(ExchangeError::InvalidQuery(
                 "portfolio margin must choose margin_trades or um_trades".to_string(),
             )),
         }
+    }
+
+    /// Queries Spot account trades belonging to a standard Binance account.
+    pub async fn spot_trades(
+        &self,
+        symbol: &str,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        self.require_standard_account()?;
+        self.paged_trades(API_BASE, "/api/v3/myTrades", symbol, range, ONE_DAY_MS, 20)
+            .await
     }
 
     pub async fn margin_trades(
@@ -127,8 +146,15 @@ impl BinanceClient {
         range: TimeRange,
     ) -> Result<Vec<Value>, ExchangeError> {
         self.require_portfolio_margin()?;
-        self.paged_trades(PAPI_BASE, "/papi/v1/margin/myTrades", symbol, range)
-            .await
+        self.paged_trades(
+            PAPI_BASE,
+            "/papi/v1/margin/myTrades",
+            symbol,
+            range,
+            SEVEN_DAYS_MS,
+            5,
+        )
+        .await
     }
 
     pub async fn um_trades(
@@ -137,8 +163,15 @@ impl BinanceClient {
         range: TimeRange,
     ) -> Result<Vec<Value>, ExchangeError> {
         self.require_portfolio_margin()?;
-        self.paged_trades(PAPI_BASE, "/papi/v1/um/userTrades", symbol, range)
-            .await
+        self.paged_trades(
+            PAPI_BASE,
+            "/papi/v1/um/userTrades",
+            symbol,
+            range,
+            SEVEN_DAYS_MS,
+            5,
+        )
+        .await
     }
 
     pub async fn open_orders(&self, symbol: Option<&str>) -> Result<Vec<Value>, ExchangeError> {
@@ -220,6 +253,55 @@ impl BinanceClient {
     }
 
     pub async fn funding_fees(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        match self.mode {
+            BinanceAccountMode::UsdmFutures => self.usdm_funding_fees(range).await,
+            BinanceAccountMode::PortfolioMargin => self.portfolio_margin_funding_fees(range).await,
+        }
+    }
+
+    async fn usdm_funding_fees(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
+        let range = TimeRange::new(range.start_ms, range.end_ms)?;
+        let mut rows = Vec::new();
+        for chunk in range.chunks(SEVEN_DAYS_MS)? {
+            let mut page_number = 1_i64;
+            loop {
+                let params = vec![
+                    ("incomeType".to_string(), "FUNDING_FEE".to_string()),
+                    ("startTime".to_string(), chunk.start_ms.to_string()),
+                    ("endTime".to_string(), chunk.end_ms.to_string()),
+                    ("page".to_string(), page_number.to_string()),
+                    ("limit".to_string(), LIMIT.to_string()),
+                ];
+                let value = self
+                    .paced_history_get(FAPI_BASE, "/fapi/v1/income", params, 30)
+                    .await?;
+                let page = root_array(EXCHANGE, value)?;
+                let page_len = page.len();
+                rows.extend(page.into_iter().filter(|row| {
+                    value_i64(row, "time")
+                        .is_some_and(|ts| chunk.start_ms <= ts && ts <= chunk.end_ms)
+                }));
+                if page_len < LIMIT {
+                    break;
+                }
+                page_number =
+                    page_number
+                        .checked_add(1)
+                        .ok_or_else(|| ExchangeError::InvalidResponse {
+                            exchange: EXCHANGE,
+                            message: "standard UM income pagination overflowed".to_string(),
+                        })?;
+            }
+        }
+        dedup(&mut rows, &["tranId"]);
+        rows.sort_by_key(|row| value_i64(row, "time").unwrap_or_default());
+        Ok(rows)
+    }
+
+    async fn portfolio_margin_funding_fees(
+        &self,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
         self.require_portfolio_margin()?;
         let range = TimeRange::new(range.start_ms, range.end_ms)?;
         let mut rows = Vec::new();
@@ -231,6 +313,7 @@ impl BinanceClient {
                 ("endTime".to_string(), range.end_ms.to_string()),
                 ("page".to_string(), page_number.to_string()),
                 ("limit".to_string(), LIMIT.to_string()),
+                ("recvWindow".to_string(), "60000".to_string()),
             ];
             let value = self
                 .signed_get(PAPI_BASE, "/papi/v1/um/income", params, 30)
@@ -402,9 +485,11 @@ impl BinanceClient {
         path: &str,
         symbol: &str,
         range: TimeRange,
+        chunk_span_ms: i64,
+        weight: u32,
     ) -> Result<Vec<Value>, ExchangeError> {
         let mut all_rows = Vec::new();
-        for chunk in range.chunks(SEVEN_DAYS_MS)? {
+        for chunk in range.chunks(chunk_span_ms)? {
             let mut from_id: Option<i64> = None;
             loop {
                 let mut params = vec![
@@ -417,7 +502,7 @@ impl BinanceClient {
                     params.push(("startTime".to_string(), chunk.start_ms.to_string()));
                     params.push(("endTime".to_string(), chunk.end_ms.to_string()));
                 }
-                let value = self.signed_get(base, path, params, 5).await?;
+                let value = self.paced_history_get(base, path, params, weight).await?;
                 let mut page = root_array(EXCHANGE, value)?;
                 if page.is_empty() {
                     break;
@@ -501,6 +586,18 @@ impl BinanceClient {
         Ok(rows)
     }
 
+    async fn paced_history_get(
+        &self,
+        base: &str,
+        path: &str,
+        params: Params,
+        weight: u32,
+    ) -> Result<Value, ExchangeError> {
+        let value = self.signed_get(base, path, params, weight).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        Ok(value)
+    }
+
     async fn signed_get(
         &self,
         base: &str,
@@ -557,6 +654,16 @@ impl BinanceClient {
         } else {
             Err(ExchangeError::InvalidQuery(
                 "endpoint requires Binance Portfolio Margin mode".to_string(),
+            ))
+        }
+    }
+
+    fn require_standard_account(&self) -> Result<(), ExchangeError> {
+        if self.mode == BinanceAccountMode::UsdmFutures {
+            Ok(())
+        } else {
+            Err(ExchangeError::InvalidQuery(
+                "endpoint requires a standard Binance account".to_string(),
             ))
         }
     }

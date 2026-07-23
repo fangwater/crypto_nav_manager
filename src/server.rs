@@ -1,5 +1,6 @@
 use crate::{
     contract_multipliers,
+    mark_prices::MarkPriceCache,
     pnl::{self, PnlCalculation, PnlSourceKind},
 };
 use anyhow::{Context, Result};
@@ -31,6 +32,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
+    mark_prices: MarkPriceCache,
 }
 
 #[derive(Debug, FromRow)]
@@ -182,6 +184,7 @@ pub async fn run() -> Result<()> {
         .await
         .context("run PostgreSQL migrations")?;
     contract_multipliers::spawn(pool.clone());
+    let mark_prices = MarkPriceCache::start().await;
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -189,7 +192,7 @@ pub async fn run() -> Result<()> {
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/strategies/{slug}", get(get_strategy))
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
-        .with_state(AppState { pool })
+        .with_state(AppState { pool, mark_prices })
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -431,6 +434,7 @@ async fn get_strategy_pnl(
         source,
         &strategy.db_schema,
         &strategy.exchange,
+        &state.mark_prices,
         strategy.st_ms,
         end_ms,
     )

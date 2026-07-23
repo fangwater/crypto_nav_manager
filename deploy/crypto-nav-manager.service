@@ -16,11 +16,11 @@ Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
 NoNewPrivileges=true
-PrivateTmp=true
+# iceoryx2 discovers mkt_signal publishers through the host /tmp/iceoryx2 tree.
+PrivateTmp=false
 ProtectSystem=full
 ProtectHome=read-only
 UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-

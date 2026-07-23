@@ -2,6 +2,7 @@ pub mod contract_multipliers;
 pub mod exchange;
 pub mod fee_rate_store;
 pub mod fifo_pnl;
+pub mod mark_prices;
 pub mod models;
 pub mod pnl;
 pub mod rest_dispatcher;

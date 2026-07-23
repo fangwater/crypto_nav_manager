@@ -2,3 +2,6 @@
 /funding_*.csv
 /data/*.db*
 /data/*.sqlite*
+__pycache__/
+*.py[cod]
+*.orig

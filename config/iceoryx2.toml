@@ -1,0 +1,4 @@
+# Keep the subscriber on the same explicit default configuration as mkt_signal.
+[global]
+
+[defaults]

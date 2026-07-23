@@ -134,18 +134,43 @@ minutes and upsert with exchange-native record IDs. Market-making strategies
 and Binance intra strategies do not query interest. Repeat `--strategy` to
 scan multiple accounts in one invocation.
 
-Export one strategy's stored funding history from PostgreSQL with:
+Sync current trading fee rates for every enabled strategy account:
 
 ```bash
-cargo run --release --bin export_binance_fr_funding -- \
-  --strategy binance_fr_arb01
+# All enabled accounts, using the top 7 symbols by 30-day traded notional.
+cargo run --release --bin sync_fee_rates
+
+# One account or an explicit symbol set.
+cargo run --release --bin sync_fee_rates -- \
+  --strategy binance-intra-arb01 \
+  --symbol LINKUSDT
 ```
 
-The exporter does not call Binance and has no export-mode flag. It always writes
-`funding_YYYY-MM-DD.csv` files to the process current directory using Liang
-Torch's existing 12-column funding format. The CSV `account` value is derived
-from the registered strategy alias, so `binance nova02` becomes
-`binance_nova02`.
+Export stored history from PostgreSQL with the matching unified command:
+
+```bash
+# Export all supported datasets for one strategy.
+cargo run --release --bin export_history -- \
+  --strategy binance_fr_arb01
+
+# Export one dataset for multiple strategies and an inclusive time range.
+cargo run --release --bin export_history -- \
+  --strategy binance_fr_arb01 \
+  --strategy gate_fr_arb01 \
+  --dataset funding \
+  --start-ms 1767225600000 \
+  --end-ms 1767311999999
+```
+
+The exporter does not call an exchange or read API credentials. It detects each
+strategy's PostgreSQL storage layout and exports `trades`, `funding`, and
+`interest` where supported. Repeat `--strategy` to export multiple accounts;
+`--dataset` accepts `all`, `trades`, `funding`, or `interest`. By default,
+daily files are isolated under `data/<strategy>/`; use `--output-dir` to
+override the root directory. Trade files retain Liang Torch's 15-column format.
+Funding and interest files use the existing 12-column cash format. The CSV
+`account` value is derived from the registered strategy alias, so
+`binance nova02` becomes `binance_nova02`.
 
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
