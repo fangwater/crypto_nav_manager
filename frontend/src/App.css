@@ -1553,6 +1553,24 @@
   font-size: 10px;
 }
 
+.fee-special-rule {
+  min-height: 34px;
+  padding: 7px 16px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-bottom: 1px solid #ead9ad;
+  color: #755618;
+  background: #fffaf0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.fee-special-rule svg {
+  flex: 0 0 auto;
+  color: #a77918;
+}
+
 .fee-sync-state svg {
   color: var(--teal);
 }

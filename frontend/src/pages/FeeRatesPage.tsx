@@ -5,6 +5,7 @@ import {
   ChevronUp,
   CircleAlert,
   Clock3,
+  Info,
   Percent,
   RefreshCw,
 } from 'lucide-react'
@@ -109,12 +110,22 @@ function latestTime(rates: TradingFeeRate[]) {
   )
 }
 
-function FeeValue({ value }: { value: string }) {
+function FeeValue({
+  value,
+  zeroDetail,
+}: {
+  value: string
+  zeroDetail?: string
+}) {
   const fee = feeDisplay(value)
   return (
     <div className={'fee-value ' + fee.className}>
       <strong>{fee.label}</strong>
-      <span>{fee.detail}</span>
+      <span>
+        {fee.className === 'is-zero' && zeroDetail
+          ? zeroDetail
+          : fee.detail}
+      </span>
     </div>
   )
 }
@@ -139,6 +150,9 @@ function AccountRates({
   const [expanding, setExpanding] = useState(false)
   const [expandError, setExpandError] = useState<string>()
   const updatedAt = latestTime(account.rates)
+  const hasDelayedSpotMakerRebate =
+    account.exchange === 'binance' &&
+    account.strategyKind === 'intra_exchange'
   const visibleRates = useMemo(() => {
     const rates = expanded && expandedRates ? expandedRates : account.rates
     if (account.exchange !== 'bybit') return rates
@@ -230,6 +244,15 @@ function AccountRates({
         </div>
       )}
 
+      {hasDelayedSpotMakerRebate && (
+        <div className="fee-special-rule">
+          <Info size={14} />
+          <span>
+            Spot Maker：成交手续费为 0，约 1 小时后返佣单独入账；当前费率快照不包含返佣。
+          </span>
+        </div>
+      )}
+
       {account.rates.length ? (
         <>
           <div className="fee-table-wrap">
@@ -263,7 +286,15 @@ function AccountRates({
                       <strong>{rate.instrument}</strong>
                     </td>
                     <td>
-                      <FeeValue value={rate.makerRate} />
+                      <FeeValue
+                        value={rate.makerRate}
+                        zeroDetail={
+                          hasDelayedSpotMakerRebate &&
+                          rate.market === 'spot'
+                            ? '延迟返佣'
+                            : undefined
+                        }
+                      />
                     </td>
                     <td>
                       <FeeValue value={rate.takerRate} />
