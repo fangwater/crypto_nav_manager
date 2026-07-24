@@ -18,6 +18,7 @@ import { PositionChart } from '../components/PositionChart'
 import type {
   PnlSeriesKey,
   PositionSeriesKey,
+  PositionUnit,
   Strategy,
   StrategyPnl,
   SymbolPnlSummary,
@@ -177,6 +178,7 @@ export function PnlStrategyPage() {
   const [positionDisplayMode, setPositionDisplayMode] = useState<
     'positions' | 'exposure'
   >('positions')
+  const [positionUnit, setPositionUnit] = useState<PositionUnit>('usdt')
   const [visiblePositionSeries, setVisiblePositionSeries] = useState<
     PositionSeriesKey[]
   >(['spotPositionUsdt', 'futuresPositionUsdt'])
@@ -636,6 +638,28 @@ export function PnlStrategyPage() {
               <div className="chart-controls">
                 <div
                   className="segmented segmented--compact"
+                  aria-label="仓位图计量单位"
+                >
+                  <button
+                    type="button"
+                    className={positionUnit === 'usdt' ? 'is-active' : ''}
+                    onClick={() => setPositionUnit('usdt')}
+                  >
+                    USDT
+                  </button>
+                  <button
+                    type="button"
+                    className={positionUnit === 'qty' ? 'is-active' : ''}
+                    onClick={() => {
+                      setPositionUnit('qty')
+                      setChartMode('symbols')
+                    }}
+                  >
+                    Qty
+                  </button>
+                </div>
+                <div
+                  className="segmented segmented--compact"
                   aria-label="仓位图显示指标"
                 >
                   <button
@@ -664,6 +688,7 @@ export function PnlStrategyPage() {
                   <button
                     type="button"
                     className={chartMode === 'portfolio' ? 'is-active' : ''}
+                    disabled={positionUnit === 'qty'}
                     onClick={() => setChartMode('portfolio')}
                   >
                     组合
@@ -673,7 +698,7 @@ export function PnlStrategyPage() {
                     className={chartMode === 'symbols' ? 'is-active' : ''}
                     onClick={() => setChartMode('symbols')}
                   >
-                    分币
+                    {positionDisplayMode === 'exposure' ? '币种组成' : '分币'}
                   </button>
                 </div>
               </div>
@@ -688,6 +713,7 @@ export function PnlStrategyPage() {
                     }
                     visibleSeries={activePositionSeries}
                     mode={chartMode}
+                    unit={positionUnit}
                   />
                 )}
                 {loadingPnl && (
@@ -774,7 +800,7 @@ export function PnlStrategyPage() {
             </div>
             {pnl && (
               <div className="chart-foot">
-                <span>USDT NOTIONAL</span>
+                <span>{positionUnit === 'usdt' ? 'USDT NOTIONAL' : 'BASE QTY'}</span>
                 <span>
                   {positionDisplayMode === 'exposure'
                     ? 'EXPOSURE = Σ SIGNED VENUE POSITION'

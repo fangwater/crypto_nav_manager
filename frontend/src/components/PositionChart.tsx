@@ -11,6 +11,7 @@ import { useEffect, useRef } from 'react'
 import type {
   PnlPoint,
   PositionSeriesKey,
+  PositionUnit,
   SymbolPnlSeries,
 } from '../types'
 
@@ -28,6 +29,7 @@ interface PositionChartProps {
   symbolPoints: SymbolPnlSeries[]
   visibleSeries: PositionSeriesKey[]
   mode: 'portfolio' | 'symbols'
+  unit: PositionUnit
 }
 
 const seriesMeta: Record<
@@ -52,10 +54,27 @@ const positiveColor = '#16705a'
 const negativeColor = '#b5473c'
 const zeroColor = '#8993a4'
 
-function amount(value: number) {
+const qtyKey: Record<
+  PositionSeriesKey,
+  'spotPositionQty' | 'futuresPositionQty' | 'exposureQty'
+> = {
+  spotPositionUsdt: 'spotPositionQty',
+  futuresPositionUsdt: 'futuresPositionQty',
+  exposureUsdt: 'exposureQty',
+}
+
+function positionValue(
+  point: PnlPoint,
+  key: PositionSeriesKey,
+  unit: PositionUnit,
+) {
+  return unit === 'usdt' ? point[key] : point[qtyKey[key]]
+}
+
+function amount(value: number, unit: PositionUnit) {
   return value.toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: unit === 'usdt' ? 2 : 0,
+    maximumFractionDigits: unit === 'usdt' ? 2 : 8,
   })
 }
 
@@ -64,6 +83,7 @@ export function PositionChart({
   symbolPoints,
   visibleSeries,
   mode,
+  unit,
 }: PositionChartProps) {
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -86,10 +106,14 @@ export function PositionChart({
             return {
               name: meta.label,
               type: 'line' as const,
-              data: points.map((point) => [point.ts, point[key]]),
+              data: points.map((point) => [
+                point.ts,
+                positionValue(point, key, unit),
+              ]),
               showSymbol: false,
               sampling: 'lttb' as const,
               connectNulls: true,
+              step: 'end' as const,
               z: isExposure ? 1 : 3,
               lineStyle: {
                 width: isExposure ? 1.1 : 1.7,
@@ -109,10 +133,14 @@ export function PositionChart({
               return {
                 name: `${item.symbol} ${meta.label}`,
                 type: 'line' as const,
-                data: item.points.map((point) => [point.ts, point[key]]),
+                data: item.points.map((point) => [
+                  point.ts,
+                  positionValue(point, key, unit),
+                ]),
                 showSymbol: false,
                 sampling: 'lttb' as const,
                 connectNulls: true,
+                step: 'end' as const,
                 z: isExposure ? 1 : 3,
                 lineStyle: {
                   width: isExposure ? 1 : 1.35,
@@ -143,7 +171,7 @@ export function PositionChart({
           borderColor: '#d7dbe2',
           textStyle: { color: '#20252d', fontSize: 12 },
           valueFormatter: (value: unknown) =>
-            `${amount(typeof value === 'number' ? value : Number(value))} USDT`,
+            `${amount(typeof value === 'number' ? value : Number(value), unit)} ${unit === 'usdt' ? 'USDT' : 'Qty'}`,
           axisPointer: {
             type: 'line',
             lineStyle: { color: '#8993a4', type: 'dashed' },
@@ -160,13 +188,13 @@ export function PositionChart({
         yAxis: {
           type: 'value',
           scale: false,
-          name: 'USDT',
+          name: unit === 'usdt' ? 'USDT' : 'Qty',
           nameTextStyle: { color: '#697386', fontSize: 10 },
           axisLine: { show: false },
           axisTick: { show: false },
           axisLabel: {
             color: '#697386',
-            formatter: (value: number) => amount(value),
+            formatter: (value: number) => amount(value, unit),
           },
           splitLine: { lineStyle: { color: '#edf0f4' } },
         },
@@ -215,7 +243,7 @@ export function PositionChart({
       observer.disconnect()
       chart.dispose()
     }
-  }, [mode, points, symbolPoints, visibleSeries])
+  }, [mode, points, symbolPoints, unit, visibleSeries])
 
   return (
     <div

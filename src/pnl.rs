@@ -26,7 +26,8 @@ impl PnlSourceKind {
         match (strategy_kind, exchange, account_mode) {
             ("intra_exchange", "binance", "usdm_futures")
             | ("intra_exchange", "bybit" | "gate", "unified") => Some(Self::Intra),
-            ("funding_rate", "bybit" | "gate", "unified") => Some(Self::FundingRate),
+            ("funding_rate", "binance", "portfolio_margin")
+            | ("funding_rate", "bybit" | "gate", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
             _ => None,
@@ -43,7 +44,7 @@ impl PnlSourceKind {
     fn interest_included(self, exchange: &str) -> bool {
         matches!(
             (self, exchange),
-            (Self::Intra | Self::FundingRate, "bybit" | "gate")
+            (Self::FundingRate, "binance") | (Self::Intra | Self::FundingRate, "bybit" | "gate")
         )
     }
 
@@ -59,6 +60,7 @@ pub struct NormalizedTrade {
     pub leg: PositionLeg,
     pub price: f64,
     pub amount_u: f64,
+    pub quantity: f64,
     pub fee_usdt: Option<f64>,
     pub ts: i64,
 }
@@ -162,6 +164,9 @@ pub struct PnlPoint {
     pub spot_position_usdt: f64,
     pub futures_position_usdt: f64,
     pub exposure_usdt: f64,
+    pub spot_position_qty: f64,
+    pub futures_position_qty: f64,
+    pub exposure_qty: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -191,6 +196,8 @@ struct Metrics {
     open_amount_usdt: f64,
     spot_position_usdt: f64,
     futures_position_usdt: f64,
+    spot_position_qty: f64,
+    futures_position_qty: f64,
     unconverted_fee_count: u64,
     unconverted_interest_count: u64,
 }
@@ -237,6 +244,8 @@ struct SymbolState {
     volume_usdt: f64,
     spot_position_usdt: f64,
     futures_position_usdt: f64,
+    spot_position_qty: f64,
+    futures_position_qty: f64,
     unconverted_fee_count: u64,
     unconverted_interest_count: u64,
     spot_snapshot: Option<PnlSnapshot>,
@@ -261,9 +270,19 @@ impl SymbolState {
             Side::Buy => trade.amount_u,
             Side::Sell => -trade.amount_u,
         };
+        let signed_quantity = match trade.side {
+            Side::Buy => trade.quantity,
+            Side::Sell => -trade.quantity,
+        };
         match trade.leg {
-            PositionLeg::Spot => self.spot_position_usdt += signed_amount_u,
-            PositionLeg::Futures => self.futures_position_usdt += signed_amount_u,
+            PositionLeg::Spot => {
+                self.spot_position_usdt += signed_amount_u;
+                self.spot_position_qty += signed_quantity;
+            }
+            PositionLeg::Futures => {
+                self.futures_position_usdt += signed_amount_u;
+                self.futures_position_qty += signed_quantity;
+            }
         }
         *cached_snapshot = Some(
             fifo.snapshot(trade.price, trade.price)
@@ -289,6 +308,8 @@ impl SymbolState {
             open_amount_usdt: clean_zero(self.spot_position_usdt + self.futures_position_usdt),
             spot_position_usdt: self.spot_position_usdt,
             futures_position_usdt: self.futures_position_usdt,
+            spot_position_qty: self.spot_position_qty,
+            futures_position_qty: self.futures_position_qty,
             unconverted_fee_count: self.unconverted_fee_count,
             unconverted_interest_count: self.unconverted_interest_count,
         }
@@ -342,8 +363,17 @@ pub async fn load_inputs(
         (PnlSourceKind::Intra, "binance") => {
             load_binance_intra_inputs(pool, schema, mark_prices, strategy_start_ms, end_ms).await
         }
-        (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate") => {
-            load_spot_swap_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
+        (PnlSourceKind::FundingRate, "binance")
+        | (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate") => {
+            load_spot_swap_inputs(
+                pool,
+                schema,
+                exchange,
+                mark_prices,
+                strategy_start_ms,
+                end_ms,
+            )
+            .await
         }
         (PnlSourceKind::MarketMaking, exchange) => {
             load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
@@ -612,6 +642,10 @@ fn aggregate_point(
         point.futures_position_usdt += current.futures_position_usdt;
         point.exposure_usdt +=
             source.exposure(current.spot_position_usdt, current.futures_position_usdt);
+        point.spot_position_qty += current.spot_position_qty;
+        point.futures_position_qty += current.futures_position_qty;
+        point.exposure_qty +=
+            source.exposure(current.spot_position_qty, current.futures_position_qty);
     }
     point.fee_before_pnl_usdt = clean_zero(point.fee_before_pnl_usdt);
     point.fee_after_pnl_usdt = clean_zero(point.fee_after_pnl_usdt);
@@ -622,6 +656,9 @@ fn aggregate_point(
     point.spot_position_usdt = clean_zero(point.spot_position_usdt);
     point.futures_position_usdt = clean_zero(point.futures_position_usdt);
     point.exposure_usdt = clean_zero(point.exposure_usdt);
+    point.spot_position_qty = clean_zero(point.spot_position_qty);
+    point.futures_position_qty = clean_zero(point.futures_position_qty);
+    point.exposure_qty = clean_zero(point.exposure_qty);
     point
 }
 
@@ -649,6 +686,11 @@ fn symbol_point(
         futures_position_usdt: clean_zero(current.futures_position_usdt),
         exposure_usdt: clean_zero(
             source.exposure(current.spot_position_usdt, current.futures_position_usdt),
+        ),
+        spot_position_qty: clean_zero(current.spot_position_qty),
+        futures_position_qty: clean_zero(current.futures_position_qty),
+        exposure_qty: clean_zero(
+            source.exposure(current.spot_position_qty, current.futures_position_qty),
         ),
     }
 }
@@ -746,12 +788,14 @@ fn validate_identifier(value: &str) -> Result<()> {
 
 #[derive(Debug, FromRow)]
 struct SpotSwapTradeRow {
-    key: String,
+    market: String,
     symbol: String,
     side: String,
     price: f64,
     amount_u: f64,
+    quantity: f64,
     fee: f64,
+    fee_usdt: Option<f64>,
     commission_asset: String,
     ts: i64,
 }
@@ -767,6 +811,7 @@ struct SpotSwapFundingRow {
 struct SpotSwapInterestRow {
     currency: String,
     interest: f64,
+    cost_usdt: Option<f64>,
     ts: i64,
 }
 
@@ -778,6 +823,7 @@ struct BinanceIntraTradeRow {
     side: String,
     price: f64,
     amount_u: f64,
+    quantity: f64,
     fee: f64,
     commission_asset: String,
     ts: i64,
@@ -818,6 +864,7 @@ async fn load_binance_intra_inputs(
     let trade_sql = format!(
         r#"SELECT market, liquidity_role, symbol, side, price::float8 AS price,
                   COALESCE(quote_quantity, price * quantity)::float8 AS amount_u,
+                  quantity::float8 AS quantity,
                   fee_amount::float8 AS fee,
                   COALESCE(fee_asset, 'USDT') AS commission_asset,
                   event_time_ms AS ts
@@ -852,6 +899,10 @@ async fn load_binance_intra_inputs(
             if !row.amount_u.is_finite() || row.amount_u <= 0.0 {
                 bail!("invalid Binance intra amount_u: {}", row.amount_u);
             }
+            let quantity = row.quantity.abs();
+            if !quantity.is_finite() || quantity <= 0.0 {
+                bail!("invalid Binance intra quantity: {}", row.quantity);
+            }
             let observed_fee_usdt = binance_fee_cost_usdt(
                 row.fee,
                 &row.commission_asset,
@@ -876,6 +927,7 @@ async fn load_binance_intra_inputs(
                 leg,
                 price: row.price,
                 amount_u: row.amount_u,
+                quantity,
                 fee_usdt,
                 ts: row.ts,
             })
@@ -998,12 +1050,14 @@ async fn load_market_making_inputs(
                 row.quote_quantity,
                 multiplier,
             )?;
+            let quantity = market_making_quantity(exchange, row.quantity, multiplier)?;
             Ok(NormalizedTrade {
                 symbol,
                 side,
                 leg: PositionLeg::Futures,
                 price: row.price,
                 amount_u,
+                quantity,
                 fee_usdt: row.fee_usdt,
                 ts: row.ts,
             })
@@ -1055,38 +1109,61 @@ fn market_making_amount_u(
     Ok(amount_u)
 }
 
+fn market_making_quantity(
+    exchange: &str,
+    quantity: f64,
+    contract_multiplier: Option<f64>,
+) -> Result<f64> {
+    let quantity = match exchange {
+        "gate" | "okx" => {
+            quantity.abs()
+                * contract_multiplier
+                    .with_context(|| format!("missing {exchange} contract multiplier"))?
+        }
+        "binance" | "bybit" => quantity.abs(),
+        _ => bail!("unsupported market-making exchange {exchange}"),
+    };
+    if !quantity.is_finite() || quantity <= 0.0 {
+        bail!("invalid {exchange} market-making quantity: {quantity}");
+    }
+    Ok(quantity)
+}
+
 async fn load_spot_swap_inputs(
     pool: &PgPool,
     schema: &str,
     exchange: &str,
+    mark_prices: &MarkPriceCache,
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
-    let (spot_key, futures_key) = match exchange {
-        "bybit" => ("bybitspot", "bybitswap"),
-        "gate" => ("gatespot", "gateswap"),
-        _ => bail!("unsupported spot/swap PnL exchange {exchange}"),
-    };
+    if !matches!(exchange, "binance" | "bybit" | "gate") {
+        bail!("unsupported spot/swap PnL exchange {exchange}");
+    }
     let trade_sql = format!(
-        r#"SELECT key, symbol, side, price::float8 AS price,
-                  amountu::float8 AS amount_u, fees::float8 AS fee,
-                  "commissionAsset" AS commission_asset, ts
+        r#"SELECT market, symbol, side, price::float8 AS price,
+                  COALESCE(quote_quantity, price * quantity)::float8 AS amount_u,
+                  quantity::float8 AS quantity, fee_amount::float8 AS fee,
+                  fee_usdt::float8 AS fee_usdt,
+                  COALESCE(fee_asset, 'USDT') AS commission_asset,
+                  event_time_ms AS ts
            FROM {schema}.trades
-           WHERE ts >= $1 AND ts <= $2
-           ORDER BY ts, symbol, id"#
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, trade_id"#
     );
     let funding_sql = format!(
-        r#"SELECT symbol, funding::float8 AS funding,
-                  "transactionTime" AS ts
+        r#"SELECT symbol, COALESCE(amount_usdt, amount)::float8 AS funding,
+                  event_time_ms AS ts
            FROM {schema}.funding
-           WHERE "transactionTime" >= $1 AND "transactionTime" <= $2
-           ORDER BY "transactionTime", symbol, id"#
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, record_id"#
     );
     let interest_sql = format!(
-        r#"SELECT currency, interest::float8 AS interest, "transactionTime" AS ts
+        r#"SELECT asset AS currency, amount::float8 AS interest,
+                  amount_usdt::float8 AS cost_usdt, event_time_ms AS ts
            FROM {schema}.interest
-           WHERE "transactionTime" >= $1 AND "transactionTime" <= $2
-           ORDER BY "transactionTime", currency, id"#
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, asset, record_id"#
     );
 
     let rows = sqlx::query_as::<_, SpotSwapTradeRow>(AssertSqlSafe(trade_sql))
@@ -1095,8 +1172,14 @@ async fn load_spot_swap_inputs(
         .fetch_all(pool)
         .await
         .with_context(|| format!("load {exchange} trades from {schema}"))?;
+    let multiplier_book = if exchange == "gate" && !rows.is_empty() {
+        Some(ContractMultiplierBook::load(pool, exchange).await?)
+    } else {
+        None
+    };
     let mut trades = Vec::with_capacity(rows.len());
-    let mut last_spot_prices = HashMap::new();
+    let mut spot_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+    let mut all_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
     for row in rows {
         let side = match row.side.as_str() {
             "buy" => Side::Buy,
@@ -1104,29 +1187,54 @@ async fn load_spot_swap_inputs(
             _ => bail!("unsupported trade side {:?}", row.side),
         };
         let symbol = row.symbol.to_ascii_uppercase();
-        if row.key == spot_key {
-            last_spot_prices.insert(symbol.clone(), row.price);
+        all_price_history
+            .entry(symbol.clone())
+            .or_default()
+            .push((row.ts, row.price));
+        if row.market == "spot" {
+            spot_price_history
+                .entry(symbol.clone())
+                .or_default()
+                .push((row.ts, row.price));
         }
         let commission_asset = row.commission_asset.to_ascii_uppercase();
         let base_asset = symbol.strip_suffix("USDT").unwrap_or("");
-        let fee_usdt = if STABLECOINS.contains(&commission_asset.as_str()) {
-            Some(row.fee)
-        } else if !base_asset.is_empty() && commission_asset == base_asset {
-            Some(row.fee * row.price)
-        } else {
-            None
+        let fee_usdt = row.fee_usdt.or_else(|| {
+            if STABLECOINS.contains(&commission_asset.as_str()) {
+                Some(row.fee)
+            } else if !base_asset.is_empty() && commission_asset == base_asset {
+                Some(row.fee * row.price)
+            } else if exchange == "binance" {
+                binance_fee_cost_usdt(row.fee, &commission_asset, row.price, &symbol, mark_prices)
+            } else {
+                None
+            }
+        });
+        let leg = match row.market.as_str() {
+            "spot" => PositionLeg::Spot,
+            "swap" | "usdm_futures" => PositionLeg::Futures,
+            _ => bail!("unsupported {exchange} trade market {:?}", row.market),
         };
-        let leg = match row.key.as_str() {
-            key if key == spot_key => PositionLeg::Spot,
-            key if key == futures_key => PositionLeg::Futures,
-            _ => bail!("unsupported {exchange} trade key {:?}", row.key),
+        let quantity = match (exchange, leg) {
+            ("gate", PositionLeg::Futures) => {
+                row.quantity.abs()
+                    * multiplier_book
+                        .as_ref()
+                        .context("missing Gate contract multiplier book")?
+                        .multiplier_at(&symbol, row.ts)?
+            }
+            _ => row.quantity.abs(),
         };
+        if !quantity.is_finite() || quantity <= 0.0 {
+            bail!("invalid {exchange} quantity: {quantity}");
+        }
         trades.push(NormalizedTrade {
             symbol,
             side,
             leg,
             price: row.price,
             amount_u: row.amount_u,
+            quantity,
             fee_usdt,
             ts: row.ts,
         });
@@ -1162,12 +1270,25 @@ async fn load_spot_swap_inputs(
             };
             let conversion_price = if STABLECOINS.contains(&currency.as_str()) {
                 Some(1.0)
+            } else if exchange == "binance" {
+                mark_prices.price(MarkPriceExchange::Binance, &symbol)
             } else {
-                last_spot_prices.get(&symbol).copied()
+                spot_price_history
+                    .get(&symbol)
+                    .and_then(|prices| nearest_trade_price(prices, row.ts))
+                    .or_else(|| {
+                        all_price_history
+                            .get(&symbol)
+                            .and_then(|prices| nearest_trade_price(prices, row.ts))
+                    })
             };
+            let cost_usdt = row
+                .cost_usdt
+                .or_else(|| conversion_price.map(|price| row.interest * price))
+                .map(|amount| interest_cost_usdt(exchange, amount));
             InterestEvent {
                 symbol,
-                cost_usdt: conversion_price.map(|price| (-row.interest * price).max(0.0)),
+                cost_usdt,
                 ts: row.ts,
             }
         })
@@ -1180,6 +1301,31 @@ async fn load_spot_swap_inputs(
     })
 }
 
+fn nearest_trade_price(prices: &[(i64, f64)], ts: i64) -> Option<f64> {
+    let next = prices.partition_point(|(price_ts, _)| *price_ts < ts);
+    match (next.checked_sub(1), prices.get(next)) {
+        (Some(previous), Some((next_ts, next_price))) => {
+            let (previous_ts, previous_price) = prices[previous];
+            if ts.saturating_sub(previous_ts) <= next_ts.saturating_sub(ts) {
+                Some(previous_price)
+            } else {
+                Some(*next_price)
+            }
+        }
+        (Some(previous), None) => Some(prices[previous].1),
+        (None, Some((_, price))) => Some(*price),
+        (None, None) => None,
+    }
+}
+
+fn interest_cost_usdt(exchange: &str, amount_usdt: f64) -> f64 {
+    if exchange == "binance" {
+        amount_usdt.max(0.0)
+    } else {
+        (-amount_usdt).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,6 +1336,7 @@ mod tests {
         side: Side,
         price: f64,
         amount_u: f64,
+        quantity: f64,
         fee: f64,
         ts: i64,
     ) -> NormalizedTrade {
@@ -1199,6 +1346,7 @@ mod tests {
             leg,
             price,
             amount_u,
+            quantity,
             fee_usdt: Some(fee),
             ts,
         }
@@ -1226,6 +1374,7 @@ mod tests {
                     Side::Buy,
                     100.0,
                     1_000.0,
+                    10.0,
                     2.0,
                     1_100,
                 ),
@@ -1235,6 +1384,7 @@ mod tests {
                     Side::Sell,
                     110.0,
                     400.0,
+                    4.0,
                     1.0,
                     1_200,
                 ),
@@ -1264,6 +1414,9 @@ mod tests {
         assert_eq!(final_point.spot_position_usdt, 1_000.0);
         assert_eq!(final_point.futures_position_usdt, -400.0);
         assert_eq!(final_point.exposure_usdt, 600.0);
+        assert!((final_point.spot_position_qty - 10.0).abs() < 1e-9);
+        assert!((final_point.futures_position_qty + 4.0).abs() < 1e-9);
+        assert!((final_point.exposure_qty - 6.0).abs() < 1e-9);
         assert_eq!(response.symbol_points.len(), 1);
         let symbol_series = &response.symbol_points[0];
         assert_eq!(symbol_series.symbol, "BTCUSDT");
@@ -1288,6 +1441,7 @@ mod tests {
                     Side::Buy,
                     100.0,
                     1_000.0,
+                    10.0,
                     0.0,
                     1_100,
                 ),
@@ -1297,6 +1451,7 @@ mod tests {
                     Side::Sell,
                     110.0,
                     400.0,
+                    4.0,
                     0.0,
                     1_200,
                 ),
@@ -1306,6 +1461,7 @@ mod tests {
                     Side::Sell,
                     105.0,
                     1_000.0,
+                    10.0,
                     0.0,
                     1_300,
                 ),
@@ -1315,6 +1471,7 @@ mod tests {
                     Side::Buy,
                     99.0,
                     400.0,
+                    4.0,
                     0.0,
                     1_400,
                 ),
@@ -1330,6 +1487,9 @@ mod tests {
         let final_point = response.points.last().unwrap();
         assert_eq!(final_point.spot_position_usdt, 0.0);
         assert_eq!(final_point.futures_position_usdt, 0.0);
+        assert_eq!(final_point.spot_position_qty, 0.0);
+        assert_eq!(final_point.futures_position_qty, 0.0);
+        assert_eq!(final_point.exposure_qty, 0.0);
     }
 
     #[test]
@@ -1342,6 +1502,7 @@ mod tests {
                     leg: PositionLeg::Futures,
                     price: 100.0,
                     amount_u: 500.0,
+                    quantity: 5.0,
                     fee_usdt: Some(0.0),
                     ts: 1_100,
                 },
@@ -1351,6 +1512,7 @@ mod tests {
                     leg: PositionLeg::Futures,
                     price: 10.0,
                     amount_u: 300.0,
+                    quantity: 30.0,
                     fee_usdt: Some(0.0),
                     ts: 1_200,
                 },
@@ -1430,6 +1592,10 @@ mod tests {
             PnlSourceKind::for_strategy("funding_rate", "gate", "unified"),
             Some(PnlSourceKind::FundingRate)
         );
+        assert_eq!(
+            PnlSourceKind::for_strategy("funding_rate", "binance", "portfolio_margin"),
+            Some(PnlSourceKind::FundingRate)
+        );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
     }
 
@@ -1442,8 +1608,28 @@ mod tests {
         );
         assert!(!PnlSourceKind::Intra.interest_included("binance"));
         assert!(PnlSourceKind::Intra.interest_included("bybit"));
+        assert!(PnlSourceKind::FundingRate.interest_included("binance"));
         assert!(PnlSourceKind::FundingRate.interest_included("gate"));
         assert_eq!(PnlSourceKind::FundingRate.exposure(1_000.0, -980.0), 20.0);
+    }
+
+    #[test]
+    fn nearest_trade_price_prefers_the_closest_timestamp_and_earlier_on_ties() {
+        let prices = [(100, 10.0), (200, 20.0), (300, 30.0)];
+
+        assert_eq!(nearest_trade_price(&prices, 50), Some(10.0));
+        assert_eq!(nearest_trade_price(&prices, 149), Some(10.0));
+        assert_eq!(nearest_trade_price(&prices, 150), Some(10.0));
+        assert_eq!(nearest_trade_price(&prices, 151), Some(20.0));
+        assert_eq!(nearest_trade_price(&prices, 350), Some(30.0));
+        assert_eq!(nearest_trade_price(&[], 150), None);
+    }
+
+    #[test]
+    fn interest_signs_are_normalized_to_positive_costs() {
+        assert_eq!(interest_cost_usdt("binance", 1.25), 1.25);
+        assert_eq!(interest_cost_usdt("bybit", -1.25), 1.25);
+        assert_eq!(interest_cost_usdt("gate", -1.25), 1.25);
     }
 
     #[test]

@@ -70,6 +70,9 @@ export interface PnlPoint {
   spotPositionUsdt: number
   futuresPositionUsdt: number
   exposureUsdt: number
+  spotPositionQty: number
+  futuresPositionQty: number
+  exposureQty: number
 }
 
 export interface SymbolPnlSeries {
@@ -113,3 +116,5 @@ export type PositionSeriesKey =
   | 'spotPositionUsdt'
   | 'futuresPositionUsdt'
   | 'exposureUsdt'
+
+export type PositionUnit = 'usdt' | 'qty'
