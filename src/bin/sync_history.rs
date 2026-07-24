@@ -850,7 +850,7 @@ fn normalize_bybit_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
     };
     make_trade(
         leg,
-        if leg == Leg::Spot { "spot" } else { "linear" },
+        if leg == Leg::Spot { "spot" } else { "swap" },
         symbol,
         text_field(&raw, &["execId"])?,
         text_field(&raw, &["orderId"])?,
@@ -1983,6 +1983,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bybit.fee_amount, "-0.10");
+        assert_eq!(bybit.market, "swap");
 
         let gate = normalize_gate_trade(
             Leg::Derivative,
