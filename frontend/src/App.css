@@ -916,6 +916,11 @@
   opacity: 0.35;
 }
 
+.series-swatch--area {
+  height: 10px;
+  opacity: 0.22;
+}
+
 .series-toggles .is-checked .series-swatch {
   opacity: 1;
 }

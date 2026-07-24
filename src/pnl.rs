@@ -48,10 +48,7 @@ impl PnlSourceKind {
     }
 
     fn exposure(self, spot_position_usdt: f64, futures_position_usdt: f64) -> f64 {
-        match self {
-            Self::Intra | Self::FundingRate => spot_position_usdt + futures_position_usdt,
-            Self::MarketMaking => futures_position_usdt.abs(),
-        }
+        spot_position_usdt + futures_position_usdt
     }
 }
 
@@ -1336,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn market_making_exposure_is_gross_absolute_futures_position() {
+    fn market_making_exposure_is_signed_venue_position_sum() {
         let inputs = PnlInputs {
             trades: vec![
                 NormalizedTrade {
@@ -1368,8 +1365,8 @@ mod tests {
 
         assert_eq!(final_point.spot_position_usdt, 0.0);
         assert_eq!(final_point.futures_position_usdt, -200.0);
-        assert_eq!(final_point.exposure_usdt, 800.0);
-        assert_eq!(response.summary.open_amount_usdt, 800.0);
+        assert_eq!(final_point.exposure_usdt, -200.0);
+        assert_eq!(response.summary.open_amount_usdt, -200.0);
         assert!(!response.source.interest_included);
         assert_eq!(response.source.adapter, "market_making_futures_v1");
     }

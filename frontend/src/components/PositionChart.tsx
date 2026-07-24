@@ -85,10 +85,16 @@ export function PositionChart({
     const chart = echarts.init(containerRef.current, undefined, {
       renderer: 'canvas',
     })
+    const orderedSeries = [...visibleSeries].sort((left, right) => {
+      if (left === 'exposureUsdt') return -1
+      if (right === 'exposureUsdt') return 1
+      return 0
+    })
     const series =
       mode === 'portfolio'
-        ? visibleSeries.map((key) => {
+        ? orderedSeries.map((key) => {
             const meta = seriesMeta[key]
+            const isExposure = key === 'exposureUsdt'
             return {
               name: meta.label,
               type: 'line' as const,
@@ -96,19 +102,25 @@ export function PositionChart({
               showSymbol: false,
               sampling: 'lttb' as const,
               connectNulls: true,
+              z: isExposure ? 1 : 3,
               lineStyle: {
-                width: key === 'exposureUsdt' ? 2.2 : 1.7,
+                width: isExposure ? 1.1 : 1.7,
                 color: meta.color,
                 type: meta.lineType,
+                opacity: isExposure ? 0.7 : 1,
               },
+              areaStyle: isExposure
+                ? { color: meta.color, opacity: 0.16, origin: 0 }
+                : undefined,
               itemStyle: { color: meta.color },
               emphasis: { focus: 'series' as const },
             }
           })
         : symbolPoints.flatMap((item, symbolIndex) =>
-            visibleSeries.map((key) => {
+            orderedSeries.map((key) => {
               const meta = seriesMeta[key]
               const color = symbolPalette[symbolIndex % symbolPalette.length]
+              const isExposure = key === 'exposureUsdt'
               return {
                 name: `${item.symbol} ${meta.label}`,
                 type: 'line' as const,
@@ -116,12 +128,16 @@ export function PositionChart({
                 showSymbol: false,
                 sampling: 'lttb' as const,
                 connectNulls: true,
+                z: isExposure ? 1 : 3,
                 lineStyle: {
-                  width: key === 'exposureUsdt' ? 2 : 1.35,
+                  width: isExposure ? 1 : 1.35,
                   color,
                   type: meta.lineType,
-                  opacity: key === 'exposureUsdt' ? 1 : 0.72,
+                  opacity: isExposure ? 0.65 : 0.82,
                 },
+                areaStyle: isExposure
+                  ? { color, opacity: 0.09, origin: 0 }
+                  : undefined,
                 itemStyle: { color },
                 emphasis: { focus: 'series' as const },
               }
@@ -144,7 +160,7 @@ export function PositionChart({
           borderColor: '#d7dbe2',
           textStyle: { color: '#20252d', fontSize: 12 },
           valueFormatter: (value: unknown) =>
-            `${amount(typeof value === 'number' ? value : Number(value))} U`,
+            `${amount(typeof value === 'number' ? value : Number(value))} USDT`,
           axisPointer: {
             type: 'line',
             lineStyle: { color: '#8993a4', type: 'dashed' },
@@ -160,8 +176,8 @@ export function PositionChart({
         },
         yAxis: {
           type: 'value',
-          scale: true,
-          name: 'U',
+          scale: false,
+          name: 'USDT',
           nameTextStyle: { color: '#697386', fontSize: 10 },
           axisLine: { show: false },
           axisTick: { show: false },

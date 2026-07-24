@@ -657,7 +657,7 @@ export function PnlStrategyPage() {
               {chartMode === 'portfolio' ? (
                 <aside className="symbol-curve-picker" aria-label="仓位曲线选择">
                   <div className="symbol-curve-picker__header">
-                    <strong>U 仓位</strong>
+                    <strong>USDT 仓位</strong>
                   </div>
                   <div className="symbol-curve-picker__list">
                     {activePositionOptions.map((option) => (
@@ -668,7 +668,11 @@ export function PnlStrategyPage() {
                           onChange={() => togglePositionSeries(option.key)}
                         />
                         <span
-                          className="series-swatch"
+                          className={
+                            option.key === 'exposureUsdt'
+                              ? 'series-swatch series-swatch--area'
+                              : 'series-swatch'
+                          }
                           style={{ backgroundColor: option.color }}
                         />
                         <span>{option.label}</span>
@@ -715,11 +719,7 @@ export function PnlStrategyPage() {
             {pnl && (
               <div className="chart-foot">
                 <span>USDT NOTIONAL</span>
-                <span>
-                  {isMarketMaking
-                    ? 'EXPOSURE = ABS(FUTURES POSITION)'
-                    : 'EXPOSURE = SPOT + FUTURES'}
-                </span>
+                <span>EXPOSURE = Σ SIGNED VENUE POSITION</span>
                 <span>{selectedSet.size} symbols</span>
               </div>
             )}
