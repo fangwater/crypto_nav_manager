@@ -56,7 +56,7 @@ const seriesMeta: Record<
     negate: true,
   },
   floatingPnlUsdt: {
-    label: '浮盈亏',
+    label: '浮动盈亏',
     color: '#4b6478',
     dashed: true,
   },

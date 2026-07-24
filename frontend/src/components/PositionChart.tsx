@@ -3,6 +3,7 @@ import {
   DataZoomComponent,
   GridComponent,
   TooltipComponent,
+  VisualMapComponent,
 } from 'echarts/components'
 import * as echarts from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -18,6 +19,7 @@ echarts.use([
   DataZoomComponent,
   GridComponent,
   TooltipComponent,
+  VisualMapComponent,
   CanvasRenderer,
 ])
 
@@ -28,41 +30,27 @@ interface PositionChartProps {
   mode: 'portfolio' | 'symbols'
 }
 
-const symbolPalette = [
-  '#176b5b',
-  '#2563a7',
-  '#b7791f',
-  '#c2413b',
-  '#7357a3',
-  '#2f855a',
-  '#9c4f87',
-  '#4b6478',
-  '#d97706',
-  '#0f766e',
-  '#4467a8',
-  '#a33f55',
-]
-
 const seriesMeta: Record<
   PositionSeriesKey,
-  { label: string; color: string; lineType: 'solid' | 'dashed' | 'dotted' }
+  { label: string; lineType: 'solid' | 'dashed' | 'dotted' }
 > = {
   spotPositionUsdt: {
     label: 'Spot 仓位',
-    color: '#2563a7',
     lineType: 'solid',
   },
   futuresPositionUsdt: {
-    label: 'Futures 仓位',
-    color: '#b7791f',
+    label: 'Swap 仓位',
     lineType: 'dashed',
   },
   exposureUsdt: {
     label: '敞口',
-    color: '#c2413b',
     lineType: 'solid',
   },
 }
+
+const positiveColor = '#16705a'
+const negativeColor = '#b5473c'
+const zeroColor = '#8993a4'
 
 function amount(value: number) {
   return value.toLocaleString('en-US', {
@@ -105,21 +93,18 @@ export function PositionChart({
               z: isExposure ? 1 : 3,
               lineStyle: {
                 width: isExposure ? 1.1 : 1.7,
-                color: meta.color,
                 type: meta.lineType,
                 opacity: isExposure ? 0.7 : 1,
               },
               areaStyle: isExposure
-                ? { color: meta.color, opacity: 0.16, origin: 0 }
+                ? { opacity: 0.18, origin: 0 }
                 : undefined,
-              itemStyle: { color: meta.color },
               emphasis: { focus: 'series' as const },
             }
           })
-        : symbolPoints.flatMap((item, symbolIndex) =>
+        : symbolPoints.flatMap((item) =>
             orderedSeries.map((key) => {
               const meta = seriesMeta[key]
-              const color = symbolPalette[symbolIndex % symbolPalette.length]
               const isExposure = key === 'exposureUsdt'
               return {
                 name: `${item.symbol} ${meta.label}`,
@@ -131,14 +116,12 @@ export function PositionChart({
                 z: isExposure ? 1 : 3,
                 lineStyle: {
                   width: isExposure ? 1 : 1.35,
-                  color,
                   type: meta.lineType,
                   opacity: isExposure ? 0.65 : 0.82,
                 },
                 areaStyle: isExposure
-                  ? { color, opacity: 0.09, origin: 0 }
+                  ? { opacity: 0.1, origin: 0 }
                   : undefined,
-                itemStyle: { color },
                 emphasis: { focus: 'series' as const },
               }
             }),
@@ -186,6 +169,17 @@ export function PositionChart({
             formatter: (value: number) => amount(value),
           },
           splitLine: { lineStyle: { color: '#edf0f4' } },
+        },
+        visualMap: {
+          show: false,
+          type: 'piecewise',
+          seriesIndex: series.map((_, index) => index),
+          dimension: 1,
+          pieces: [
+            { gt: 0, color: positiveColor },
+            { lt: 0, color: negativeColor },
+            { value: 0, color: zeroColor },
+          ],
         },
         dataZoom: [
           { type: 'inside', filterMode: 'none' },

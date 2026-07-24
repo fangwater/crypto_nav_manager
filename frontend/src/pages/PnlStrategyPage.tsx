@@ -38,6 +38,7 @@ const seriesOptions: Array<{
   { key: 'totalPnlUsdt', label: 'Total', color: '#176b5b' },
   { key: 'feeBeforePnlUsdt', label: 'Fee 前', color: '#2563a7' },
   { key: 'feeAfterPnlUsdt', label: 'Fee 后', color: '#7357a3' },
+  { key: 'floatingPnlUsdt', label: '浮动盈亏', color: '#4b6478' },
   { key: 'fundingPnlUsdt', label: 'Funding', color: '#b7791f' },
   { key: 'interestCostUsdt', label: 'Interest', color: '#c2413b' },
 ]
@@ -45,11 +46,11 @@ const seriesOptions: Array<{
 const positionSeriesOptions: Array<{
   key: PositionSeriesKey
   label: string
-  color: string
+  lineType: 'solid' | 'dashed' | 'area'
 }> = [
-  { key: 'spotPositionUsdt', label: 'Spot 仓位', color: '#2563a7' },
-  { key: 'futuresPositionUsdt', label: 'Futures 仓位', color: '#b7791f' },
-  { key: 'exposureUsdt', label: '敞口', color: '#c2413b' },
+  { key: 'spotPositionUsdt', label: 'Spot 仓位', lineType: 'solid' },
+  { key: 'futuresPositionUsdt', label: 'Swap 仓位', lineType: 'dashed' },
+  { key: 'exposureUsdt', label: '敞口', lineType: 'area' },
 ]
 
 const marketMakingPositionSeriesOptions = positionSeriesOptions
@@ -173,9 +174,12 @@ export function PnlStrategyPage() {
   const [chartMode, setChartMode] = useState<'portfolio' | 'symbols'>(
     'portfolio',
   )
+  const [positionDisplayMode, setPositionDisplayMode] = useState<
+    'positions' | 'exposure'
+  >('positions')
   const [visiblePositionSeries, setVisiblePositionSeries] = useState<
     PositionSeriesKey[]
-  >(['spotPositionUsdt', 'futuresPositionUsdt', 'exposureUsdt'])
+  >(['spotPositionUsdt', 'futuresPositionUsdt'])
   const [symbolSearch, setSymbolSearch] = useState('')
   const [strategyError, setStrategyError] = useState<string | null>(null)
   const [pnlError, setPnlError] = useState<string | null>(null)
@@ -342,12 +346,15 @@ export function PnlStrategyPage() {
 
   const summary = pnl?.summary
   const isMarketMaking = strategy.strategyKind === 'market_making'
-  const activePositionSeries = isMarketMaking
-    ? visiblePositionSeries.filter((key) => key !== 'spotPositionUsdt')
-    : visiblePositionSeries
-  const activePositionOptions = isMarketMaking
-    ? marketMakingPositionSeriesOptions
-    : positionSeriesOptions
+  const activePositionSeries: PositionSeriesKey[] =
+    positionDisplayMode === 'exposure'
+      ? ['exposureUsdt']
+      : isMarketMaking
+        ? ['futuresPositionUsdt']
+        : visiblePositionSeries.filter((key) => key !== 'exposureUsdt')
+  const activePositionOptions = (
+    isMarketMaking ? marketMakingPositionSeriesOptions : positionSeriesOptions
+  ).filter((option) => option.key !== 'exposureUsdt')
 
   return (
     <>
@@ -458,6 +465,13 @@ export function PnlStrategyPage() {
             <span>Fee 后</span>
             <strong className={valueClass(summary?.feeAfterPnlUsdt ?? 0)}>
               {summary ? money(summary.feeAfterPnlUsdt, true) : '--'}
+            </strong>
+            <small>USDT</small>
+          </div>
+          <div className="pnl-metric">
+            <span>浮动盈亏</span>
+            <strong className={valueClass(summary?.floatingPnlUsdt ?? 0)}>
+              {summary ? money(summary.floatingPnlUsdt, true) : '--'}
             </strong>
             <small>USDT</small>
           </div>
@@ -611,9 +625,38 @@ export function PnlStrategyPage() {
             <div className="chart-panel__header pnl-chart-header">
               <div>
                 <p className="eyebrow">POSITION / EXPOSURE</p>
-                <h2>{isMarketMaking ? '合约仓位与敞口' : '仓位与敞口'}</h2>
+                <h2>
+                  {positionDisplayMode === 'exposure'
+                    ? '净敞口'
+                    : isMarketMaking
+                      ? '合约仓位'
+                      : 'Spot / Swap 仓位'}
+                </h2>
               </div>
               <div className="chart-controls">
+                <div
+                  className="segmented segmented--compact"
+                  aria-label="仓位图显示指标"
+                >
+                  <button
+                    type="button"
+                    className={
+                      positionDisplayMode === 'positions' ? 'is-active' : ''
+                    }
+                    onClick={() => setPositionDisplayMode('positions')}
+                  >
+                    仓位
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      positionDisplayMode === 'exposure' ? 'is-active' : ''
+                    }
+                    onClick={() => setPositionDisplayMode('exposure')}
+                  >
+                    敞口
+                  </button>
+                </div>
                 <div
                   className="segmented segmented--compact"
                   aria-label="仓位曲线视图"
@@ -657,27 +700,40 @@ export function PnlStrategyPage() {
               {chartMode === 'portfolio' ? (
                 <aside className="symbol-curve-picker" aria-label="仓位曲线选择">
                   <div className="symbol-curve-picker__header">
-                    <strong>USDT 仓位</strong>
+                    <strong>
+                      {positionDisplayMode === 'exposure' ? '敞口方向' : 'USDT 仓位'}
+                    </strong>
                   </div>
                   <div className="symbol-curve-picker__list">
-                    {activePositionOptions.map((option) => (
-                      <label key={option.key}>
-                        <input
-                          type="checkbox"
-                          checked={visiblePositionSeries.includes(option.key)}
-                          onChange={() => togglePositionSeries(option.key)}
-                        />
-                        <span
-                          className={
-                            option.key === 'exposureUsdt'
-                              ? 'series-swatch series-swatch--area'
-                              : 'series-swatch'
-                          }
-                          style={{ backgroundColor: option.color }}
-                        />
-                        <span>{option.label}</span>
-                      </label>
-                    ))}
+                    {positionDisplayMode === 'positions' ? (
+                      activePositionOptions.map((option) => (
+                        <label key={option.key}>
+                          <input
+                            type="checkbox"
+                            checked={visiblePositionSeries.includes(option.key)}
+                            disabled={isMarketMaking}
+                            onChange={() => togglePositionSeries(option.key)}
+                          />
+                          <span
+                            className={
+                              option.lineType === 'dashed'
+                                ? 'signed-line-swatch is-dashed'
+                                : 'signed-line-swatch'
+                            }
+                            aria-hidden="true"
+                          >
+                            <i />
+                            <i />
+                          </span>
+                          <span>{option.label}</span>
+                        </label>
+                      ))
+                    ) : (
+                      <div className="position-sign-key">
+                        <span><i className="is-positive" />正值</span>
+                        <span><i className="is-negative" />负值</span>
+                      </div>
+                    )}
                   </div>
                 </aside>
               ) : pnl ? (
@@ -719,7 +775,11 @@ export function PnlStrategyPage() {
             {pnl && (
               <div className="chart-foot">
                 <span>USDT NOTIONAL</span>
-                <span>EXPOSURE = Σ SIGNED VENUE POSITION</span>
+                <span>
+                  {positionDisplayMode === 'exposure'
+                    ? 'EXPOSURE = Σ SIGNED VENUE POSITION'
+                    : 'SIGNED VENUE POSITION'}
+                </span>
                 <span>{selectedSet.size} symbols</span>
               </div>
             )}

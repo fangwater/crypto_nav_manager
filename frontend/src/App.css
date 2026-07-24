@@ -790,7 +790,7 @@
 
 .pnl-metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.55);
@@ -916,9 +916,47 @@
   opacity: 0.35;
 }
 
-.series-swatch--area {
+.signed-line-swatch {
+  width: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.signed-line-swatch i {
+  width: 8px;
+  border-top: 2px solid #16705a;
+}
+
+.signed-line-swatch i:last-child {
+  border-color: #b5473c;
+}
+
+.signed-line-swatch.is-dashed i {
+  border-top-style: dashed;
+}
+
+.position-sign-key {
+  padding: 8px 12px;
+  display: grid;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.position-sign-key span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.position-sign-key i {
+  width: 12px;
   height: 10px;
-  opacity: 0.22;
+  display: block;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.35;
 }
 
 .series-toggles .is-checked .series-swatch {
