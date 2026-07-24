@@ -232,7 +232,8 @@ impl Metrics {
 
 #[derive(Clone, Debug, Default)]
 struct SymbolState {
-    fifo: FifoPnl,
+    spot_fifo: FifoPnl,
+    futures_fifo: FifoPnl,
     funding_pnl_usdt: f64,
     interest_cost_usdt: f64,
     trade_count: u64,
@@ -241,7 +242,8 @@ struct SymbolState {
     futures_position_usdt: f64,
     unconverted_fee_count: u64,
     unconverted_interest_count: u64,
-    cached_snapshot: Option<PnlSnapshot>,
+    spot_snapshot: Option<PnlSnapshot>,
+    futures_snapshot: Option<PnlSnapshot>,
 }
 
 impl SymbolState {
@@ -250,9 +252,12 @@ impl SymbolState {
             self.unconverted_fee_count += 1;
             0.0
         });
-        self.fifo
-            .apply_fill(trade.side, trade.price, trade.amount_u, fee)
-            .context("apply normalized trade to FIFO")?;
+        let (fifo, cached_snapshot) = match trade.leg {
+            PositionLeg::Spot => (&mut self.spot_fifo, &mut self.spot_snapshot),
+            PositionLeg::Futures => (&mut self.futures_fifo, &mut self.futures_snapshot),
+        };
+        fifo.apply_fill(trade.side, trade.price, trade.amount_u, fee)
+            .context("apply normalized trade to venue FIFO")?;
         self.trade_count += 1;
         self.volume_usdt += trade.amount_u;
         let signed_amount_u = match trade.side {
@@ -263,35 +268,27 @@ impl SymbolState {
             PositionLeg::Spot => self.spot_position_usdt += signed_amount_u,
             PositionLeg::Futures => self.futures_position_usdt += signed_amount_u,
         }
-        self.cached_snapshot = Some(
-            self.fifo
-                .snapshot(trade.price, trade.price)
-                .context("mark FIFO at the latest trade price")?,
+        *cached_snapshot = Some(
+            fifo.snapshot(trade.price, trade.price)
+                .context("mark venue FIFO at the latest trade price")?,
         );
         Ok(())
     }
 
     fn metrics(&self) -> Metrics {
-        let snapshot = self.cached_snapshot.unwrap_or(PnlSnapshot {
-            gross_realized_pnl: 0.0,
-            cumulative_fees: 0.0,
-            realized_pnl: 0.0,
-            floating_pnl: 0.0,
-            total_pnl: 0.0,
-            long_amount_u: 0.0,
-            short_amount_u: 0.0,
-            net_open_amount_u: 0.0,
-        });
+        let spot = self.spot_snapshot.unwrap_or_default();
+        let futures = self.futures_snapshot.unwrap_or_default();
         Metrics {
             trade_count: self.trade_count,
             volume_usdt: self.volume_usdt,
-            fee_before_pnl_usdt: snapshot.gross_realized_pnl,
-            trading_fee_usdt: snapshot.cumulative_fees,
-            fee_after_pnl_usdt: snapshot.realized_pnl,
+            fee_before_pnl_usdt: spot.gross_realized_pnl + futures.gross_realized_pnl,
+            trading_fee_usdt: spot.cumulative_fees + futures.cumulative_fees,
+            fee_after_pnl_usdt: spot.realized_pnl + futures.realized_pnl,
             funding_pnl_usdt: self.funding_pnl_usdt,
             interest_cost_usdt: self.interest_cost_usdt,
-            floating_pnl_usdt: snapshot.floating_pnl,
-            total_pnl_usdt: snapshot.total_pnl + self.funding_pnl_usdt - self.interest_cost_usdt,
+            floating_pnl_usdt: spot.floating_pnl + futures.floating_pnl,
+            total_pnl_usdt: spot.total_pnl + futures.total_pnl + self.funding_pnl_usdt
+                - self.interest_cost_usdt,
             open_amount_usdt: clean_zero(self.spot_position_usdt + self.futures_position_usdt),
             spot_position_usdt: self.spot_position_usdt,
             futures_position_usdt: self.futures_position_usdt,
@@ -1192,6 +1189,7 @@ mod tests {
 
     fn trade(
         symbol: &str,
+        leg: PositionLeg,
         side: Side,
         price: f64,
         amount_u: f64,
@@ -1201,10 +1199,7 @@ mod tests {
         NormalizedTrade {
             symbol: symbol.to_string(),
             side,
-            leg: match side {
-                Side::Buy => PositionLeg::Spot,
-                Side::Sell => PositionLeg::Futures,
-            },
+            leg,
             price,
             amount_u,
             fee_usdt: Some(fee),
@@ -1225,11 +1220,27 @@ mod tests {
     }
 
     #[test]
-    fn combines_amount_fifo_actual_fees_last_trade_mark_and_funding() {
+    fn keeps_venue_fifo_independent_and_combines_fees_funding_and_interest() {
         let inputs = PnlInputs {
             trades: vec![
-                trade("BTCUSDT", Side::Buy, 100.0, 1_000.0, 2.0, 1_100),
-                trade("BTCUSDT", Side::Sell, 110.0, 400.0, 1.0, 1_200),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    100.0,
+                    1_000.0,
+                    2.0,
+                    1_100,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Futures,
+                    Side::Sell,
+                    110.0,
+                    400.0,
+                    1.0,
+                    1_200,
+                ),
             ],
             funding: vec![FundingEvent {
                 symbol: "BTCUSDT".to_string(),
@@ -1245,13 +1256,13 @@ mod tests {
 
         let response = calculate(inputs, request(1_000, 1_400)).unwrap();
 
-        assert!((response.summary.fee_before_pnl_usdt - 40.0).abs() < 1e-9);
+        assert_eq!(response.summary.fee_before_pnl_usdt, 0.0);
         assert!((response.summary.trading_fee_usdt - 3.0).abs() < 1e-9);
-        assert!((response.summary.fee_after_pnl_usdt - 37.0).abs() < 1e-9);
+        assert!((response.summary.fee_after_pnl_usdt + 3.0).abs() < 1e-9);
         assert!((response.summary.funding_pnl_usdt - 5.0).abs() < 1e-9);
         assert!((response.summary.interest_cost_usdt - 2.0).abs() < 1e-9);
-        assert!((response.summary.floating_pnl_usdt - 60.0).abs() < 1e-9);
-        assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
+        assert_eq!(response.summary.floating_pnl_usdt, 0.0);
+        assert_eq!(response.summary.total_pnl_usdt, 0.0);
         let final_point = response.points.last().unwrap();
         assert_eq!(final_point.spot_position_usdt, 1_000.0);
         assert_eq!(final_point.futures_position_usdt, -400.0);
@@ -1268,6 +1279,60 @@ mod tests {
             response.source.returned_symbol_points,
             symbol_series.points.len()
         );
+    }
+
+    #[test]
+    fn closes_fifo_only_within_the_same_venue() {
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    100.0,
+                    1_000.0,
+                    0.0,
+                    1_100,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Futures,
+                    Side::Sell,
+                    110.0,
+                    400.0,
+                    0.0,
+                    1_200,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    105.0,
+                    1_000.0,
+                    0.0,
+                    1_300,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Futures,
+                    Side::Buy,
+                    99.0,
+                    400.0,
+                    0.0,
+                    1_400,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+
+        let response = calculate(inputs, request(1_000, 1_500)).unwrap();
+
+        assert!((response.summary.fee_before_pnl_usdt - 90.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 90.0).abs() < 1e-9);
+        assert_eq!(response.summary.open_amount_usdt, 0.0);
+        let final_point = response.points.last().unwrap();
+        assert_eq!(final_point.spot_position_usdt, 0.0);
+        assert_eq!(final_point.futures_position_usdt, 0.0);
     }
 
     #[test]

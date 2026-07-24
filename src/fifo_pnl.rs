@@ -29,7 +29,7 @@ pub struct FillResult {
     pub net_open_amount_u: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PnlSnapshot {
     pub gross_realized_pnl: f64,
     pub cumulative_fees: f64,
