@@ -22,12 +22,14 @@ const IPC_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const IPC_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const REST_TIMEOUT: Duration = Duration::from_secs(8);
 const BINANCE_MARK_PRICES_URL: &str = "https://fapi.binance.com/fapi/v1/premiumIndex";
+const BYBIT_MARK_PRICES_URL: &str = "https://api.bybit.com/v5/market/tickers";
 const GATE_CONTRACTS_URL: &str = "https://api.gateio.ws/api/v4/futures/usdt/contracts";
 const OKX_MARK_PRICES_URL: &str = "https://www.okx.com/api/v5/public/mark-price";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MarkPriceExchange {
     Binance,
+    Bybit,
     Gate,
     Okx,
 }
@@ -36,6 +38,7 @@ impl MarkPriceExchange {
     fn as_str(self) -> &'static str {
         match self {
             Self::Binance => "binance",
+            Self::Bybit => "bybit",
             Self::Gate => "gate",
             Self::Okx => "okx",
         }
@@ -122,12 +125,14 @@ impl MarkPriceCache {
                 return;
             }
         };
-        let (binance, gate, okx) = tokio::join!(
+        let (binance, bybit, gate, okx) = tokio::join!(
             fetch_binance_mark_prices(&client),
+            fetch_bybit_mark_prices(&client),
             fetch_gate_mark_prices(&client),
             fetch_okx_mark_prices(&client)
         );
         self.store_bootstrap_result(MarkPriceExchange::Binance, binance);
+        self.store_bootstrap_result(MarkPriceExchange::Bybit, bybit);
         self.store_bootstrap_result(MarkPriceExchange::Gate, gate);
         self.store_bootstrap_result(MarkPriceExchange::Okx, okx);
     }
@@ -184,6 +189,58 @@ async fn fetch_binance_mark_prices(client: &reqwest::Client) -> Result<Vec<(Stri
         .await
         .context("decode Binance premium index")?;
     parse_rest_rows(rows.into_iter().map(|row| (row.symbol, row.mark_price)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitMarkPriceResponse {
+    ret_code: i64,
+    ret_msg: String,
+    result: BybitMarkPriceResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitMarkPriceResult {
+    list: Vec<BybitMarkPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitMarkPrice {
+    symbol: String,
+    mark_price: String,
+}
+
+async fn fetch_bybit_mark_prices(client: &reqwest::Client) -> Result<Vec<(String, f64)>> {
+    let response = client
+        .get(BYBIT_MARK_PRICES_URL)
+        .query(&[("category", "linear")])
+        .send()
+        .await
+        .context("request Bybit linear tickers")?
+        .error_for_status()
+        .context("Bybit linear tickers status")?
+        .json::<BybitMarkPriceResponse>()
+        .await
+        .context("decode Bybit linear tickers")?;
+    parse_bybit_mark_prices(response)
+}
+
+fn parse_bybit_mark_prices(response: BybitMarkPriceResponse) -> Result<Vec<(String, f64)>> {
+    if response.ret_code != 0 {
+        bail!(
+            "Bybit linear tickers error {}: {}",
+            response.ret_code,
+            response.ret_msg
+        );
+    }
+    parse_rest_rows(
+        response
+            .result
+            .list
+            .into_iter()
+            .map(|row| (row.symbol, row.mark_price)),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,6 +546,7 @@ mod tests {
     fn cache_is_partitioned_by_exchange_and_rejects_older_updates() {
         let cache = MarkPriceCache::default();
         assert!(cache.update(MarkPriceExchange::Binance, "BNBUSDT", 578.0, 20));
+        assert!(cache.update(MarkPriceExchange::Bybit, "BNBUSDT", 577.5, 20));
         assert!(cache.update(MarkPriceExchange::Gate, "BNB_USDT", 579.0, 20));
         assert!(!cache.update(MarkPriceExchange::Binance, "BNBUSDT", 500.0, 10));
 
@@ -496,7 +554,30 @@ mod tests {
             cache.price(MarkPriceExchange::Binance, "bnb_usdt"),
             Some(578.0)
         );
+        assert_eq!(
+            cache.price(MarkPriceExchange::Bybit, "BNBUSDT"),
+            Some(577.5)
+        );
         assert_eq!(cache.price(MarkPriceExchange::Gate, "BNBUSDT"), Some(579.0));
+    }
+
+    #[test]
+    fn parses_bybit_linear_mark_prices() {
+        let response = serde_json::from_str::<BybitMarkPriceResponse>(
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[
+                {"symbol":"BRETTUSDT","markPrice":"0.004463"},
+                {"symbol":"DOTUSDT","markPrice":"0.8106"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_bybit_mark_prices(response).unwrap(),
+            vec![
+                ("BRETTUSDT".to_string(), 0.004463),
+                ("DOTUSDT".to_string(), 0.8106),
+            ]
+        );
     }
 
     #[test]

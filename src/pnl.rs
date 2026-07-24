@@ -1273,14 +1273,19 @@ async fn load_spot_swap_inputs(
             } else if exchange == "binance" {
                 mark_prices.price(MarkPriceExchange::Binance, &symbol)
             } else {
-                spot_price_history
+                let nearest_price = spot_price_history
                     .get(&symbol)
                     .and_then(|prices| nearest_trade_price(prices, row.ts))
                     .or_else(|| {
                         all_price_history
                             .get(&symbol)
                             .and_then(|prices| nearest_trade_price(prices, row.ts))
-                    })
+                    });
+                if exchange == "bybit" {
+                    nearest_price.or_else(|| mark_prices.price(MarkPriceExchange::Bybit, &symbol))
+                } else {
+                    nearest_price
+                }
             };
             let cost_usdt = row
                 .cost_usdt

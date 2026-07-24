@@ -178,7 +178,10 @@ export function PnlStrategyPage() {
   const [positionDisplayMode, setPositionDisplayMode] = useState<
     'positions' | 'exposure'
   >('positions')
-  const [positionUnit, setPositionUnit] = useState<PositionUnit>('usdt')
+  const [positionChartMode, setPositionChartMode] = useState<
+    'portfolio' | 'symbols'
+  >('symbols')
+  const [positionUnit, setPositionUnit] = useState<PositionUnit>('qty')
   const [visiblePositionSeries, setVisiblePositionSeries] = useState<
     PositionSeriesKey[]
   >(['spotPositionUsdt', 'futuresPositionUsdt'])
@@ -652,7 +655,7 @@ export function PnlStrategyPage() {
                     className={positionUnit === 'qty' ? 'is-active' : ''}
                     onClick={() => {
                       setPositionUnit('qty')
-                      setChartMode('symbols')
+                      setPositionChartMode('symbols')
                     }}
                   >
                     Qty
@@ -687,16 +690,16 @@ export function PnlStrategyPage() {
                 >
                   <button
                     type="button"
-                    className={chartMode === 'portfolio' ? 'is-active' : ''}
+                    className={positionChartMode === 'portfolio' ? 'is-active' : ''}
                     disabled={positionUnit === 'qty'}
-                    onClick={() => setChartMode('portfolio')}
+                    onClick={() => setPositionChartMode('portfolio')}
                   >
                     组合
                   </button>
                   <button
                     type="button"
-                    className={chartMode === 'symbols' ? 'is-active' : ''}
-                    onClick={() => setChartMode('symbols')}
+                    className={positionChartMode === 'symbols' ? 'is-active' : ''}
+                    onClick={() => setPositionChartMode('symbols')}
                   >
                     {positionDisplayMode === 'exposure' ? '币种组成' : '分币'}
                   </button>
@@ -712,7 +715,7 @@ export function PnlStrategyPage() {
                       selectedSymbols?.length === 0 ? [] : pnl.symbolPoints
                     }
                     visibleSeries={activePositionSeries}
-                    mode={chartMode}
+                    mode={positionChartMode}
                     unit={positionUnit}
                   />
                 )}
@@ -723,7 +726,7 @@ export function PnlStrategyPage() {
                   </div>
                 )}
               </div>
-              {chartMode === 'portfolio' ? (
+              {positionChartMode === 'portfolio' ? (
                 <aside className="symbol-curve-picker" aria-label="仓位曲线选择">
                   <div className="symbol-curve-picker__header">
                     <strong>
