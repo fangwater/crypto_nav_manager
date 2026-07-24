@@ -13,6 +13,7 @@ use crypto_nav_manager::{
     models::{ProductCategory, TimeRange},
     rest_dispatcher::{Dispatcher, DispatcherConfig},
     rest_ip_pool::configured_or_exchange_local_ips,
+    strategy_env::read_env_file,
 };
 use serde_json::Value;
 use sqlx::{
@@ -21,7 +22,7 @@ use sqlx::{
 };
 use std::{
     collections::{BTreeSet, HashMap},
-    env, fs,
+    env,
     net::IpAddr,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -98,6 +99,7 @@ enum StrategyClass {
 struct Strategy {
     slug: String,
     schema: String,
+    host: String,
     env_path: PathBuf,
     exchange: String,
     account_mode: String,
@@ -630,7 +632,7 @@ async fn build_client(
     }
     let dispatcher = Dispatcher::new(dispatcher_config)
         .with_context(|| format!("create {} REST dispatcher", strategy.exchange))?;
-    let values = read_env(&strategy.env_path)?;
+    let values = read_env(&strategy.host, &strategy.env_path)?;
     let client = match strategy.exchange.as_str() {
         "binance" => {
             let mode = match strategy.account_mode.as_str() {
@@ -692,15 +694,15 @@ async fn build_client(
 }
 
 async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
-    let row: Option<(String, String, String, String, String, i64)> = sqlx::query_as(
-        "SELECT db_schema,env_path,exchange,account_mode,strategy_kind,st_ms \
+    let row: Option<(String, String, String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT db_schema,host,env_path,exchange,account_mode,strategy_kind,st_ms \
          FROM strategy_envs WHERE slug=$1",
     )
     .bind(slug)
     .fetch_optional(pool)
     .await
     .context("query strategy_envs")?;
-    let (schema, env_path, exchange, account_mode, kind, st_ms) =
+    let (schema, host, env_path, exchange, account_mode, kind, st_ms) =
         row.with_context(|| format!("strategy not found: {slug}"))?;
     if !valid_schema(&schema) {
         bail!("invalid PostgreSQL schema for {slug}: {schema}");
@@ -714,6 +716,7 @@ async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
     Ok(Strategy {
         slug: slug.to_string(),
         schema,
+        host,
         env_path: PathBuf::from(env_path),
         exchange: exchange.to_ascii_lowercase(),
         account_mode,
@@ -722,9 +725,8 @@ async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
     })
 }
 
-fn read_env(path: &Path) -> Result<HashMap<String, String>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read strategy env file {}", path.display()))?;
+fn read_env(host: &str, path: &Path) -> Result<HashMap<String, String>> {
+    let contents = read_env_file(host, path)?;
     let mut values = HashMap::new();
     for (line_number, original) in contents.lines().enumerate() {
         let mut line = original.trim();
@@ -1875,6 +1877,7 @@ mod tests {
         Strategy {
             slug: "test".into(),
             schema: "test".into(),
+            host: "local".into(),
             env_path: PathBuf::new(),
             exchange: exchange.into(),
             account_mode: "unified".into(),

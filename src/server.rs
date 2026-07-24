@@ -44,6 +44,7 @@ struct AppState {
     pool: PgPool,
     mark_prices: MarkPriceCache,
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
+    snapshot_sync: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -97,6 +98,50 @@ struct PnlStrategyRecord {
     exchange: String,
     account_mode: String,
     strategy_kind: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct SnapshotStrategyRecord {
+    slug: String,
+    host: String,
+    config_url: String,
+}
+
+#[derive(Debug, FromRow)]
+struct SnapshotRecord {
+    strategy_slug: String,
+    snapshot_ts_ms: i64,
+    fetched_at_ms: i64,
+    source_url: String,
+    payload: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotResponse {
+    strategy_slug: String,
+    snapshot_ts_ms: i64,
+    fetched_at_ms: i64,
+    source_url: String,
+    payload: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotSyncResult {
+    strategy_slug: String,
+    stored: bool,
+    snapshot_ts_ms: Option<i64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotSyncResponse {
+    requested: usize,
+    stored: usize,
+    failed: usize,
+    results: Vec<SnapshotSyncResult>,
 }
 
 #[derive(Debug, FromRow)]
@@ -209,12 +254,16 @@ pub async fn run() -> Result<()> {
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
+        .route("/api/snapshots", get(list_latest_snapshots))
+        .route("/api/snapshots/sync", post(sync_snapshots))
+        .route("/api/snapshots/{slug}", get(get_latest_snapshot))
         .route("/api/strategies/{slug}", get(get_strategy))
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
         .with_state(AppState {
             pool,
             mark_prices,
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
+            snapshot_sync: Arc::new(Mutex::new(())),
         })
         .layer(TraceLayer::new_for_http());
 
@@ -228,6 +277,169 @@ pub async fn run() -> Result<()> {
         .await
         .context("serve HTTP")?;
     Ok(())
+}
+
+async fn sync_snapshots(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let Ok(_guard) = state.snapshot_sync.try_lock() else {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "snapshot sync already running",
+            }),
+        )
+            .into_response());
+    };
+    let strategies = sqlx::query_as::<_, SnapshotStrategyRecord>(
+        "SELECT slug,host,config_url FROM strategy_envs WHERE enabled ORDER BY sort_order,slug",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let requested = strategies.len();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut tasks = JoinSet::new();
+    for strategy in strategies {
+        let client = client.clone();
+        tasks.spawn(async move {
+            let slug = strategy.slug;
+            let result = async {
+                let source_url = snapshot_source_url(&strategy.host, &strategy.config_url)?;
+                let payload = client
+                    .get(&source_url)
+                    .send()
+                    .await
+                    .with_context(|| format!("request snapshot for {slug}"))?
+                    .error_for_status()
+                    .with_context(|| format!("snapshot status for {slug}"))?
+                    .json::<Value>()
+                    .await
+                    .with_context(|| format!("decode snapshot for {slug}"))?;
+                let snapshot_ts_ms = payload
+                    .get("ts_ms")
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+                    .with_context(|| format!("snapshot for {slug} has no valid ts_ms"))?;
+                Ok::<_, anyhow::Error>((source_url, snapshot_ts_ms, payload))
+            }
+            .await;
+            (slug, result)
+        });
+    }
+
+    let mut results = Vec::with_capacity(requested);
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((slug, Ok((source_url, snapshot_ts_ms, payload)))) => {
+                sqlx::query(
+                    r#"INSERT INTO strategy_snapshots
+                       (strategy_slug,snapshot_ts_ms,source_url,payload)
+                       VALUES ($1,$2,$3,$4)
+                       ON CONFLICT (strategy_slug,snapshot_ts_ms) DO UPDATE SET
+                           fetched_at=CURRENT_TIMESTAMP,
+                           source_url=EXCLUDED.source_url,
+                           payload=EXCLUDED.payload"#,
+                )
+                .bind(&slug)
+                .bind(snapshot_ts_ms)
+                .bind(source_url)
+                .bind(payload)
+                .execute(&state.pool)
+                .await?;
+                results.push(SnapshotSyncResult {
+                    strategy_slug: slug,
+                    stored: true,
+                    snapshot_ts_ms: Some(snapshot_ts_ms),
+                    error: None,
+                });
+            }
+            Ok((slug, Err(error))) => results.push(SnapshotSyncResult {
+                strategy_slug: slug,
+                stored: false,
+                snapshot_ts_ms: None,
+                error: Some(format!("{error:#}")),
+            }),
+            Err(error) => results.push(SnapshotSyncResult {
+                strategy_slug: "unknown".to_string(),
+                stored: false,
+                snapshot_ts_ms: None,
+                error: Some(format!("snapshot task failed: {error}")),
+            }),
+        }
+    }
+    results.sort_by(|left, right| left.strategy_slug.cmp(&right.strategy_slug));
+    let stored = results.iter().filter(|result| result.stored).count();
+    Ok(Json(SnapshotSyncResponse {
+        requested,
+        stored,
+        failed: requested.saturating_sub(stored),
+        results,
+    })
+    .into_response())
+}
+
+fn snapshot_source_url(host: &str, config_url: &str) -> Result<String> {
+    let absolute = if config_url.starts_with("http://") || config_url.starts_with("https://") {
+        config_url.to_string()
+    } else if host == "local" && config_url.starts_with('/') {
+        format!("http://127.0.0.1:4191{config_url}")
+    } else {
+        anyhow::bail!("snapshot config URL is not absolute for host {host}");
+    };
+    let mut url = reqwest::Url::parse(&absolute).context("parse snapshot config URL")?;
+    let path = url.path().trim_end_matches('/');
+    let base = path.strip_suffix("/config").unwrap_or(path);
+    url.set_path(&format!("{base}/snapshot"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+async fn list_latest_snapshots(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SnapshotResponse>>, ApiError> {
+    let rows = sqlx::query_as::<_, SnapshotRecord>(
+        r#"SELECT DISTINCT ON (strategy_slug)
+               strategy_slug,snapshot_ts_ms,
+               (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
+               source_url,payload
+           FROM strategy_snapshots
+           ORDER BY strategy_slug,snapshot_ts_ms DESC"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(snapshot_response).collect()))
+}
+
+async fn get_latest_snapshot(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let row = sqlx::query_as::<_, SnapshotRecord>(
+        r#"SELECT strategy_slug,snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  source_url,payload
+           FROM strategy_snapshots
+           WHERE strategy_slug=$1
+           ORDER BY snapshot_ts_ms DESC LIMIT 1"#,
+    )
+    .bind(slug)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(match row {
+        Some(row) => Json(snapshot_response(row)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+fn snapshot_response(row: SnapshotRecord) -> SnapshotResponse {
+    SnapshotResponse {
+        strategy_slug: row.strategy_slug,
+        snapshot_ts_ms: row.snapshot_ts_ms,
+        fetched_at_ms: row.fetched_at_ms,
+        source_url: row.source_url,
+        payload: row.payload,
+    }
 }
 
 fn postgres_options() -> Result<PgConnectOptions> {
@@ -714,7 +926,9 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{assigned_env_keys, is_default_bybit_instrument, valid_schema};
+    use super::{
+        assigned_env_keys, is_default_bybit_instrument, snapshot_source_url, valid_schema,
+    };
 
     #[test]
     fn detects_only_non_empty_assignments() {
@@ -751,5 +965,22 @@ mod tests {
             assert!(is_default_bybit_instrument(instrument));
         }
         assert!(!is_default_bybit_instrument("ADAUSDT"));
+    }
+
+    #[test]
+    fn derives_local_and_remote_snapshot_urls_from_config_urls() {
+        assert_eq!(
+            snapshot_source_url("local", "/intra/binance-intra-arb01/config").unwrap(),
+            "http://127.0.0.1:4191/intra/binance-intra-arb01/snapshot"
+        );
+        assert_eq!(
+            snapshot_source_url(
+                "sg",
+                "http://47.131.162.78:4191/intra/bybit-intra-arb01/config",
+            )
+            .unwrap(),
+            "http://47.131.162.78:4191/intra/bybit-intra-arb01/snapshot"
+        );
+        assert!(snapshot_source_url("sg", "/intra/bybit-intra-arb01/config").is_err());
     }
 }
