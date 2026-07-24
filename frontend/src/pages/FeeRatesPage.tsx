@@ -110,22 +110,12 @@ function latestTime(rates: TradingFeeRate[]) {
   )
 }
 
-function FeeValue({
-  value,
-  zeroDetail,
-}: {
-  value: string
-  zeroDetail?: string
-}) {
+function FeeValue({ value }: { value: string }) {
   const fee = feeDisplay(value)
   return (
     <div className={'fee-value ' + fee.className}>
       <strong>{fee.label}</strong>
-      <span>
-        {fee.className === 'is-zero' && zeroDetail
-          ? zeroDetail
-          : fee.detail}
-      </span>
+      <span>{fee.detail}</span>
     </div>
   )
 }
@@ -248,7 +238,8 @@ function AccountRates({
         <div className="fee-special-rule">
           <Info size={14} />
           <span>
-            Spot Maker：成交手续费为 0，约 1 小时后返佣单独入账；当前费率快照不包含返佣。
+            Spot Maker：成交手续费为 0；下一小时返佣按 0.40 bps
+            评估并单独入账。
           </span>
         </div>
       )}
@@ -287,12 +278,11 @@ function AccountRates({
                     </td>
                     <td>
                       <FeeValue
-                        value={rate.makerRate}
-                        zeroDetail={
+                        value={
                           hasDelayedSpotMakerRebate &&
                           rate.market === 'spot'
-                            ? '延迟返佣'
-                            : undefined
+                            ? '-0.00004'
+                            : rate.makerRate
                         }
                       />
                     </td>

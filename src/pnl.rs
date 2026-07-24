@@ -10,6 +10,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
+// Binance records Spot MM2 maker commission as zero and settles the rebate
+// through the next-hour wallet distribution.
+const BINANCE_INTRA_SPOT_MAKER_REBATE_RATE: f64 = 0.4 / 10_000.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PnlSourceKind {
@@ -775,7 +778,8 @@ struct SpotSwapInterestRow {
 
 #[derive(Debug, FromRow)]
 struct BinanceIntraTradeRow {
-    key: String,
+    market: String,
+    liquidity_role: String,
     symbol: String,
     side: String,
     price: f64,
@@ -818,18 +822,22 @@ async fn load_binance_intra_inputs(
     end_ms: i64,
 ) -> Result<PnlInputs> {
     let trade_sql = format!(
-        r#"SELECT key, symbol, side, price::float8 AS price,
-                  amountu::float8 AS amount_u, fees::float8 AS fee,
-                  "commissionAsset" AS commission_asset, ts
+        r#"SELECT market, liquidity_role, symbol, side, price::float8 AS price,
+                  COALESCE(quote_quantity, price * quantity)::float8 AS amount_u,
+                  fee_amount::float8 AS fee,
+                  COALESCE(fee_asset, 'USDT') AS commission_asset,
+                  event_time_ms AS ts
            FROM {schema}.trades
-           WHERE ts >= $1 AND ts <= $2
-           ORDER BY ts, symbol, id"#
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, trade_id"#
     );
     let funding_sql = format!(
-        r#"SELECT symbol, income::float8 AS amount_usdt, time AS ts
+        r#"SELECT symbol, COALESCE(amount_usdt, amount)::float8 AS amount_usdt,
+                  event_time_ms AS ts
            FROM {schema}.funding
-           WHERE time >= $1 AND time <= $2
-           ORDER BY time, symbol, "tranId""#
+           WHERE symbol IS NOT NULL
+             AND event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms, symbol, record_id"#
     );
 
     let rows = sqlx::query_as::<_, BinanceIntraTradeRow>(AssertSqlSafe(trade_sql))
@@ -847,17 +855,26 @@ async fn load_binance_intra_inputs(
                 _ => bail!("unsupported Binance intra trade side {:?}", row.side),
             };
             let symbol = row.symbol.to_ascii_uppercase();
-            let fee_usdt = binance_fee_cost_usdt(
+            if !row.amount_u.is_finite() || row.amount_u <= 0.0 {
+                bail!("invalid Binance intra amount_u: {}", row.amount_u);
+            }
+            let observed_fee_usdt = binance_fee_cost_usdt(
                 row.fee,
                 &row.commission_asset,
                 row.price,
                 &symbol,
                 mark_prices,
             );
-            let leg = match row.key.as_str() {
-                "binancespot" => PositionLeg::Spot,
-                "binanceswap" => PositionLeg::Futures,
-                _ => bail!("unsupported Binance intra trade key {:?}", row.key),
+            let fee_usdt = binance_intra_fee_usdt(
+                &row.market,
+                &row.liquidity_role,
+                row.amount_u,
+                observed_fee_usdt,
+            );
+            let leg = match row.market.as_str() {
+                "spot" => PositionLeg::Spot,
+                "swap" | "usdm_futures" => PositionLeg::Futures,
+                _ => bail!("unsupported Binance intra market {:?}", row.market),
             };
             Ok(NormalizedTrade {
                 symbol,
@@ -890,6 +907,19 @@ async fn load_binance_intra_inputs(
         funding,
         interest: Vec::new(),
     })
+}
+
+fn binance_intra_fee_usdt(
+    market: &str,
+    liquidity_role: &str,
+    amount_u: f64,
+    observed_fee_usdt: Option<f64>,
+) -> Option<f64> {
+    if market.eq_ignore_ascii_case("spot") && liquidity_role.eq_ignore_ascii_case("maker") {
+        Some(-amount_u * BINANCE_INTRA_SPOT_MAKER_REBATE_RATE)
+    } else {
+        observed_fee_usdt
+    }
 }
 
 fn binance_fee_cost_usdt(
@@ -1301,6 +1331,22 @@ mod tests {
         assert_eq!(
             market_making_amount_u("bybit", 100.0, 5.0, None, Some(99.0)).unwrap(),
             500.0
+        );
+    }
+
+    #[test]
+    fn binance_intra_spot_maker_uses_fixed_rebate_patch() {
+        assert_eq!(
+            binance_intra_fee_usdt("spot", "maker", 2_500.0, Some(0.0)),
+            Some(-0.1)
+        );
+        assert_eq!(
+            binance_intra_fee_usdt("spot", "taker", 2_500.0, Some(0.25)),
+            Some(0.25)
+        );
+        assert_eq!(
+            binance_intra_fee_usdt("swap", "maker", 2_500.0, Some(0.05)),
+            Some(0.05)
         );
     }
 

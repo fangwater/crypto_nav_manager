@@ -42,6 +42,14 @@
 实际可返回窗口可能更长，但不能据此假定从任意 `startTime` 开始的数据都完整。更早数据需走
 UM futures transaction history 异步下载或本地历史 CSV。Spot MM 返佣从策略 `st_ms` 开始同步；
 assetDividend 窗口若达到 500 条上限则自动二分，并按分发记录 `id` 幂等写入 `rebates` 表。
+Binance FR 的 CSV 首次导入完成后，`sync_history --dataset trades` 以成功水位线或 PG 最新成交
+继续增量同步，不从 `st_ms` 重扫；`funding` 和 `interest` 的首次补齐使用 `--full` 从 `st_ms`
+开始。Portfolio Margin interest 强制按最多 30 天窗口分页，并在 6 个月归档边界前后重叠 7 天
+查询 `archived`/当前存储，最终按 `txId` 去重。历史 GET 使用 60 秒 `recvWindow`，仅对本地
+权重等待、传输/响应体解码失败和 Binance `-1021` 做有限的幂等重试。
+Binance intra PnL 对 Spot Maker 使用固定 `-0.4 bps` 手续费成本补丁，模拟下一小时入账的
+MM2 返佣；不会再把 `rebates` 表重复加入 PnL。可用
+`scripts/estimate_binance_intra_rebate_rate.py --hour <UTC hour>` 从整点成交和下一小时入账复核费率。
 
 ## Bybit UTA v5
 

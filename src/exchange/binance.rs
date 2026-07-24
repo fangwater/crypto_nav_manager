@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     models::{TimeRange, TradingFeeRate},
-    rest_dispatcher::Dispatcher,
+    rest_dispatcher::{DispatchError, Dispatcher},
 };
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName};
@@ -17,11 +17,14 @@ const FAPI_BASE: &str = "https://fapi.binance.com";
 const PAPI_BASE: &str = "https://papi.binance.com";
 const API_BASE: &str = "https://api.binance.com";
 const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+const THIRTY_DAYS_MS: i64 = 30 * ONE_DAY_MS;
+const SIX_MONTHS_MS: i64 = 180 * ONE_DAY_MS;
 const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const ASSET_DIVIDEND_MAX_SPAN_MS: i64 = 180 * ONE_DAY_MS;
 const ASSET_DIVIDEND_LIMIT: usize = 500;
 const LIMIT: usize = 1_000;
 const FORCE_ORDER_LIMIT: usize = 100;
+const HISTORY_RATE_LIMIT_RETRIES: usize = 3;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -153,7 +156,7 @@ impl BinanceClient {
             "/papi/v1/margin/myTrades",
             symbol,
             range,
-            SEVEN_DAYS_MS,
+            ONE_DAY_MS,
             5,
         )
         .await
@@ -446,42 +449,62 @@ impl BinanceClient {
     ) -> Result<Vec<Value>, ExchangeError> {
         self.require_portfolio_margin()?;
         let mut rows = Vec::new();
-        let mut current = 1_u32;
-        loop {
-            let mut params = vec![
-                ("startTime".to_string(), range.start_ms.to_string()),
-                ("endTime".to_string(), range.end_ms.to_string()),
-                ("current".to_string(), current.to_string()),
-                ("size".to_string(), "100".to_string()),
-                ("archived".to_string(), archived.to_string()),
-            ];
-            if let Some(asset) = asset {
-                params.push(("asset".to_string(), asset.to_string()));
+        for chunk in range.chunks(THIRTY_DAYS_MS)? {
+            let mut current = 1_u32;
+            loop {
+                let mut params = vec![
+                    ("startTime".to_string(), chunk.start_ms.to_string()),
+                    ("endTime".to_string(), chunk.end_ms.to_string()),
+                    ("current".to_string(), current.to_string()),
+                    ("size".to_string(), "100".to_string()),
+                    ("archived".to_string(), archived.to_string()),
+                ];
+                if let Some(asset) = asset {
+                    params.push(("asset".to_string(), asset.to_string()));
+                }
+                let value = self
+                    .history_signed_get(
+                        PAPI_BASE,
+                        "/papi/v1/margin/marginInterestHistory",
+                        params,
+                        1,
+                    )
+                    .await?;
+                let page = value
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .ok_or_else(|| ExchangeError::InvalidResponse {
+                        exchange: EXCHANGE,
+                        message: "margin interest response is missing rows".to_string(),
+                    })?;
+                let page_len = page.len();
+                rows.extend(page.into_iter().filter(|row| {
+                    value_i64(row, "interestAccuredTime")
+                        .is_some_and(|ts| chunk.start_ms <= ts && ts <= chunk.end_ms)
+                }));
+                if page_len < 100 {
+                    break;
+                }
+                current = current.saturating_add(1);
             }
-            let value = self
-                .signed_get(
-                    PAPI_BASE,
-                    "/papi/v1/margin/marginInterestHistory",
-                    params,
-                    50,
-                )
-                .await?;
-            let page = value
-                .get("rows")
-                .and_then(Value::as_array)
-                .cloned()
-                .ok_or_else(|| ExchangeError::InvalidResponse {
-                    exchange: EXCHANGE,
-                    message: "margin interest response is missing rows".to_string(),
-                })?;
-            let page_len = page.len();
-            rows.extend(page);
-            if page_len < 100 {
-                break;
-            }
-            current = current.saturating_add(1);
         }
-        dedup(&mut rows, &["txId", "interestAccuredTime", "asset"]);
+        dedup(&mut rows, &["txId"]);
+        rows.sort_by_key(|row| value_i64(row, "interestAccuredTime").unwrap_or_default());
+        Ok(rows)
+    }
+
+    pub async fn margin_interest_history(
+        &self,
+        range: TimeRange,
+        asset: Option<&str>,
+    ) -> Result<Vec<Value>, ExchangeError> {
+        let mut rows = Vec::new();
+        for (query_range, archived) in margin_interest_query_ranges(range, now_ms())? {
+            rows.extend(self.margin_interest(query_range, asset, archived).await?);
+        }
+        dedup(&mut rows, &["txId"]);
+        rows.sort_by_key(|row| value_i64(row, "interestAccuredTime").unwrap_or_default());
         Ok(rows)
     }
 
@@ -643,9 +666,43 @@ impl BinanceClient {
         params: Params,
         weight: u32,
     ) -> Result<Value, ExchangeError> {
-        let value = self.signed_get(base, path, params, weight).await?;
+        let value = self.history_signed_get(base, path, params, weight).await?;
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         Ok(value)
+    }
+
+    async fn history_signed_get(
+        &self,
+        base: &str,
+        path: &str,
+        mut params: Params,
+        weight: u32,
+    ) -> Result<Value, ExchangeError> {
+        if !params.iter().any(|(key, _)| key == "recvWindow") {
+            params.push(("recvWindow".to_string(), "60000".to_string()));
+        }
+        for retry in 0..=HISTORY_RATE_LIMIT_RETRIES {
+            match self.signed_get(base, path, params.clone(), weight).await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let Some(delay) = history_retry_delay(&error) else {
+                        return Err(error);
+                    };
+                    if retry == HISTORY_RATE_LIMIT_RETRIES {
+                        return Err(error);
+                    }
+                    eprintln!(
+                        "Binance history rate limited; retry {}/{} after {:.1}s",
+                        retry + 1,
+                        HISTORY_RATE_LIMIT_RETRIES,
+                        delay.as_secs_f64()
+                    );
+                    tokio::time::sleep(delay + std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        unreachable!("history retry loop always returns")
     }
 
     async fn signed_get(
@@ -655,7 +712,9 @@ impl BinanceClient {
         mut params: Params,
         weight: u32,
     ) -> Result<Value, ExchangeError> {
-        params.push(("recvWindow".to_string(), "5000".to_string()));
+        if !params.iter().any(|(key, _)| key == "recvWindow") {
+            params.push(("recvWindow".to_string(), "5000".to_string()));
+        }
         params.push(("timestamp".to_string(), now_ms().to_string()));
         let query = query_string(&params);
         let signature = sign_query(&query, &self.credentials.secret_key);
@@ -745,6 +804,53 @@ fn check_api_error(value: Value) -> Result<Value, ExchangeError> {
             .unwrap_or("unknown Binance API error")
             .to_string(),
     })
+}
+
+fn history_retry_delay(error: &ExchangeError) -> Option<std::time::Duration> {
+    match error {
+        ExchangeError::Dispatch(DispatchError::RateLimited { retry_after, .. }) => {
+            Some(*retry_after)
+        }
+        ExchangeError::Dispatch(DispatchError::NoAvailableIp {
+            retry_after: Some(retry_after),
+        }) => Some(*retry_after),
+        ExchangeError::Dispatch(DispatchError::Request { .. }) => {
+            Some(std::time::Duration::from_secs(1))
+        }
+        ExchangeError::InvalidResponse { message, .. }
+            if message.contains("error decoding response body") =>
+        {
+            Some(std::time::Duration::from_secs(1))
+        }
+        ExchangeError::Http { body, .. } if body.contains("\"code\":-1021") => {
+            Some(std::time::Duration::from_secs(1))
+        }
+        _ => None,
+    }
+}
+
+fn margin_interest_query_ranges(
+    range: TimeRange,
+    current_time_ms: i64,
+) -> Result<Vec<(TimeRange, bool)>, ExchangeError> {
+    let archive_cutoff = current_time_ms.saturating_sub(SIX_MONTHS_MS);
+    let archived_end = archive_cutoff.saturating_add(SEVEN_DAYS_MS);
+    let recent_start = archive_cutoff.saturating_sub(SEVEN_DAYS_MS);
+    let mut ranges = Vec::with_capacity(2);
+
+    if range.start_ms <= archived_end && range.start_ms <= range.end_ms {
+        ranges.push((
+            TimeRange::new(range.start_ms, range.end_ms.min(archived_end))?,
+            true,
+        ));
+    }
+    if range.end_ms >= recent_start && range.start_ms <= range.end_ms {
+        ranges.push((
+            TimeRange::new(range.start_ms.max(recent_start), range.end_ms)?,
+            false,
+        ));
+    }
+    Ok(ranges)
 }
 
 fn value_i64(value: &Value, key: &str) -> Option<i64> {
@@ -876,6 +982,77 @@ mod tests {
 
         dedup(&mut rows, &["symbol", "id"]);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn history_retry_uses_dispatcher_delay() {
+        let error = ExchangeError::Dispatch(DispatchError::NoAvailableIp {
+            retry_after: Some(std::time::Duration::from_secs(42)),
+        });
+        assert_eq!(
+            history_retry_delay(&error),
+            Some(std::time::Duration::from_secs(42))
+        );
+    }
+
+    #[test]
+    fn history_retry_recovers_idempotent_transport_failures() {
+        let error = ExchangeError::InvalidResponse {
+            exchange: EXCHANGE,
+            message: "error decoding response body".to_string(),
+        };
+        assert_eq!(
+            history_retry_delay(&error),
+            Some(std::time::Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn history_retry_refreshes_timestamp_after_recv_window_error() {
+        let error = ExchangeError::Http {
+            exchange: EXCHANGE,
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"code":-1021,"msg":"Timestamp outside recvWindow"}"#.to_string(),
+        };
+        assert_eq!(
+            history_retry_delay(&error),
+            Some(std::time::Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn margin_interest_ranges_cover_archive_boundary_with_overlap() {
+        let current = 365 * ONE_DAY_MS;
+        let range = TimeRange::new(100 * ONE_DAY_MS, 300 * ONE_DAY_MS).unwrap();
+        let ranges = margin_interest_query_ranges(range, current).unwrap();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].0.start_ms, 100 * ONE_DAY_MS);
+        assert_eq!(ranges[0].0.end_ms, 192 * ONE_DAY_MS);
+        assert!(ranges[0].1);
+        assert_eq!(ranges[1].0.start_ms, 178 * ONE_DAY_MS);
+        assert_eq!(ranges[1].0.end_ms, 300 * ONE_DAY_MS);
+        assert!(!ranges[1].1);
+    }
+
+    #[test]
+    fn margin_interest_ranges_select_one_storage_tier_when_unambiguous() {
+        let current = 365 * ONE_DAY_MS;
+        let old = margin_interest_query_ranges(
+            TimeRange::new(10 * ONE_DAY_MS, 100 * ONE_DAY_MS).unwrap(),
+            current,
+        )
+        .unwrap();
+        let recent = margin_interest_query_ranges(
+            TimeRange::new(300 * ONE_DAY_MS, current).unwrap(),
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(old.len(), 1);
+        assert!(old[0].1);
+        assert_eq!(recent.len(), 1);
+        assert!(!recent[0].1);
     }
 
     #[test]

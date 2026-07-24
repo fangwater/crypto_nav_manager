@@ -149,7 +149,6 @@ struct TradeRow {
     fee_asset: String,
     realized_pnl: Option<String>,
     event_time_ms: i64,
-    raw: Value,
 }
 
 #[derive(Debug)]
@@ -159,7 +158,6 @@ struct CashRow {
     asset: String,
     amount: String,
     event_time_ms: i64,
-    raw: Value,
 }
 
 #[derive(Debug)]
@@ -574,11 +572,7 @@ async fn fetch_funding(client: &ExchangeClient, range: TimeRange) -> Result<Vec<
 
 async fn fetch_interest(client: &ExchangeClient, range: TimeRange) -> Result<Vec<Value>> {
     match client {
-        ExchangeClient::Binance(client) => {
-            let mut rows = client.margin_interest(range, None, false).await?;
-            rows.extend(client.margin_interest(range, None, true).await?);
-            Ok(rows)
-        }
+        ExchangeClient::Binance(client) => client.margin_interest_history(range, None).await,
         ExchangeClient::Bybit(client) => client.borrow_interest(range).await,
         ExchangeClient::Gate(client) => client.interest_records(range).await,
         ExchangeClient::Bitget(client) => client.margin_interest(range).await,
@@ -1030,7 +1024,7 @@ fn make_trade(
     fee_asset: String,
     realized_pnl: Option<String>,
     event_time_ms: i64,
-    raw: Value,
+    _raw: Value,
 ) -> Result<TradeRow> {
     if !matches!(side.as_str(), "buy" | "sell") {
         bail!("invalid trade side for {symbol}/{trade_id}: {side}");
@@ -1062,7 +1056,6 @@ fn make_trade(
         fee_asset: fee_asset.to_ascii_uppercase(),
         realized_pnl,
         event_time_ms,
-        raw,
     })
 }
 
@@ -1177,7 +1170,6 @@ fn normalize_cash(exchange: &str, dataset: Dataset, raw: Value) -> Result<CashRo
         asset: asset.to_ascii_uppercase(),
         amount,
         event_time_ms,
-        raw,
     })
 }
 
@@ -1429,7 +1421,7 @@ async fn commit_trades(
                 let sql = format!(
                     "INSERT INTO {}.{table} \
                      (market,symbol,trade_id,order_id,side,liquidity_role,price,quantity,\
-                      quote_quantity,fee_amount,fee_asset,fee_usdt,realized_pnl,event_time_ms,raw) ",
+                      quote_quantity,fee_amount,fee_asset,fee_usdt,realized_pnl,event_time_ms) ",
                     strategy.schema
                 );
                 let mut query = QueryBuilder::<Postgres>::new(sql);
@@ -1458,8 +1450,7 @@ async fn commit_trades(
                         .push_unseparated("::numeric")
                         .push_bind(&row.realized_pnl)
                         .push_unseparated("::numeric")
-                        .push_bind(row.event_time_ms)
-                        .push_bind(&row.raw);
+                        .push_bind(row.event_time_ms);
                 });
                 query.push(
                     " ON CONFLICT (market,symbol,trade_id) DO UPDATE SET \
@@ -1468,8 +1459,7 @@ async fn commit_trades(
                      quantity=EXCLUDED.quantity,quote_quantity=EXCLUDED.quote_quantity,\
                      fee_amount=EXCLUDED.fee_amount,fee_asset=EXCLUDED.fee_asset,\
                      fee_usdt=EXCLUDED.fee_usdt,realized_pnl=EXCLUDED.realized_pnl,\
-                     event_time_ms=EXCLUDED.event_time_ms,raw=EXCLUDED.raw,\
-                     fetched_at=CURRENT_TIMESTAMP",
+                     event_time_ms=EXCLUDED.event_time_ms",
                 );
                 affected += query
                     .build()
@@ -1590,7 +1580,7 @@ async fn commit_cash(
             for batch in rows.chunks(BATCH_SIZE) {
                 let sql = format!(
                     "INSERT INTO {}.{table} \
-                     (record_id,symbol,asset,amount,amount_usdt,event_time_ms,raw) ",
+                     (record_id,symbol,asset,amount,amount_usdt,event_time_ms) ",
                     strategy.schema
                 );
                 let mut query = QueryBuilder::<Postgres>::new(sql);
@@ -1607,14 +1597,12 @@ async fn commit_cash(
                         .push_unseparated("::numeric")
                         .push_bind(amount_usdt)
                         .push_unseparated("::numeric")
-                        .push_bind(row.event_time_ms)
-                        .push_bind(&row.raw);
+                        .push_bind(row.event_time_ms);
                 });
                 query.push(
                     " ON CONFLICT (record_id) DO UPDATE SET symbol=EXCLUDED.symbol,\
                      asset=EXCLUDED.asset,amount=EXCLUDED.amount,\
-                     amount_usdt=EXCLUDED.amount_usdt,event_time_ms=EXCLUDED.event_time_ms,\
-                     raw=EXCLUDED.raw,fetched_at=CURRENT_TIMESTAMP",
+                     amount_usdt=EXCLUDED.amount_usdt,event_time_ms=EXCLUDED.event_time_ms",
                 );
                 affected += query
                     .build()
