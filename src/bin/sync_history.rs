@@ -38,6 +38,7 @@ enum Dataset {
     Funding,
     Interest,
     Rebates,
+    Liquidations,
 }
 
 impl Dataset {
@@ -48,6 +49,7 @@ impl Dataset {
             Self::Funding => "funding",
             Self::Interest => "interest",
             Self::Rebates => "rebates",
+            Self::Liquidations => "liquidations",
         }
     }
 }
@@ -116,6 +118,7 @@ impl Strategy {
                     && !(self.class == StrategyClass::Intra && self.exchange == "binance")
             }
             Dataset::Rebates => self.exchange == "binance" && self.class == StrategyClass::Intra,
+            Dataset::Liquidations => self.exchange == "gate" && self.class == StrategyClass::Fr,
         }
     }
 }
@@ -160,6 +163,24 @@ struct CashRow {
     asset: String,
     amount: String,
     event_time_ms: i64,
+}
+
+#[derive(Debug)]
+struct LiquidationRow {
+    order_id: String,
+    symbol: String,
+    position_size_contracts: String,
+    contract_multiplier: String,
+    leverage: Option<String>,
+    margin: Option<String>,
+    entry_price: Option<String>,
+    liquidation_price: Option<String>,
+    mark_price: Option<String>,
+    order_price: Option<String>,
+    fill_price: Option<String>,
+    remaining_size_contracts: Option<String>,
+    event_time_ms: i64,
+    raw: Value,
 }
 
 #[derive(Debug)]
@@ -272,6 +293,7 @@ fn selected_datasets(dataset: Dataset) -> Vec<Dataset> {
             Dataset::Funding,
             Dataset::Interest,
             Dataset::Rebates,
+            Dataset::Liquidations,
         ],
         value => vec![value],
     }
@@ -377,6 +399,20 @@ async fn sync_dataset(
             let affected = commit_rebates(pool, strategy, &rows, end_ms).await?;
             println!(
                 "rebates complete: fetched={}, upserted={affected}",
+                rows.len()
+            );
+        }
+        Dataset::Liquidations => {
+            let multipliers = load_gate_multipliers(client).await?;
+            let raw = fetch_liquidations(client, range).await?;
+            let mut rows = raw
+                .into_iter()
+                .map(|value| normalize_gate_liquidation(value, &multipliers))
+                .collect::<Result<Vec<_>>>()?;
+            rows.sort_by_key(|row| row.event_time_ms);
+            let affected = commit_liquidations(pool, strategy, &rows, end_ms).await?;
+            println!(
+                "liquidations complete: fetched={}, upserted={affected}",
                 rows.len()
             );
         }
@@ -591,6 +627,16 @@ async fn fetch_rebates(client: &ExchangeClient, range: TimeRange) -> Result<Vec<
         .asset_dividends(range)
         .await
         .context("fetch Binance wallet distributions")
+}
+
+async fn fetch_liquidations(client: &ExchangeClient, range: TimeRange) -> Result<Vec<Value>> {
+    let ExchangeClient::Gate(client) = client else {
+        bail!("liquidation history is currently only supported for Gate");
+    };
+    client
+        .liquidation_history(None, range)
+        .await
+        .context("fetch Gate liquidation history")
 }
 
 async fn load_gate_multipliers(client: &ExchangeClient) -> Result<HashMap<String, f64>> {
@@ -1175,6 +1221,38 @@ fn normalize_cash(exchange: &str, dataset: Dataset, raw: Value) -> Result<CashRo
     })
 }
 
+fn normalize_gate_liquidation(
+    raw: Value,
+    multipliers: &HashMap<String, f64>,
+) -> Result<LiquidationRow> {
+    let contract = text_field(&raw, &["contract"])?;
+    let symbol = normalize_symbol(&contract);
+    let order_id = text_field(&raw, &["order_id"])?;
+    let position_size_contracts = number_field(&raw, &["size"])?;
+    let multiplier = multipliers
+        .get(&contract.to_ascii_uppercase())
+        .copied()
+        .with_context(|| format!("missing Gate multiplier for {contract}"))?;
+    let event_time_ms = timestamp_field(&raw, &["time"])?;
+
+    Ok(LiquidationRow {
+        order_id,
+        symbol,
+        position_size_contracts,
+        contract_multiplier: decimal_string(multiplier),
+        leverage: optional_number(&raw, &["leverage"]),
+        margin: optional_number(&raw, &["margin"]),
+        entry_price: optional_number(&raw, &["entry_price"]),
+        liquidation_price: optional_number(&raw, &["liq_price"]),
+        mark_price: optional_number(&raw, &["mark_price"]),
+        order_price: optional_number(&raw, &["order_price"]),
+        fill_price: optional_number(&raw, &["fill_price"]),
+        remaining_size_contracts: optional_number(&raw, &["left"]),
+        event_time_ms,
+        raw,
+    })
+}
+
 fn normalize_binance_rebate(raw: Value) -> Result<RebateRow> {
     let record_id = text_field(&raw, &["id"])?;
     let amount = number_field(&raw, &["amount"])?;
@@ -1288,6 +1366,7 @@ async fn latest_dataset_time(
             }
         }
         Dataset::Rebates => ("rebates".to_string(), "event_time_ms".to_string()),
+        Dataset::Liquidations => ("liquidations".to_string(), "event_time_ms".to_string()),
         Dataset::All => unreachable!(),
     };
     if !valid_schema(&strategy.schema) || !valid_identifier(&table) || !valid_identifier(&column) {
@@ -1675,6 +1754,84 @@ async fn commit_rebates(
     Ok(affected)
 }
 
+async fn commit_liquidations(
+    pool: &PgPool,
+    strategy: &Strategy,
+    rows: &[LiquidationRow],
+    end_ms: i64,
+) -> Result<u64> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin liquidation sync transaction")?;
+    let mut affected = 0;
+    for batch in rows.chunks(BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO {}.liquidations \
+             (order_id,symbol,position_size_contracts,contract_multiplier,\
+              leverage,margin,entry_price,liquidation_price,mark_price,order_price,fill_price,\
+              remaining_size_contracts,event_time_ms,raw) ",
+            strategy.schema
+        );
+        let mut query = QueryBuilder::<Postgres>::new(sql);
+        query.push_values(batch, |mut values, row| {
+            values
+                .push_bind(&row.order_id)
+                .push_bind(&row.symbol)
+                .push_bind(&row.position_size_contracts)
+                .push_unseparated("::numeric")
+                .push_bind(&row.contract_multiplier)
+                .push_unseparated("::numeric")
+                .push_bind(&row.leverage)
+                .push_unseparated("::numeric")
+                .push_bind(&row.margin)
+                .push_unseparated("::numeric")
+                .push_bind(&row.entry_price)
+                .push_unseparated("::numeric")
+                .push_bind(&row.liquidation_price)
+                .push_unseparated("::numeric")
+                .push_bind(&row.mark_price)
+                .push_unseparated("::numeric")
+                .push_bind(&row.order_price)
+                .push_unseparated("::numeric")
+                .push_bind(&row.fill_price)
+                .push_unseparated("::numeric")
+                .push_bind(&row.remaining_size_contracts)
+                .push_unseparated("::numeric")
+                .push_bind(row.event_time_ms)
+                .push_bind(&row.raw);
+        });
+        query.push(
+            " ON CONFLICT (symbol,order_id,event_time_ms) DO UPDATE SET \
+             position_size_contracts=EXCLUDED.position_size_contracts,\
+             contract_multiplier=EXCLUDED.contract_multiplier,leverage=EXCLUDED.leverage,\
+             margin=EXCLUDED.margin,entry_price=EXCLUDED.entry_price,\
+             liquidation_price=EXCLUDED.liquidation_price,mark_price=EXCLUDED.mark_price,\
+             order_price=EXCLUDED.order_price,fill_price=EXCLUDED.fill_price,\
+             remaining_size_contracts=EXCLUDED.remaining_size_contracts,raw=EXCLUDED.raw,\
+             fetched_at=CURRENT_TIMESTAMP",
+        );
+        affected += query
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .context("upsert Gate liquidation batch")?
+            .rows_affected();
+    }
+    advance_watermark(
+        &mut transaction,
+        &strategy.slug,
+        Dataset::Liquidations,
+        end_ms,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .context("commit liquidation sync")?;
+    Ok(affected)
+}
+
 fn text_field(value: &Value, fields: &[&str]) -> Result<String> {
     fields
         .iter()
@@ -1899,6 +2056,40 @@ mod tests {
         assert!(strategy("binance", StrategyClass::Intra).supports(Dataset::Rebates));
         assert!(!strategy("binance", StrategyClass::Fr).supports(Dataset::Rebates));
         assert!(!strategy("bybit", StrategyClass::Intra).supports(Dataset::Rebates));
+    }
+
+    #[test]
+    fn liquidation_policy_only_enables_gate_fr() {
+        assert!(strategy("gate", StrategyClass::Fr).supports(Dataset::Liquidations));
+        assert!(!strategy("gate", StrategyClass::Intra).supports(Dataset::Liquidations));
+        assert!(!strategy("bybit", StrategyClass::Fr).supports(Dataset::Liquidations));
+    }
+
+    #[test]
+    fn gate_liquidation_normalizes_contract_quantity_and_timestamp() {
+        let row = normalize_gate_liquidation(
+            serde_json::json!({
+                "time": 1750141421,
+                "contract": "BTC_USDT",
+                "size": "-600",
+                "leverage": "25",
+                "margin": "0.0067",
+                "entry_price": "3536.123",
+                "liq_price": "3421.54",
+                "mark_price": "3420.27",
+                "order_id": 317393847,
+                "order_price": "3405",
+                "fill_price": "3424",
+                "left": "0"
+            }),
+            &HashMap::from([("BTC_USDT".to_string(), 0.001)]),
+        )
+        .unwrap();
+        assert_eq!(row.order_id, "317393847");
+        assert_eq!(row.symbol, "BTCUSDT");
+        assert_eq!(row.position_size_contracts, "-600");
+        assert_eq!(row.contract_multiplier, "0.001");
+        assert_eq!(row.event_time_ms, 1_750_141_421_000);
     }
 
     #[test]
