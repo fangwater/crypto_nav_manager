@@ -17,7 +17,7 @@ const EXCHANGE: &str = "bybit";
 const BASE: &str = "https://api.bybit.com";
 const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const PAGE_LIMIT: usize = 50;
-const RECV_WINDOW: &str = "5000";
+const RECV_WINDOW: &str = "20000";
 
 type HmacSha256 = Hmac<Sha256>;
 

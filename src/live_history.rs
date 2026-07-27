@@ -2,36 +2,33 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     env,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    task::JoinSet,
-    time::{Instant, MissedTickBehavior},
-};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
-const DEFAULT_TRADE_INTERVAL_SECS: u64 = 900;
-const DEFAULT_ACCOUNT_INTERVAL_SECS: u64 = 900;
+const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
+const SYNC_INTERVAL_ENV: &str = "CRYPTO_NAV_LIVE_SYNC_SECS";
 const DEFAULT_REDIS_CLI: &str = "/usr/bin/redis-cli";
 const DEFAULT_REDIS_HOST: &str = "127.0.0.1";
 const DEFAULT_REDIS_PORT: &str = "6379";
 const DEFAULT_REDIS_DB: &str = "0";
-const ONLINE_LISTS: [&str; 5] = [
+const FR_ONLINE_LISTS: [&str; 5] = [
     "dump_symbols",
     "pos_dump_symbols",
     "fwd_trade_symbols",
     "bwd_trade_symbols",
     "unimmr_close_symbols",
 ];
+const INTRA_ONLINE_LISTS: [&str; 3] = ["dump_symbols", "fwd_trade_symbols", "bwd_trade_symbols"];
 
 #[derive(Clone, Debug)]
 struct LiveHistoryConfig {
-    trade_interval: Duration,
-    account_interval: Option<Duration>,
+    sync_interval: Duration,
     redis_cli: PathBuf,
     redis_host: String,
     redis_port: String,
@@ -44,16 +41,14 @@ struct LiveHistoryStrategy {
     slug: String,
     env_path: String,
     exchange: String,
-    funding_initialized: bool,
-    interest_initialized: bool,
-    liquidations_initialized: bool,
+    strategy_kind: String,
+    schedule_offset_minutes: i64,
 }
 
 #[derive(Debug)]
 struct SyncReport {
     slug: String,
     symbol_count: usize,
-    account_synced: bool,
     summaries: Vec<String>,
 }
 
@@ -63,12 +58,12 @@ pub fn spawn(pool: PgPool) -> Result<()> {
         return Ok(());
     };
     info!(
-        trade_interval_secs = config.trade_interval.as_secs(),
-        account_interval_secs = config.account_interval.map(|value| value.as_secs()),
+        sync_interval_secs = config.sync_interval.as_secs(),
+        clock = "UTC",
         redis_host = %config.redis_host,
         redis_port = %config.redis_port,
         redis_db = %config.redis_db,
-        "live Binance FR history sync enabled"
+        "live account history sync enabled"
     );
     tokio::spawn(run(pool, config));
     Ok(())
@@ -76,17 +71,13 @@ pub fn spawn(pool: PgPool) -> Result<()> {
 
 impl LiveHistoryConfig {
     fn from_env() -> Result<Option<Self>> {
-        let trade_interval_secs = env_u64(
-            "CRYPTO_NAV_LIVE_TRADE_SYNC_SECS",
-            DEFAULT_TRADE_INTERVAL_SECS,
-        )?;
-        if trade_interval_secs == 0 {
+        let sync_interval_secs = env_u64(SYNC_INTERVAL_ENV, DEFAULT_SYNC_INTERVAL_SECS)?;
+        if sync_interval_secs == 0 {
             return Ok(None);
         }
-        let account_interval_secs = env_u64(
-            "CRYPTO_NAV_LIVE_ACCOUNT_SYNC_SECS",
-            DEFAULT_ACCOUNT_INTERVAL_SECS,
-        )?;
+        if sync_interval_secs % 60 != 0 {
+            bail!("{SYNC_INTERVAL_ENV} must be a whole number of UTC minutes");
+        }
         let sync_history = env::var_os("CRYPTO_NAV_SYNC_HISTORY_BIN")
             .map(PathBuf::from)
             .unwrap_or(
@@ -95,9 +86,7 @@ impl LiveHistoryConfig {
                     .with_file_name("sync_history"),
             );
         Ok(Some(Self {
-            trade_interval: Duration::from_secs(trade_interval_secs),
-            account_interval: (account_interval_secs > 0)
-                .then(|| Duration::from_secs(account_interval_secs)),
+            sync_interval: Duration::from_secs(sync_interval_secs),
             redis_cli: env::var_os("CRYPTO_NAV_REDIS_CLI")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_REDIS_CLI)),
@@ -113,125 +102,166 @@ impl LiveHistoryConfig {
 }
 
 async fn run(pool: PgPool, config: LiveHistoryConfig) {
-    let mut ticker = tokio::time::interval(config.trade_interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_account_attempt = HashMap::<String, Instant>::new();
+    let strategies = loop {
+        match load_strategies(&pool).await {
+            Ok(strategies) if !strategies.is_empty() => break strategies,
+            Ok(_) => warn!("no enabled strategies configured for live history sync"),
+            Err(error) => error!(error = ?error, "load live history strategies failed"),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
 
+    let interval_minutes = (config.sync_interval.as_secs() / 60) as i64;
+    let mut tasks = JoinSet::new();
+    for strategy in strategies {
+        if strategy.schedule_offset_minutes >= interval_minutes {
+            error!(
+                strategy = %strategy.slug,
+                offset_minutes = strategy.schedule_offset_minutes,
+                interval_minutes,
+                "live history schedule offset exceeds interval; strategy disabled"
+            );
+            continue;
+        }
+        let task_config = config.clone();
+        tasks.spawn(run_strategy(task_config, strategy));
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(()) => warn!("live history schedule task exited unexpectedly"),
+            Err(error) => error!(error = ?error, "join live history schedule task failed"),
+        }
+    }
+}
+
+async fn run_strategy(config: LiveHistoryConfig, strategy: LiveHistoryStrategy) {
     loop {
-        ticker.tick().await;
-        let strategies = match load_strategies(&pool).await {
-            Ok(strategies) => strategies,
+        let (delay, next_sync_at_ms) = match delay_until_next_slot(
+            SystemTime::now(),
+            config.sync_interval,
+            strategy.schedule_offset_minutes,
+        ) {
+            Ok(schedule) => schedule,
             Err(error) => {
-                error!(error = ?error, "load live history strategies failed");
+                error!(strategy = %strategy.slug, error = ?error, "calculate live history schedule failed");
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
         };
-        if strategies.is_empty() {
-            warn!("no enabled local Binance FR strategies for live history sync");
-            continue;
-        }
+        info!(
+            strategy = %strategy.slug,
+            exchange = %strategy.exchange,
+            utc_offset_minutes = strategy.schedule_offset_minutes,
+            next_sync_at_ms,
+            "live history sync scheduled"
+        );
+        tokio::time::sleep(delay).await;
 
-        let now = Instant::now();
-        let mut tasks = JoinSet::new();
-        for strategy in strategies {
-            let account_due = config.account_interval.is_some_and(|interval| {
-                last_account_attempt
-                    .get(&strategy.slug)
-                    .is_none_or(|last| now.duration_since(*last) >= interval)
-            });
-            if account_due {
-                last_account_attempt.insert(strategy.slug.clone(), now);
+        let task_config = config.clone();
+        let task_strategy = strategy.clone();
+        match tokio::task::spawn_blocking(move || sync_strategy(&task_config, task_strategy)).await
+        {
+            Ok(Ok(report)) => info!(
+                strategy = %report.slug,
+                online_symbols = report.symbol_count,
+                summaries = %report.summaries.join("; "),
+                "live history sync complete"
+            ),
+            Ok(Err(error)) => {
+                error!(strategy = %strategy.slug, error = ?error, "live history strategy sync failed");
             }
-            let task_config = config.clone();
-            tasks.spawn_blocking(move || sync_strategy(&task_config, strategy, account_due));
-        }
-
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(Ok(report)) => info!(
-                    strategy = %report.slug,
-                    online_symbols = report.symbol_count,
-                    account_synced = report.account_synced,
-                    summaries = %report.summaries.join("; "),
-                    "live history sync complete"
-                ),
-                Ok(Err(error)) => {
-                    error!(error = ?error, "live history strategy sync failed");
-                }
-                Err(error) => {
-                    error!(error = ?error, "join live history strategy sync failed");
-                }
+            Err(error) => {
+                error!(strategy = %strategy.slug, error = ?error, "join live history strategy sync failed");
             }
         }
     }
 }
 
+fn delay_until_next_slot(
+    now: SystemTime,
+    interval: Duration,
+    offset_minutes: i64,
+) -> Result<(Duration, i64)> {
+    let now_ms = i64::try_from(
+        now.duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis(),
+    )
+    .context("system clock milliseconds overflow i64")?;
+    let interval_ms =
+        i64::try_from(interval.as_millis()).context("sync interval milliseconds overflow i64")?;
+    let offset_ms = offset_minutes
+        .checked_mul(60_000)
+        .context("schedule offset milliseconds overflow")?;
+    let elapsed = (now_ms - offset_ms).rem_euclid(interval_ms);
+    let delay_ms = interval_ms - elapsed;
+    let next_sync_at_ms = now_ms
+        .checked_add(delay_ms)
+        .context("next sync timestamp overflow")?;
+    Ok((Duration::from_millis(delay_ms as u64), next_sync_at_ms))
+}
+
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     sqlx::query_as(
-        r#"SELECT s.slug, s.env_path, s.exchange,
-                  EXISTS (SELECT 1 FROM history_sync_watermarks
-                          WHERE strategy_slug = s.slug AND dataset = 'funding')
-                    AS funding_initialized,
-                  EXISTS (SELECT 1 FROM history_sync_watermarks
-                          WHERE strategy_slug = s.slug AND dataset = 'interest')
-                    AS interest_initialized,
-                  EXISTS (SELECT 1 FROM history_sync_watermarks
-                          WHERE strategy_slug = s.slug AND dataset = 'liquidations')
-                    AS liquidations_initialized
+        r#"SELECT s.slug, s.env_path, s.exchange, s.strategy_kind,
+                  (ROW_NUMBER() OVER (
+                    PARTITION BY s.exchange ORDER BY s.sort_order, s.slug
+                  ) - 1)::bigint AS schedule_offset_minutes
            FROM strategy_envs s
            WHERE enabled
-             AND host = 'local'
-             AND exchange = 'binance'
-             AND strategy_kind = 'funding_rate'
-           ORDER BY sort_order, slug"#,
+             AND (
+               (host = 'local' AND exchange = 'binance' AND strategy_kind = 'funding_rate')
+               OR slug IN (
+                 'binance-intra-arb01',
+                 'bybit-intra-arb01',
+                 'bybit-intra-arb02',
+                 'gate_fr_arb01',
+                 'gate_fr_arb02'
+               )
+             )
+           ORDER BY exchange, schedule_offset_minutes"#,
     )
     .fetch_all(pool)
     .await
-    .context("query live Binance FR strategies")
+    .context("query live history strategies")
 }
 
-fn sync_strategy(
-    config: &LiveHistoryConfig,
-    strategy: LiveHistoryStrategy,
-    account_due: bool,
-) -> Result<SyncReport> {
+fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> Result<SyncReport> {
     let mut failures = Vec::new();
     let mut summaries = Vec::new();
-    let symbols = match load_online_symbols(config, &strategy) {
-        Ok(symbols) if symbols.is_empty() => {
-            warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
-            Vec::new()
+    let needs_symbols = strategy.exchange == "binance";
+    let symbols = if needs_symbols {
+        match load_online_symbols(config, &strategy) {
+            Ok(symbols) if symbols.is_empty() => {
+                warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
+                Vec::new()
+            }
+            Ok(symbols) => symbols,
+            Err(error) => {
+                warn!(
+                    strategy = %strategy.slug,
+                    error = ?error,
+                    "load online symbols failed; skip live trades"
+                );
+                Vec::new()
+            }
         }
-        Ok(symbols) => symbols,
-        Err(error) => {
-            warn!(
-                strategy = %strategy.slug,
-                error = ?error,
-                "load online symbols failed; skip live trades"
-            );
-            Vec::new()
-        }
+    } else {
+        Vec::new()
     };
 
-    if !symbols.is_empty() {
-        match run_sync_history(config, &strategy.slug, "trades", &symbols, false) {
+    if !needs_symbols || !symbols.is_empty() {
+        match run_incremental_or_bootstrap(config, &strategy.slug, "trades", &symbols) {
             Ok(summary) => summaries.push(summary),
             Err(error) => failures.push(format!("trades: {error:#}")),
         }
     }
 
-    if account_due {
-        for dataset in ["funding", "interest", "liquidations"] {
-            let full = match dataset {
-                "funding" => !strategy.funding_initialized,
-                "interest" => !strategy.interest_initialized,
-                "liquidations" => !strategy.liquidations_initialized,
-                _ => false,
-            };
-            match run_sync_history(config, &strategy.slug, dataset, &[], full) {
-                Ok(summary) => summaries.push(summary),
-                Err(error) => failures.push(format!("{dataset}: {error:#}")),
-            }
+    for dataset in account_datasets(&strategy) {
+        match run_incremental_or_bootstrap(config, &strategy.slug, dataset, &[]) {
+            Ok(summary) => summaries.push(summary),
+            Err(error) => failures.push(format!("{dataset}: {error:#}")),
         }
     }
 
@@ -245,9 +275,42 @@ fn sync_strategy(
     Ok(SyncReport {
         slug: strategy.slug,
         symbol_count: symbols.len(),
-        account_synced: account_due,
         summaries,
     })
+}
+
+fn account_datasets(strategy: &LiveHistoryStrategy) -> &'static [&'static str] {
+    match (strategy.exchange.as_str(), strategy.strategy_kind.as_str()) {
+        ("binance", "funding_rate") | ("gate", "funding_rate") => {
+            &["funding", "interest", "liquidations"]
+        }
+        ("binance", "intra_exchange") => &["funding"],
+        ("bybit", "intra_exchange") => &["funding", "interest"],
+        _ => &[],
+    }
+}
+
+fn run_incremental_or_bootstrap(
+    config: &LiveHistoryConfig,
+    slug: &str,
+    dataset: &str,
+    symbols: &[String],
+) -> Result<String> {
+    match run_sync_history(config, slug, dataset, symbols, false) {
+        Ok(summary) => Ok(summary),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.to_string().contains("is not initialized")) =>
+        {
+            warn!(
+                strategy = slug,
+                dataset, "history dataset is empty; initialize from st_ms"
+            );
+            run_sync_history(config, slug, dataset, symbols, true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn run_sync_history(
@@ -333,10 +396,19 @@ fn online_symbol_keys(strategy: &LiveHistoryStrategy) -> Result<Vec<String>> {
     if exchange.is_empty() {
         bail!("empty exchange for {}", strategy.slug);
     }
-    let suffix = format!("{exchange}-margin_{exchange}-futures");
-    Ok(ONLINE_LISTS
+    let (namespace, suffix, lists): (&str, String, &[&str]) = match strategy.strategy_kind.as_str()
+    {
+        "funding_rate" => (
+            "fr",
+            format!("{exchange}-margin_{exchange}-futures"),
+            &FR_ONLINE_LISTS,
+        ),
+        "intra_exchange" => ("intra", exchange, &INTRA_ONLINE_LISTS),
+        value => bail!("unsupported online symbol strategy kind: {value}"),
+    };
+    Ok(lists
         .iter()
-        .map(|list| format!("{prefix}:fr_{list}:{suffix}"))
+        .map(|list| format!("{prefix}:{namespace}_{list}:{suffix}"))
         .collect())
 }
 
@@ -403,20 +475,40 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
     use super::{
-        LiveHistoryStrategy, normalize_online_symbol, online_symbol_keys, parse_redis_mget,
+        LiveHistoryStrategy, account_datasets, delay_until_next_slot, normalize_online_symbol,
+        online_symbol_keys, parse_redis_mget,
     };
+
+    fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
+        LiveHistoryStrategy {
+            slug: slug.to_string(),
+            env_path: format!("/home/ubuntu/{slug}/env.sh"),
+            exchange: exchange.to_string(),
+            strategy_kind: strategy_kind.to_string(),
+            schedule_offset_minutes: 0,
+        }
+    }
+
+    #[test]
+    fn aligns_schedules_to_fixed_utc_slots() {
+        let now = UNIX_EPOCH + Duration::from_secs(8 * 3600 + 7 * 60 + 30);
+        let (base_delay, base_next) =
+            delay_until_next_slot(now, Duration::from_secs(900), 0).unwrap();
+        assert_eq!(base_delay, Duration::from_secs(7 * 60 + 30));
+        assert_eq!(base_next, (8 * 3600 + 15 * 60) * 1_000);
+
+        let (staggered_delay, staggered_next) =
+            delay_until_next_slot(now, Duration::from_secs(900), 1).unwrap();
+        assert_eq!(staggered_delay, Duration::from_secs(8 * 60 + 30));
+        assert_eq!(staggered_next, (8 * 3600 + 16 * 60) * 1_000);
+    }
 
     #[test]
     fn builds_mkt_signal_fr_online_keys() {
-        let strategy = LiveHistoryStrategy {
-            slug: "binance_fr_arb02".to_string(),
-            env_path: "/home/ubuntu/binance_fr_arb02/env.sh".to_string(),
-            exchange: "binance".to_string(),
-            funding_initialized: true,
-            interest_initialized: true,
-            liquidations_initialized: true,
-        };
+        let strategy = strategy("binance_fr_arb02", "binance", "funding_rate");
         assert_eq!(
             online_symbol_keys(&strategy).unwrap(),
             vec![
@@ -426,6 +518,39 @@ mod tests {
                 "binance_fr_arb02:fr_bwd_trade_symbols:binance-margin_binance-futures",
                 "binance_fr_arb02:fr_unimmr_close_symbols:binance-margin_binance-futures",
             ]
+        );
+    }
+
+    #[test]
+    fn builds_mkt_signal_intra_online_keys() {
+        let strategy = strategy("binance-intra-arb01", "binance", "intra_exchange");
+        assert_eq!(
+            online_symbol_keys(&strategy).unwrap(),
+            vec![
+                "binance-intra-arb01:intra_dump_symbols:binance",
+                "binance-intra-arb01:intra_fwd_trade_symbols:binance",
+                "binance-intra-arb01:intra_bwd_trade_symbols:binance",
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_supported_account_datasets() {
+        assert_eq!(
+            account_datasets(&strategy(
+                "binance-intra-arb01",
+                "binance",
+                "intra_exchange"
+            )),
+            ["funding"]
+        );
+        assert_eq!(
+            account_datasets(&strategy("bybit-intra-arb01", "bybit", "intra_exchange")),
+            ["funding", "interest"]
+        );
+        assert_eq!(
+            account_datasets(&strategy("gate_fr_arb01", "gate", "funding_rate")),
+            ["funding", "interest", "liquidations"]
         );
     }
 

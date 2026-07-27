@@ -724,6 +724,7 @@ async fn build_client(
         .with_context(|| format!("select {} REST source IPs", strategy.exchange))?;
     let mut dispatcher_config = DispatcherConfig {
         local_ips,
+        request_timeout: Duration::from_secs(30),
         ..DispatcherConfig::default()
     };
     if strategy.exchange == "bitget" {
@@ -1206,7 +1207,7 @@ fn normalize_cash(exchange: &str, dataset: Dataset, raw: Value) -> Result<CashRo
         }
         ("gate", Dataset::Interest) => {
             let asset = text_field(&raw, &["currency"])?;
-            let ts = timestamp_field(&raw, &["time_ms", "time"])?;
+            let ts = timestamp_field(&raw, &["time_ms", "time", "create_time"])?;
             let amount = number_field(&raw, &["interest"])?;
             let id =
                 optional_text(&raw, &["id"]).unwrap_or_else(|| format!("{asset}:{ts}:{amount}"));
@@ -2393,6 +2394,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gate.fee_amount, "-0.10");
+    }
+
+    #[test]
+    fn gate_interest_accepts_create_time() {
+        let row = normalize_cash(
+            "gate",
+            Dataset::Interest,
+            serde_json::json!({
+                "actual_rate": "0.0000044795",
+                "create_time": 1779937439409_i64,
+                "currency": "USDT",
+                "interest": "0.00152846",
+                "status": 1,
+                "type": "margin"
+            }),
+        )
+        .unwrap();
+        assert_eq!(row.record_id, "USDT:1779937439409:0.00152846");
+        assert_eq!(row.asset, "USDT");
+        assert_eq!(row.amount, "-0.00152846");
+        assert_eq!(row.event_time_ms, 1779937439409_i64);
     }
 
     #[test]

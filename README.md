@@ -137,17 +137,20 @@ also include the `rebates` dataset; run `--dataset rebates --full` to backfill
 wallet distributions from the strategy's `st_ms`. Repeat `--strategy` to scan
 multiple accounts in one invocation.
 
-The API service continuously syncs enabled local Binance FR accounts. Every
-trade cycle it rebuilds the symbol set from the same five Redis lists used by
-`mkt_signal`: `dump_symbols`, `pos_dump_symbols`, `fwd_trade_symbols`,
-`bwd_trade_symbols`, and `unimmr_close_symbols`. It then runs an incremental
-trade scan only for that union. By default, trades, funding, interest, and
-liquidations are all scheduled once every 15 minutes. Configure the worker with:
+The API service continuously syncs the four local Binance FR accounts plus
+`binance-intra-arb01`, `bybit-intra-arb01`, `bybit-intra-arb02`,
+`gate_fr_arb01`, and `gate_fr_arb02`. Binance trade scans rebuild their symbol
+sets from the same Redis online lists used by `mkt_signal`; Bybit and Gate use
+their account-wide history APIs. Each strategy only requests the datasets its
+exchange and strategy type support. Binance intra rebates remain excluded from
+the recurring worker because that endpoint has a high request weight. By
+default, all enabled datasets use fixed 15-minute UTC clock slots. Strategies
+on the same exchange are staggered by one minute according to `sort_order`.
+Configure the worker with:
 
 ```bash
-# Defaults shown. Set the trade interval to 0 to disable the worker.
-CRYPTO_NAV_LIVE_TRADE_SYNC_SECS=900
-CRYPTO_NAV_LIVE_ACCOUNT_SYNC_SECS=900
+# Defaults shown. Set the interval to 0 to disable the worker.
+CRYPTO_NAV_LIVE_SYNC_SECS=900
 CRYPTO_NAV_REDIS_HOST=127.0.0.1
 CRYPTO_NAV_REDIS_PORT=6379
 CRYPTO_NAV_REDIS_DB=0
