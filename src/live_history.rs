@@ -14,7 +14,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const DEFAULT_TRADE_INTERVAL_SECS: u64 = 60;
+const DEFAULT_TRADE_INTERVAL_SECS: u64 = 900;
 const DEFAULT_ACCOUNT_INTERVAL_SECS: u64 = 900;
 const DEFAULT_REDIS_CLI: &str = "/usr/bin/redis-cli";
 const DEFAULT_REDIS_HOST: &str = "127.0.0.1";
