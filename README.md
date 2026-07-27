@@ -137,6 +137,22 @@ also include the `rebates` dataset; run `--dataset rebates --full` to backfill
 wallet distributions from the strategy's `st_ms`. Repeat `--strategy` to scan
 multiple accounts in one invocation.
 
+The API service continuously syncs enabled local Binance FR accounts. Every
+trade cycle it rebuilds the symbol set from the same five Redis lists used by
+`mkt_signal`: `dump_symbols`, `pos_dump_symbols`, `fwd_trade_symbols`,
+`bwd_trade_symbols`, and `unimmr_close_symbols`. It then runs an incremental
+trade scan only for that union. Funding, interest, and liquidation datasets use
+a separate lower-frequency account-wide cycle. Configure the worker with:
+
+```bash
+# Defaults shown. Set the trade interval to 0 to disable the worker.
+CRYPTO_NAV_LIVE_TRADE_SYNC_SECS=60
+CRYPTO_NAV_LIVE_ACCOUNT_SYNC_SECS=900
+CRYPTO_NAV_REDIS_HOST=127.0.0.1
+CRYPTO_NAV_REDIS_PORT=6379
+CRYPTO_NAV_REDIS_DB=0
+```
+
 Sync current trading fee rates for every enabled strategy account:
 
 ```bash

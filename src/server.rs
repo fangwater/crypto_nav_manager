@@ -1,5 +1,5 @@
 use crate::{
-    contract_multipliers,
+    contract_multipliers, live_history,
     mark_prices::MarkPriceCache,
     pnl::{self, PnlCalculation, PnlSourceKind},
     strategy_env::read_env_file,
@@ -246,6 +246,7 @@ pub async fn run() -> Result<()> {
         .await
         .context("run PostgreSQL migrations")?;
     contract_multipliers::spawn(pool.clone());
+    live_history::spawn(pool.clone())?;
     let mark_prices = MarkPriceCache::start().await;
 
     let app = Router::new()
