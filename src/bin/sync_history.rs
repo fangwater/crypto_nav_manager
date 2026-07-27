@@ -81,6 +81,10 @@ struct Args {
     #[arg(long)]
     symbol: Vec<String>,
 
+    /// Skip spot/margin fills when synchronizing trades.
+    #[arg(long)]
+    derivatives_only: bool,
+
     /// Override automatically selected REST source IPs. May be repeated.
     #[arg(long)]
     local_ip: Vec<IpAddr>,
@@ -301,6 +305,7 @@ async fn main() -> Result<()> {
                 args.full,
                 overlap_ms,
                 end_ms,
+                args.derivatives_only,
             )
             .await
             .with_context(|| format!("sync {} {}", strategy.slug, dataset.name()))?;
@@ -333,6 +338,7 @@ async fn sync_dataset(
     full: bool,
     overlap_ms: i64,
     end_ms: i64,
+    derivatives_only: bool,
 ) -> Result<()> {
     let latest = latest_dataset_time(pool, strategy, dataset).await?;
     let watermark = watermark(pool, &strategy.slug, dataset).await?;
@@ -367,7 +373,7 @@ async fn sync_dataset(
     match dataset {
         Dataset::Trades => {
             let symbols = load_trade_symbols(pool, strategy, requested_symbols).await?;
-            let raw = fetch_trades(client, strategy, &symbols, range).await?;
+            let raw = fetch_trades(client, strategy, &symbols, range, derivatives_only).await?;
             let multipliers = load_gate_multipliers(client).await?;
             let mut rows = raw
                 .into_iter()
@@ -517,8 +523,9 @@ async fn fetch_trades(
     strategy: &Strategy,
     symbols: &[String],
     range: TimeRange,
+    derivatives_only: bool,
 ) -> Result<Vec<(Leg, Value)>> {
-    let include_spot = strategy.class != StrategyClass::Mm;
+    let include_spot = strategy.class != StrategyClass::Mm && !derivatives_only;
     let mut rows = Vec::new();
     match client {
         ExchangeClient::Binance(client) => {
@@ -1475,7 +1482,13 @@ async fn load_trade_symbols(
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
     if symbols.is_empty() {
-        for table in ["trades", "trade_fills", "funding", "funding_fees"] {
+        for table in [
+            "trades",
+            "trade_fills",
+            "funding",
+            "funding_fees",
+            "liquidations",
+        ] {
             if !table_exists(pool, &strategy.schema, table).await? {
                 continue;
             }
