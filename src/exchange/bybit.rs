@@ -18,6 +18,8 @@ const BASE: &str = "https://api.bybit.com";
 const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const PAGE_LIMIT: usize = 50;
 const RECV_WINDOW: &str = "20000";
+const TIMESTAMP_ERROR_CODE: &str = "10002";
+const TIMESTAMP_ERROR_RETRIES: usize = 1;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -345,49 +347,55 @@ impl BybitClient {
         weight: u32,
     ) -> Result<Value, ExchangeError> {
         let query = query_string(&params);
-        let timestamp = now_ms().to_string();
-        let signature = sign_request(
-            &timestamp,
-            &self.credentials.api_key,
-            RECV_WINDOW,
-            &query,
-            &self.credentials.secret_key,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("x-bapi-api-key"),
-            header_value("X-BAPI-API-KEY", &self.credentials.api_key)?,
-        );
-        headers.insert(
-            HeaderName::from_static("x-bapi-timestamp"),
-            header_value("X-BAPI-TIMESTAMP", &timestamp)?,
-        );
-        headers.insert(
-            HeaderName::from_static("x-bapi-recv-window"),
-            header_value("X-BAPI-RECV-WINDOW", RECV_WINDOW)?,
-        );
-        headers.insert(
-            HeaderName::from_static("x-bapi-sign"),
-            header_value("X-BAPI-SIGN", &signature)?,
-        );
-        headers.insert(
-            CONTENT_TYPE,
-            header_value("Content-Type", "application/json")?,
-        );
         let suffix = if query.is_empty() {
             String::new()
         } else {
             format!("?{query}")
         };
-        let value = get_json(
-            &self.dispatcher,
-            EXCHANGE,
-            format!("{BASE}{path}{suffix}"),
-            headers,
-            weight,
-        )
-        .await?;
-        check_api_error(value)
+        let url = format!("{BASE}{path}{suffix}");
+
+        for attempt in 0..=TIMESTAMP_ERROR_RETRIES {
+            let timestamp = now_ms().to_string();
+            let signature = sign_request(
+                &timestamp,
+                &self.credentials.api_key,
+                RECV_WINDOW,
+                &query,
+                &self.credentials.secret_key,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_static("x-bapi-api-key"),
+                header_value("X-BAPI-API-KEY", &self.credentials.api_key)?,
+            );
+            headers.insert(
+                HeaderName::from_static("x-bapi-timestamp"),
+                header_value("X-BAPI-TIMESTAMP", &timestamp)?,
+            );
+            headers.insert(
+                HeaderName::from_static("x-bapi-recv-window"),
+                header_value("X-BAPI-RECV-WINDOW", RECV_WINDOW)?,
+            );
+            headers.insert(
+                HeaderName::from_static("x-bapi-sign"),
+                header_value("X-BAPI-SIGN", &signature)?,
+            );
+            headers.insert(
+                CONTENT_TYPE,
+                header_value("Content-Type", "application/json")?,
+            );
+
+            let result = get_json(&self.dispatcher, EXCHANGE, url.clone(), headers, weight)
+                .await
+                .and_then(check_api_error);
+            if attempt < TIMESTAMP_ERROR_RETRIES && result.as_ref().is_err_and(is_timestamp_error) {
+                eprintln!("Bybit request timestamp expired; retrying once with a fresh signature");
+                continue;
+            }
+            return result;
+        }
+
+        unreachable!("timestamp retry loop always returns")
     }
 }
 
@@ -466,6 +474,17 @@ fn check_api_error(value: Value) -> Result<Value, ExchangeError> {
     })
 }
 
+fn is_timestamp_error(error: &ExchangeError) -> bool {
+    matches!(
+        error,
+        ExchangeError::Api {
+            exchange: EXCHANGE,
+            code,
+            ..
+        } if code == TIMESTAMP_ERROR_CODE
+    )
+}
+
 fn is_liquidation_order(row: &Value) -> bool {
     matches!(
         row.get("createType").and_then(Value::as_str),
@@ -502,6 +521,23 @@ mod tests {
             sign_request("1", "api", "5000", "category=linear", "secret"),
             "3c7d359b41eb3e2593e0768d38b754b743a9e12c6e161dee039a5bcecba6ef1c"
         );
+    }
+
+    #[test]
+    fn timestamp_error_is_the_only_api_error_retried() {
+        let timestamp_error = check_api_error(serde_json::json!({
+            "retCode": 10002,
+            "retMsg": "invalid request"
+        }))
+        .unwrap_err();
+        let unrelated_error = check_api_error(serde_json::json!({
+            "retCode": 10006,
+            "retMsg": "too many visits"
+        }))
+        .unwrap_err();
+
+        assert!(is_timestamp_error(&timestamp_error));
+        assert!(!is_timestamp_error(&unrelated_error));
     }
 
     #[test]
