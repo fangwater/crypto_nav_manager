@@ -258,9 +258,9 @@ impl SymbolState {
             self.unconverted_fee_count += 1;
             0.0
         });
-        let (fifo, cached_snapshot) = match trade.leg {
-            PositionLeg::Spot => (&mut self.spot_fifo, &mut self.spot_snapshot),
-            PositionLeg::Futures => (&mut self.futures_fifo, &mut self.futures_snapshot),
+        let fifo = match trade.leg {
+            PositionLeg::Spot => &mut self.spot_fifo,
+            PositionLeg::Futures => &mut self.futures_fifo,
         };
         fifo.apply_fill(trade.side, trade.price, trade.amount_u, fee)
             .context("apply normalized trade to venue FIFO")?;
@@ -284,9 +284,15 @@ impl SymbolState {
                 self.futures_position_qty += signed_quantity;
             }
         }
-        *cached_snapshot = Some(
-            fifo.snapshot(trade.price, trade.price)
-                .context("mark venue FIFO at the latest trade price")?,
+        self.spot_snapshot = Some(
+            self.spot_fifo
+                .snapshot(trade.price, trade.price)
+                .context("mark spot FIFO at the latest symbol trade price")?,
+        );
+        self.futures_snapshot = Some(
+            self.futures_fifo
+                .snapshot(trade.price, trade.price)
+                .context("mark futures FIFO at the latest symbol trade price")?,
         );
         Ok(())
     }
@@ -1215,7 +1221,7 @@ async fn load_spot_swap_inputs(
             "swap" | "usdm_futures" => PositionLeg::Futures,
             _ => bail!("unsupported {exchange} trade market {:?}", row.market),
         };
-        let quantity = match (exchange, leg) {
+        let raw_quantity = match (exchange, leg) {
             ("gate", PositionLeg::Futures) => {
                 row.quantity.abs()
                     * multiplier_book
@@ -1224,6 +1230,18 @@ async fn load_spot_swap_inputs(
                         .multiplier_at(&symbol, row.ts)?
             }
             _ => row.quantity.abs(),
+        };
+        let quantity = if exchange == "binance"
+            && leg == PositionLeg::Spot
+            && !base_asset.is_empty()
+            && commission_asset == base_asset
+        {
+            match side {
+                Side::Buy => raw_quantity - row.fee,
+                Side::Sell => raw_quantity + row.fee,
+            }
+        } else {
+            raw_quantity
         };
         if !quantity.is_finite() || quantity <= 0.0 {
             bail!("invalid {exchange} quantity: {quantity}");
@@ -1370,6 +1388,52 @@ mod tests {
     }
 
     #[test]
+    fn marks_both_venue_fifos_at_each_symbol_trade() {
+        let mut state = SymbolState::default();
+        state
+            .apply_trade(&trade(
+                "BTCUSDT",
+                PositionLeg::Spot,
+                Side::Buy,
+                100.0,
+                1_000.0,
+                10.0,
+                0.0,
+                1,
+            ))
+            .unwrap();
+        state
+            .apply_trade(&trade(
+                "BTCUSDT",
+                PositionLeg::Futures,
+                Side::Sell,
+                100.0,
+                1_000.0,
+                10.0,
+                0.0,
+                2,
+            ))
+            .unwrap();
+        state
+            .apply_trade(&trade(
+                "BTCUSDT",
+                PositionLeg::Spot,
+                Side::Sell,
+                110.0,
+                100.0,
+                1.0,
+                0.0,
+                3,
+            ))
+            .unwrap();
+
+        let metrics = state.metrics();
+        assert!((metrics.fee_before_pnl_usdt - 10.0).abs() < 1e-9);
+        assert!((metrics.floating_pnl_usdt + 10.0).abs() < 1e-9);
+        assert!(metrics.total_pnl_usdt.abs() < 1e-9);
+    }
+
+    #[test]
     fn keeps_venue_fifo_independent_and_combines_fees_funding_and_interest() {
         let inputs = PnlInputs {
             trades: vec![
@@ -1413,8 +1477,8 @@ mod tests {
         assert!((response.summary.fee_after_pnl_usdt + 3.0).abs() < 1e-9);
         assert!((response.summary.funding_pnl_usdt - 5.0).abs() < 1e-9);
         assert!((response.summary.interest_cost_usdt - 2.0).abs() < 1e-9);
-        assert_eq!(response.summary.floating_pnl_usdt, 0.0);
-        assert_eq!(response.summary.total_pnl_usdt, 0.0);
+        assert!((response.summary.floating_pnl_usdt - 100.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
         let final_point = response.points.last().unwrap();
         assert_eq!(final_point.spot_position_usdt, 1_000.0);
         assert_eq!(final_point.futures_position_usdt, -400.0);

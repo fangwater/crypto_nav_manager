@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const EXPECTED_HEADERS: [&str; 15] = [
+const MODERN_HEADERS: [&str; 15] = [
     "sid",
     "key",
     "symbol",
@@ -25,6 +25,22 @@ const EXPECTED_HEADERS: [&str; 15] = [
     "fees",
     "commissionAsset",
     "realizedPnl",
+    "ts",
+    "ttype",
+    "positionSide",
+];
+const LEGACY_HEADERS: [&str; 14] = [
+    "sid",
+    "key",
+    "symbol",
+    "id",
+    "orderid",
+    "side",
+    "price",
+    "qty",
+    "amountu",
+    "fees",
+    "commissionAsset",
     "ts",
     "ttype",
     "positionSide",
@@ -53,7 +69,7 @@ struct TradeRow {
     key: String,
     symbol: String,
     id: i64,
-    #[serde(rename = "orderId")]
+    #[serde(rename = "orderId", alias = "orderid")]
     order_id: i64,
     side: String,
     price: String,
@@ -61,13 +77,13 @@ struct TradeRow {
     amountu: String,
     fees: String,
     #[serde(rename = "commissionAsset")]
-    commission_asset: String,
-    #[serde(rename = "realizedPnl")]
+    _commission_asset: String,
+    #[serde(rename = "realizedPnl", default)]
     realized_pnl: Option<String>,
     ts: i64,
     ttype: String,
     #[serde(rename = "positionSide")]
-    position_side: String,
+    _position_side: String,
 }
 
 #[tokio::main]
@@ -158,11 +174,12 @@ fn read_and_validate(files: &[PathBuf]) -> Result<Vec<TradeRow>> {
             .with_context(|| format!("read header from {}", file.display()))?
             .clone();
         let actual_headers = headers.iter().collect::<Vec<_>>();
-        if actual_headers != EXPECTED_HEADERS {
+        if actual_headers != MODERN_HEADERS && actual_headers != LEGACY_HEADERS {
             bail!(
-                "unexpected header in {}\nexpected: {}\nactual:   {}",
+                "unexpected header in {}\nexpected modern: {}\nexpected legacy: {}\nactual:          {}",
                 file.display(),
-                EXPECTED_HEADERS.join(","),
+                MODERN_HEADERS.join(","),
+                LEGACY_HEADERS.join(","),
                 headers.iter().collect::<Vec<_>>().join(",")
             );
         }
@@ -222,18 +239,22 @@ async fn import_rows(pool: &PgPool, schema: &str, rows: &[TradeRow]) -> Result<(
     for batch in rows.chunks(BATCH_SIZE) {
         let insert_sql = format!(
             "INSERT INTO {schema}.trades (\
-             sid, key, symbol, id, \"orderId\", side, price, qty, amountu, fees, \
-             \"commissionAsset\", \"realizedPnl\", ts, ttype, \"positionSide\") "
+             market, symbol, trade_id, order_id, side, liquidity_role, price, quantity, \
+             quote_quantity, fee_amount, fee_asset, fee_usdt, realized_pnl, event_time_ms) "
         );
         let mut query = QueryBuilder::<Postgres>::new(insert_sql);
         query.push_values(batch, |mut values, row| {
+            let market = if row.sid == 1 { "spot" } else { "usdm_futures" };
+            // Liang Torch exports `fees` after conversion to USDT; commissionAsset
+            // only records which asset Binance originally used for the deduction.
+            let fee_usdt = Some(row.fees.as_str());
             values
-                .push_bind(row.sid)
-                .push_bind(&row.key)
+                .push_bind(market)
                 .push_bind(&row.symbol)
-                .push_bind(row.id)
-                .push_bind(row.order_id)
+                .push_bind(row.id.to_string())
+                .push_bind(row.order_id.to_string())
                 .push_bind(&row.side)
+                .push_bind(&row.ttype)
                 .push("CAST(")
                 .push_bind_unseparated(&row.price)
                 .push_unseparated(" AS NUMERIC)")
@@ -246,28 +267,28 @@ async fn import_rows(pool: &PgPool, schema: &str, rows: &[TradeRow]) -> Result<(
                 .push("CAST(")
                 .push_bind_unseparated(&row.fees)
                 .push_unseparated(" AS NUMERIC)")
-                .push_bind(&row.commission_asset)
+                .push_bind("USDT")
+                .push("CAST(")
+                .push_bind_unseparated(fee_usdt)
+                .push_unseparated(" AS NUMERIC)")
                 .push("CAST(")
                 .push_bind_unseparated(row.realized_pnl.as_deref())
                 .push_unseparated(" AS NUMERIC)")
-                .push_bind(row.ts)
-                .push_bind(&row.ttype)
-                .push_bind(&row.position_side);
+                .push_bind(row.ts);
         });
         query.push(
-            " ON CONFLICT (key, symbol, id) DO UPDATE SET \
-             sid = EXCLUDED.sid, \
-             \"orderId\" = EXCLUDED.\"orderId\", \
+            " ON CONFLICT (market, symbol, trade_id) DO UPDATE SET \
+             order_id = EXCLUDED.order_id, \
              side = EXCLUDED.side, \
+             liquidity_role = EXCLUDED.liquidity_role, \
              price = EXCLUDED.price, \
-             qty = EXCLUDED.qty, \
-             amountu = EXCLUDED.amountu, \
-             fees = EXCLUDED.fees, \
-             \"commissionAsset\" = EXCLUDED.\"commissionAsset\", \
-             \"realizedPnl\" = EXCLUDED.\"realizedPnl\", \
-             ts = EXCLUDED.ts, \
-             ttype = EXCLUDED.ttype, \
-             \"positionSide\" = EXCLUDED.\"positionSide\"",
+             quantity = EXCLUDED.quantity, \
+             quote_quantity = EXCLUDED.quote_quantity, \
+             fee_amount = EXCLUDED.fee_amount, \
+             fee_asset = EXCLUDED.fee_asset, \
+             fee_usdt = EXCLUDED.fee_usdt, \
+             realized_pnl = COALESCE(EXCLUDED.realized_pnl, trades.realized_pnl), \
+             event_time_ms = EXCLUDED.event_time_ms",
         );
         query
             .build()
@@ -287,7 +308,8 @@ async fn print_progress(
     source_rows: usize,
 ) -> Result<()> {
     let summary_sql = format!(
-        "SELECT COUNT(*), COUNT(DISTINCT (key, symbol)), MIN(ts), MAX(ts) \
+        "SELECT COUNT(*), COUNT(DISTINCT (market, symbol)), \
+                MIN(event_time_ms), MAX(event_time_ms) \
          FROM {schema}.trades"
     );
     let (database_rows, cursor_count, first_ts, latest_ts): (i64, i64, Option<i64>, Option<i64>) =
@@ -307,8 +329,8 @@ async fn print_progress(
     );
 
     let market_sql = format!(
-        "SELECT key, COUNT(*), COUNT(DISTINCT symbol), MAX(ts) \
-         FROM {schema}.trades GROUP BY key ORDER BY key"
+        "SELECT market, COUNT(*), COUNT(DISTINCT symbol), MAX(event_time_ms) \
+         FROM {schema}.trades GROUP BY market ORDER BY market"
     );
     let markets: Vec<(String, i64, i64, Option<i64>)> =
         sqlx::query_as(AssertSqlSafe(market_sql.as_str()))

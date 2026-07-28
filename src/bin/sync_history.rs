@@ -69,6 +69,10 @@ struct Args {
     #[arg(long)]
     full: bool,
 
+    /// Inclusive repair start timestamp. Overrides the incremental watermark.
+    #[arg(long, conflicts_with = "full")]
+    start_ms: Option<i64>,
+
     /// Amount of already scanned history to re-read during incremental sync.
     #[arg(long, default_value_t = DEFAULT_OVERLAP_MINUTES, value_parser = clap::value_parser!(i64).range(0..))]
     overlap_minutes: i64,
@@ -271,6 +275,17 @@ async fn main() -> Result<()> {
                 strategy.st_ms
             );
         }
+        if let Some(start_ms) = args.start_ms {
+            if start_ms < strategy.st_ms {
+                bail!(
+                    "start_ms {start_ms} is earlier than {slug} st_ms {}",
+                    strategy.st_ms
+                );
+            }
+            if start_ms > end_ms {
+                bail!("start_ms {start_ms} is later than end_ms {end_ms}");
+            }
+        }
         let client = build_client(&pool, &strategy, &args.local_ip).await?;
         println!(
             "\n{}: exchange={}, class={:?}, end={}",
@@ -303,6 +318,7 @@ async fn main() -> Result<()> {
                 dataset,
                 &args.symbol,
                 args.full,
+                args.start_ms,
                 overlap_ms,
                 end_ms,
                 args.derivatives_only,
@@ -336,22 +352,30 @@ async fn sync_dataset(
     dataset: Dataset,
     requested_symbols: &[String],
     full: bool,
+    requested_start_ms: Option<i64>,
     overlap_ms: i64,
     end_ms: i64,
     derivatives_only: bool,
 ) -> Result<()> {
     let latest = latest_dataset_time(pool, strategy, dataset).await?;
     let watermark = watermark(pool, &strategy.slug, dataset).await?;
-    let start_ms =
-        scan_start(strategy.st_ms, watermark, latest, full, overlap_ms).with_context(|| {
-            format!(
-                "{} {} is not initialized; rerun with --strategy {} --dataset {} --full",
-                strategy.slug,
-                dataset.name(),
-                strategy.slug,
-                dataset.name()
-            )
-        })?;
+    let start_ms = scan_start(
+        strategy.st_ms,
+        watermark,
+        latest,
+        full,
+        requested_start_ms,
+        overlap_ms,
+    )
+    .with_context(|| {
+        format!(
+            "{} {} is not initialized; rerun with --strategy {} --dataset {} --full",
+            strategy.slug,
+            dataset.name(),
+            strategy.slug,
+            dataset.name()
+        )
+    })?;
     if start_ms > end_ms {
         println!("{} already beyond requested end; skipped", dataset.name());
         return Ok(());
@@ -475,8 +499,12 @@ fn scan_start(
     watermark: Option<i64>,
     latest: Option<i64>,
     full: bool,
+    requested_start_ms: Option<i64>,
     overlap_ms: i64,
 ) -> Result<i64> {
+    if let Some(start_ms) = requested_start_ms {
+        return Ok(start_ms);
+    }
     if full {
         return Ok(st_ms);
     }
@@ -2298,7 +2326,15 @@ mod tests {
     #[test]
     fn incremental_range_prefers_success_watermark() {
         assert_eq!(
-            scan_start(1_000_000, Some(2_000_000), Some(3_000_000), false, 600_000).unwrap(),
+            scan_start(
+                1_000_000,
+                Some(2_000_000),
+                Some(3_000_000),
+                false,
+                None,
+                600_000
+            )
+            .unwrap(),
             1_400_000
         );
     }
@@ -2306,12 +2342,12 @@ mod tests {
     #[test]
     fn incremental_range_can_seed_from_existing_rows() {
         assert_eq!(
-            scan_start(1_000_000, None, Some(2_000_000), false, 600_000).unwrap(),
+            scan_start(1_000_000, None, Some(2_000_000), false, None, 600_000).unwrap(),
             1_400_000
         );
-        assert!(scan_start(1_000_000, None, None, false, 600_000).is_err());
+        assert!(scan_start(1_000_000, None, None, false, None, 600_000).is_err());
         assert_eq!(
-            scan_start(1_000_000, None, None, true, 600_000).unwrap(),
+            scan_start(1_000_000, None, None, true, None, 600_000).unwrap(),
             1_000_000
         );
     }
