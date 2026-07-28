@@ -242,10 +242,9 @@ struct SymbolState {
     interest_cost_usdt: f64,
     trade_count: u64,
     volume_usdt: f64,
-    spot_position_usdt: f64,
-    futures_position_usdt: f64,
     spot_position_qty: f64,
     futures_position_qty: f64,
+    mark_price: Option<f64>,
     unconverted_fee_count: u64,
     unconverted_interest_count: u64,
     spot_snapshot: Option<PnlSnapshot>,
@@ -266,24 +265,15 @@ impl SymbolState {
             .context("apply normalized trade to venue FIFO")?;
         self.trade_count += 1;
         self.volume_usdt += trade.amount_u;
-        let signed_amount_u = match trade.side {
-            Side::Buy => trade.amount_u,
-            Side::Sell => -trade.amount_u,
-        };
         let signed_quantity = match trade.side {
             Side::Buy => trade.quantity,
             Side::Sell => -trade.quantity,
         };
         match trade.leg {
-            PositionLeg::Spot => {
-                self.spot_position_usdt += signed_amount_u;
-                self.spot_position_qty += signed_quantity;
-            }
-            PositionLeg::Futures => {
-                self.futures_position_usdt += signed_amount_u;
-                self.futures_position_qty += signed_quantity;
-            }
+            PositionLeg::Spot => self.spot_position_qty += signed_quantity,
+            PositionLeg::Futures => self.futures_position_qty += signed_quantity,
         }
+        self.mark_price = Some(trade.price);
         self.spot_snapshot = Some(
             self.spot_fifo
                 .snapshot(trade.price, trade.price)
@@ -300,6 +290,9 @@ impl SymbolState {
     fn metrics(&self) -> Metrics {
         let spot = self.spot_snapshot.unwrap_or_default();
         let futures = self.futures_snapshot.unwrap_or_default();
+        let mark_price = self.mark_price.unwrap_or_default();
+        let spot_position_usdt = self.spot_position_qty * mark_price;
+        let futures_position_usdt = self.futures_position_qty * mark_price;
         Metrics {
             trade_count: self.trade_count,
             volume_usdt: self.volume_usdt,
@@ -311,9 +304,9 @@ impl SymbolState {
             floating_pnl_usdt: spot.floating_pnl + futures.floating_pnl,
             total_pnl_usdt: spot.total_pnl + futures.total_pnl + self.funding_pnl_usdt
                 - self.interest_cost_usdt,
-            open_amount_usdt: clean_zero(self.spot_position_usdt + self.futures_position_usdt),
-            spot_position_usdt: self.spot_position_usdt,
-            futures_position_usdt: self.futures_position_usdt,
+            open_amount_usdt: clean_zero(spot_position_usdt + futures_position_usdt),
+            spot_position_usdt,
+            futures_position_usdt,
             spot_position_qty: self.spot_position_qty,
             futures_position_qty: self.futures_position_qty,
             unconverted_fee_count: self.unconverted_fee_count,
@@ -1231,18 +1224,9 @@ async fn load_spot_swap_inputs(
             }
             _ => row.quantity.abs(),
         };
-        let quantity = if exchange == "binance"
-            && leg == PositionLeg::Spot
-            && !base_asset.is_empty()
-            && commission_asset == base_asset
-        {
-            match side {
-                Side::Buy => raw_quantity - row.fee,
-                Side::Sell => raw_quantity + row.fee,
-            }
-        } else {
-            raw_quantity
-        };
+        // Filled quantity is the strategy position delta. Asset-denominated fees
+        // belong in PnL and must not create a synthetic position imbalance.
+        let quantity = raw_quantity;
         if !quantity.is_finite() || quantity <= 0.0 {
             bail!("invalid {exchange} quantity: {quantity}");
         }
@@ -1480,9 +1464,9 @@ mod tests {
         assert!((response.summary.floating_pnl_usdt - 100.0).abs() < 1e-9);
         assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
         let final_point = response.points.last().unwrap();
-        assert_eq!(final_point.spot_position_usdt, 1_000.0);
-        assert_eq!(final_point.futures_position_usdt, -400.0);
-        assert_eq!(final_point.exposure_usdt, 600.0);
+        assert_eq!(final_point.spot_position_usdt, 1_100.0);
+        assert_eq!(final_point.futures_position_usdt, -440.0);
+        assert_eq!(final_point.exposure_usdt, 660.0);
         assert!((final_point.spot_position_qty - 10.0).abs() < 1e-9);
         assert!((final_point.futures_position_qty + 4.0).abs() < 1e-9);
         assert!((final_point.exposure_qty - 6.0).abs() < 1e-9);
@@ -1498,6 +1482,65 @@ mod tests {
             response.source.returned_symbol_points,
             symbol_series.points.len()
         );
+    }
+
+    #[test]
+    fn values_exposure_from_net_quantity_instead_of_signed_trade_amount() {
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "COTIUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    0.010,
+                    10.0,
+                    1_000.0,
+                    0.0,
+                    1_100,
+                ),
+                trade(
+                    "COTIUSDT",
+                    PositionLeg::Futures,
+                    Side::Sell,
+                    0.010,
+                    10.0,
+                    1_000.0,
+                    0.0,
+                    1_200,
+                ),
+                trade(
+                    "COTIUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    0.012,
+                    12.0,
+                    1_000.0,
+                    0.0,
+                    1_300,
+                ),
+                trade(
+                    "COTIUSDT",
+                    PositionLeg::Futures,
+                    Side::Buy,
+                    0.011,
+                    10.989,
+                    999.0,
+                    0.0,
+                    1_400,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+
+        let response = calculate(inputs, request(1_000, 1_500)).unwrap();
+        let final_point = response.points.last().unwrap();
+
+        assert_eq!(final_point.spot_position_qty, 0.0);
+        assert_eq!(final_point.futures_position_qty, -1.0);
+        assert_eq!(final_point.spot_position_usdt, 0.0);
+        assert!((final_point.futures_position_usdt + 0.011).abs() < 1e-12);
+        assert!((final_point.exposure_usdt + 0.011).abs() < 1e-12);
+        assert!((response.summary.open_amount_usdt + 0.011).abs() < 1e-12);
     }
 
     #[test]
