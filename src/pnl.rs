@@ -1128,6 +1128,29 @@ fn market_making_quantity(
     Ok(quantity)
 }
 
+fn spot_swap_position_quantity(
+    exchange: &str,
+    leg: PositionLeg,
+    side: Side,
+    raw_quantity: f64,
+    fee: f64,
+    commission_asset: &str,
+    base_asset: &str,
+) -> f64 {
+    if exchange == "gate"
+        && leg == PositionLeg::Spot
+        && !base_asset.is_empty()
+        && commission_asset == base_asset
+    {
+        match side {
+            Side::Buy => raw_quantity + fee.abs(),
+            Side::Sell => raw_quantity - fee.abs(),
+        }
+    } else {
+        raw_quantity
+    }
+}
+
 async fn load_spot_swap_inputs(
     pool: &PgPool,
     schema: &str,
@@ -1171,11 +1194,6 @@ async fn load_spot_swap_inputs(
         .fetch_all(pool)
         .await
         .with_context(|| format!("load {exchange} trades from {schema}"))?;
-    let multiplier_book = if exchange == "gate" && !rows.is_empty() {
-        Some(ContractMultiplierBook::load(pool, exchange).await?)
-    } else {
-        None
-    };
     let mut trades = Vec::with_capacity(rows.len());
     let mut spot_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
     let mut all_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
@@ -1214,19 +1232,16 @@ async fn load_spot_swap_inputs(
             "swap" | "usdm_futures" => PositionLeg::Futures,
             _ => bail!("unsupported {exchange} trade market {:?}", row.market),
         };
-        let raw_quantity = match (exchange, leg) {
-            ("gate", PositionLeg::Futures) => {
-                row.quantity.abs()
-                    * multiplier_book
-                        .as_ref()
-                        .context("missing Gate contract multiplier book")?
-                        .multiplier_at(&symbol, row.ts)?
-            }
-            _ => row.quantity.abs(),
-        };
-        // Filled quantity is the strategy position delta. Asset-denominated fees
-        // belong in PnL and must not create a synthetic position imbalance.
-        let quantity = raw_quantity;
+        let raw_quantity = row.quantity.abs();
+        let quantity = spot_swap_position_quantity(
+            exchange,
+            leg,
+            side,
+            raw_quantity,
+            row.fee,
+            &commission_asset,
+            base_asset,
+        );
         if !quantity.is_finite() || quantity <= 0.0 {
             bail!("invalid {exchange} quantity: {quantity}");
         }
@@ -1643,6 +1658,46 @@ mod tests {
         assert_eq!(response.summary.open_amount_usdt, -200.0);
         assert!(!response.source.interest_included);
         assert_eq!(response.source.adapter, "market_making_futures_v1");
+    }
+
+    #[test]
+    fn gate_spot_base_rebate_increases_signed_position() {
+        assert_eq!(
+            spot_swap_position_quantity(
+                "gate",
+                PositionLeg::Spot,
+                Side::Buy,
+                10.0,
+                -0.2,
+                "BTC",
+                "BTC",
+            ),
+            10.2
+        );
+        assert_eq!(
+            spot_swap_position_quantity(
+                "gate",
+                PositionLeg::Spot,
+                Side::Sell,
+                10.0,
+                0.2,
+                "BTC",
+                "BTC",
+            ),
+            9.8
+        );
+        assert_eq!(
+            spot_swap_position_quantity(
+                "binance",
+                PositionLeg::Spot,
+                Side::Sell,
+                10.0,
+                0.2,
+                "BTC",
+                "BTC",
+            ),
+            10.0
+        );
     }
 
     #[test]

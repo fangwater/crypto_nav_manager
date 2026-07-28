@@ -1035,7 +1035,7 @@ fn normalize_gate_trade(
     let quantity = decimal_string(size_value.abs() * multiplier);
     make_trade(
         leg,
-        "usdt_futures",
+        "swap",
         normalize_symbol(&contract),
         text_field(&raw, &["trade_id"])?,
         optional_text(&raw, &["order_id"]).unwrap_or_default(),
@@ -2430,6 +2430,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gate.fee_amount, "-0.10");
+        assert_eq!(gate.market, "swap");
     }
 
     #[test]
