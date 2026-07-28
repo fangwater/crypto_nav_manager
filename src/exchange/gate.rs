@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     models::{TimeRange, TradingFeeRate},
-    rest_dispatcher::Dispatcher,
+    rest_dispatcher::{DispatchError, Dispatcher},
 };
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName};
@@ -17,6 +17,7 @@ const EXCHANGE: &str = "gate";
 const BASE: &str = "https://api.gateio.ws";
 const API_PREFIX: &str = "/api/v4";
 const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const TRANSIENT_GET_RETRIES: usize = 1;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -430,50 +431,67 @@ impl GateClient {
         params: Params,
         weight: u32,
     ) -> Result<Value, ExchangeError> {
+        self.private_get_from(BASE, path, params, weight).await
+    }
+
+    async fn private_get_from(
+        &self,
+        base: &str,
+        path: &str,
+        params: Params,
+        weight: u32,
+    ) -> Result<Value, ExchangeError> {
         let query = query_string(&params);
         let full_path = format!("{API_PREFIX}{path}");
-        let timestamp = now_sec();
-        let signature = sign_request(
-            &self.credentials.secret_key,
-            "GET",
-            &full_path,
-            &query,
-            "",
-            timestamp,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("key"),
-            header_value("KEY", &self.credentials.api_key)?,
-        );
-        headers.insert(
-            HeaderName::from_static("timestamp"),
-            header_value("Timestamp", &timestamp.to_string())?,
-        );
-        headers.insert(
-            HeaderName::from_static("sign"),
-            header_value("SIGN", &signature)?,
-        );
-        if path.starts_with("/futures/") {
-            headers.insert(
-                HeaderName::from_static("x-gate-size-decimal"),
-                header_value("X-Gate-Size-Decimal", "1")?,
-            );
-        }
         let suffix = if query.is_empty() {
             String::new()
         } else {
             format!("?{query}")
         };
-        let value = get_json(
-            &self.dispatcher,
-            EXCHANGE,
-            format!("{BASE}{full_path}{suffix}"),
-            headers,
-            weight,
-        )
-        .await?;
-        check_api_error(value)
+        let url = format!("{base}{full_path}{suffix}");
+
+        for attempt in 0..=TRANSIENT_GET_RETRIES {
+            let timestamp = now_sec();
+            let signature = sign_request(
+                &self.credentials.secret_key,
+                "GET",
+                &full_path,
+                &query,
+                "",
+                timestamp,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_static("key"),
+                header_value("KEY", &self.credentials.api_key)?,
+            );
+            headers.insert(
+                HeaderName::from_static("timestamp"),
+                header_value("Timestamp", &timestamp.to_string())?,
+            );
+            headers.insert(
+                HeaderName::from_static("sign"),
+                header_value("SIGN", &signature)?,
+            );
+            if path.starts_with("/futures/") {
+                headers.insert(
+                    HeaderName::from_static("x-gate-size-decimal"),
+                    header_value("X-Gate-Size-Decimal", "1")?,
+                );
+            }
+
+            let result = get_json(&self.dispatcher, EXCHANGE, url.clone(), headers, weight)
+                .await
+                .and_then(check_api_error);
+            if attempt < TRANSIENT_GET_RETRIES && result.as_ref().is_err_and(is_transient_get_error)
+            {
+                eprintln!("Gate GET transport failed; retrying once with a fresh signature");
+                continue;
+            }
+            return result;
+        }
+
+        unreachable!("Gate private GET retry loop always returns")
     }
 
     async fn public_get(
@@ -488,14 +506,25 @@ impl GateClient {
         } else {
             format!("?{query}")
         };
-        get_json(
-            &self.dispatcher,
-            EXCHANGE,
-            format!("{BASE}{API_PREFIX}{path}{suffix}"),
-            HeaderMap::new(),
-            weight,
-        )
-        .await
+        let url = format!("{BASE}{API_PREFIX}{path}{suffix}");
+        for attempt in 0..=TRANSIENT_GET_RETRIES {
+            let result = get_json(
+                &self.dispatcher,
+                EXCHANGE,
+                url.clone(),
+                HeaderMap::new(),
+                weight,
+            )
+            .await;
+            if attempt < TRANSIENT_GET_RETRIES && result.as_ref().is_err_and(is_transient_get_error)
+            {
+                eprintln!("Gate public GET transport failed; retrying once");
+                continue;
+            }
+            return result;
+        }
+
+        unreachable!("Gate public GET retry loop always returns")
     }
 }
 
@@ -534,6 +563,14 @@ fn check_api_error(value: Value) -> Result<Value, ExchangeError> {
         });
     }
     Ok(value)
+}
+
+fn is_transient_get_error(error: &ExchangeError) -> bool {
+    matches!(
+        error,
+        ExchangeError::Dispatch(DispatchError::Request { source, .. })
+            if source.is_timeout() || source.is_connect()
+    )
 }
 
 fn dedup(rows: &mut Vec<Value>, keys: &[&str]) {
@@ -600,6 +637,9 @@ fn sort_by_timestamp(rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rest_dispatcher::DispatcherConfig;
+    use std::{net::IpAddr, time::Duration};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn gate_signature_is_stable() {
@@ -607,6 +647,45 @@ mod tests {
             sign_request("secret", "GET", "/api/v4/test", "a=1", "", 1_700_000_000),
             "0894400e042cb393ddd64de852b3d03b317c0067fac11c1605fd459c3c48c0f5d0de84f622edd612f63e96cc12948466a2add34995081bf56d9e27bf8cfb8ef0"
         );
+    }
+
+    #[tokio::test]
+    async fn private_get_retries_once_after_transport_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2_048];
+                    let _ = stream.read(&mut request).await;
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        return;
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let dispatcher = Dispatcher::new(DispatcherConfig {
+            local_ips: vec![IpAddr::from([127, 0, 0, 1])],
+            request_timeout: Duration::from_millis(50),
+            ..DispatcherConfig::default()
+        })
+        .unwrap();
+        let client = GateClient::new(dispatcher, GateCredentials::new("key", "secret"));
+
+        let response = client
+            .private_get_from(&format!("http://{address}"), "/test", Vec::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(response, serde_json::json!({}));
     }
 
     #[test]
