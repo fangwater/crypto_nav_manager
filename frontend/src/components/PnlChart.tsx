@@ -46,8 +46,8 @@ const seriesMeta: Record<
   { label: string; color: string; dashed?: boolean; negate?: boolean }
 > = {
   totalPnlUsdt: { label: 'Total PnL', color: '#176b5b' },
-  feeBeforePnlUsdt: { label: 'Fee 前', color: '#2563a7' },
-  feeAfterPnlUsdt: { label: 'Fee 后', color: '#7357a3' },
+  feeBeforePnlUsdt: { label: 'Fee 前净值', color: '#2563a7' },
+  feeAfterPnlUsdt: { label: 'Fee 后净值', color: '#7357a3' },
   fundingPnlUsdt: { label: 'Funding', color: '#b7791f' },
   interestCostUsdt: {
     label: 'Interest 成本',
@@ -60,6 +60,13 @@ const seriesMeta: Record<
     color: '#4b6478',
     dashed: true,
   },
+}
+
+function portfolioSeriesValue(point: PnlPoint, key: PnlSeriesKey) {
+  if (key === 'feeBeforePnlUsdt' || key === 'feeAfterPnlUsdt') {
+    return point[key] + point.floatingPnlUsdt
+  }
+  return point[key]
 }
 
 function money(value: number) {
@@ -92,7 +99,7 @@ export function PnlChart({
               type: 'line' as const,
               data: points.map((point) => [
                 point.ts,
-                (meta.negate ? -1 : 1) * point[key],
+                (meta.negate ? -1 : 1) * portfolioSeriesValue(point, key),
               ]),
               showSymbol: false,
               sampling: 'lttb' as const,

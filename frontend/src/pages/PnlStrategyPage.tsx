@@ -37,8 +37,8 @@ const seriesOptions: Array<{
   color: string
 }> = [
   { key: 'totalPnlUsdt', label: 'Total', color: '#176b5b' },
-  { key: 'feeBeforePnlUsdt', label: 'Fee 前', color: '#2563a7' },
-  { key: 'feeAfterPnlUsdt', label: 'Fee 后', color: '#7357a3' },
+  { key: 'feeBeforePnlUsdt', label: 'Fee 前净值', color: '#2563a7' },
+  { key: 'feeAfterPnlUsdt', label: 'Fee 后净值', color: '#7357a3' },
   { key: 'floatingPnlUsdt', label: '浮动盈亏', color: '#4b6478' },
   { key: 'fundingPnlUsdt', label: 'Funding', color: '#b7791f' },
   { key: 'interestCostUsdt', label: 'Interest', color: '#c2413b' },
@@ -453,7 +453,7 @@ export function PnlStrategyPage() {
             <small>{summary ? money(summary.returnBpsOnVolume, true) : '--'} bps</small>
           </div>
           <div className="pnl-metric">
-            <span>Fee 前</span>
+            <span>已实现 Fee 前</span>
             <strong className={valueClass(summary?.feeBeforePnlUsdt ?? 0)}>
               {summary ? money(summary.feeBeforePnlUsdt, true) : '--'}
             </strong>
@@ -467,7 +467,7 @@ export function PnlStrategyPage() {
             <small>USDT</small>
           </div>
           <div className="pnl-metric">
-            <span>Fee 后</span>
+            <span>已实现 Fee 后</span>
             <strong className={valueClass(summary?.feeAfterPnlUsdt ?? 0)}>
               {summary ? money(summary.feeAfterPnlUsdt, true) : '--'}
             </strong>
@@ -858,8 +858,8 @@ export function PnlStrategyPage() {
                   <th>Symbol</th>
                   <th>Trades</th>
                   <th>Volume</th>
-                  <th>Fee 前</th>
-                  <th>Fee 后</th>
+                  <th>已实现 Fee 前</th>
+                  <th>已实现 Fee 后</th>
                   <th>Funding</th>
                   <th>Interest</th>
                   <th>Total</th>
