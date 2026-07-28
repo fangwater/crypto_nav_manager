@@ -216,6 +216,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'binance-intra-arb01',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
+                 'bitget_fr_arb02',
                  'gate_fr_arb01',
                  'gate_fr_arb02'
                )
@@ -284,6 +285,7 @@ fn account_datasets(strategy: &LiveHistoryStrategy) -> &'static [&'static str] {
         ("binance", "funding_rate") | ("gate", "funding_rate") => {
             &["funding", "interest", "liquidations"]
         }
+        ("bitget", "funding_rate") => &["funding", "interest"],
         ("binance", "intra_exchange") => &["funding"],
         ("bybit", "intra_exchange") => &["funding", "interest"],
         _ => &[],
@@ -551,6 +553,10 @@ mod tests {
         assert_eq!(
             account_datasets(&strategy("gate_fr_arb01", "gate", "funding_rate")),
             ["funding", "interest", "liquidations"]
+        );
+        assert_eq!(
+            account_datasets(&strategy("bitget_fr_arb02", "bitget", "funding_rate")),
+            ["funding", "interest"]
         );
     }
 

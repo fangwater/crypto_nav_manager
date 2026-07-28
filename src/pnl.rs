@@ -27,7 +27,7 @@ impl PnlSourceKind {
             ("intra_exchange", "binance", "usdm_futures")
             | ("intra_exchange", "bybit" | "gate", "unified") => Some(Self::Intra),
             ("funding_rate", "binance", "portfolio_margin")
-            | ("funding_rate", "bybit" | "gate", "unified") => Some(Self::FundingRate),
+            | ("funding_rate", "bybit" | "gate" | "bitget", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
             _ => None,
@@ -44,7 +44,9 @@ impl PnlSourceKind {
     fn interest_included(self, exchange: &str) -> bool {
         matches!(
             (self, exchange),
-            (Self::FundingRate, "binance") | (Self::Intra | Self::FundingRate, "bybit" | "gate")
+            (Self::FundingRate, "binance")
+                | (Self::Intra | Self::FundingRate, "bybit" | "gate")
+                | (Self::FundingRate, "bitget")
         )
     }
 
@@ -363,7 +365,7 @@ pub async fn load_inputs(
             load_binance_intra_inputs(pool, schema, mark_prices, strategy_start_ms, end_ms).await
         }
         (PnlSourceKind::FundingRate, "binance")
-        | (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate") => {
+        | (PnlSourceKind::Intra | PnlSourceKind::FundingRate, "bybit" | "gate" | "bitget") => {
             load_spot_swap_inputs(
                 pool,
                 schema,
@@ -1137,7 +1139,7 @@ fn spot_swap_position_quantity(
     commission_asset: &str,
     base_asset: &str,
 ) -> f64 {
-    if exchange == "gate"
+    if matches!(exchange, "gate" | "bitget")
         && leg == PositionLeg::Spot
         && !base_asset.is_empty()
         && commission_asset == base_asset
@@ -1159,7 +1161,7 @@ async fn load_spot_swap_inputs(
     strategy_start_ms: i64,
     end_ms: i64,
 ) -> Result<PnlInputs> {
-    if !matches!(exchange, "binance" | "bybit" | "gate") {
+    if !matches!(exchange, "binance" | "bybit" | "gate" | "bitget") {
         bail!("unsupported spot/swap PnL exchange {exchange}");
     }
     let trade_sql = format!(
@@ -1228,8 +1230,8 @@ async fn load_spot_swap_inputs(
             }
         });
         let leg = match row.market.as_str() {
-            "spot" => PositionLeg::Spot,
-            "swap" | "usdm_futures" => PositionLeg::Futures,
+            "spot" | "margin" => PositionLeg::Spot,
+            "swap" | "usdm_futures" | "usdt_futures" => PositionLeg::Futures,
             _ => bail!("unsupported {exchange} trade market {:?}", row.market),
         };
         let raw_quantity = row.quantity.abs();
@@ -1661,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_spot_base_rebate_increases_signed_position() {
+    fn spot_base_rebate_increases_signed_position() {
         assert_eq!(
             spot_swap_position_quantity(
                 "gate",
@@ -1697,6 +1699,30 @@ mod tests {
                 "BTC",
             ),
             10.0
+        );
+        assert_eq!(
+            spot_swap_position_quantity(
+                "bitget",
+                PositionLeg::Spot,
+                Side::Buy,
+                10.0,
+                -0.2,
+                "BTC",
+                "BTC",
+            ),
+            10.2
+        );
+        assert_eq!(
+            spot_swap_position_quantity(
+                "bitget",
+                PositionLeg::Spot,
+                Side::Sell,
+                10.0,
+                -0.2,
+                "BTC",
+                "BTC",
+            ),
+            9.8
         );
     }
 
@@ -1763,6 +1789,10 @@ mod tests {
             PnlSourceKind::for_strategy("funding_rate", "binance", "portfolio_margin"),
             Some(PnlSourceKind::FundingRate)
         );
+        assert_eq!(
+            PnlSourceKind::for_strategy("funding_rate", "bitget", "unified"),
+            Some(PnlSourceKind::FundingRate)
+        );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
     }
 
@@ -1777,6 +1807,7 @@ mod tests {
         assert!(PnlSourceKind::Intra.interest_included("bybit"));
         assert!(PnlSourceKind::FundingRate.interest_included("binance"));
         assert!(PnlSourceKind::FundingRate.interest_included("gate"));
+        assert!(PnlSourceKind::FundingRate.interest_included("bitget"));
         assert_eq!(PnlSourceKind::FundingRate.exposure(1_000.0, -980.0), 20.0);
     }
 
