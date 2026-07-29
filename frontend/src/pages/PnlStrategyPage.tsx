@@ -9,10 +9,18 @@ import {
   RefreshCw,
   Search,
   Settings,
+  Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { getStrategy, getStrategyPnl } from '../api'
+import {
+  clearInitialSnapshot,
+  getInitialSnapshot,
+  getStrategy,
+  getStrategyPnl,
+  getStrategySnapshots,
+  setInitialSnapshot,
+} from '../api'
 import { PnlChart } from '../components/PnlChart'
 import { PositionChart } from '../components/PositionChart'
 import type {
@@ -21,6 +29,7 @@ import type {
   PositionUnit,
   Strategy,
   StrategyPnl,
+  StrategySnapshotSummary,
   SymbolPnlSummary,
 } from '../types'
 
@@ -161,6 +170,10 @@ export function PnlStrategyPage() {
   const { slug = '' } = useParams()
   const [strategy, setStrategy] = useState<Strategy | null>(null)
   const [pnl, setPnl] = useState<StrategyPnl | null>(null)
+  const [snapshotHistory, setSnapshotHistory] = useState<StrategySnapshotSummary[]>([])
+  const [initialSnapshot, setInitialSnapshotState] = useState<StrategySnapshotSummary | null>(null)
+  const [selectedSnapshotTs, setSelectedSnapshotTs] = useState<number | null>(null)
+  const [snapshotBusy, setSnapshotBusy] = useState(false)
   const [startInput, setStartInput] = useState('')
   const [endInput, setEndInput] = useState('')
   const [startMs, setStartMs] = useState<number | null>(null)
@@ -193,14 +206,25 @@ export function PnlStrategyPage() {
   useEffect(() => {
     setStrategy(null)
     setPnl(null)
+    setSnapshotHistory([])
+    setInitialSnapshotState(null)
+    setSelectedSnapshotTs(null)
     setStrategyError(null)
-    getStrategy(slug)
-      .then((nextStrategy) => {
+    Promise.all([
+      getStrategy(slug),
+      getStrategySnapshots(slug),
+      getInitialSnapshot(slug),
+    ])
+      .then(([nextStrategy, snapshots, selectedSnapshot]) => {
         const now = Date.now()
+        const effectiveStart = selectedSnapshot?.snapshotTsMs ?? nextStrategy.stMs
         setStrategy(nextStrategy)
-        setStartInput(toDatetimeLocal(nextStrategy.stMs))
+        setSnapshotHistory(snapshots)
+        setInitialSnapshotState(selectedSnapshot)
+        setSelectedSnapshotTs(selectedSnapshot?.snapshotTsMs ?? snapshots[0]?.snapshotTsMs ?? null)
+        setStartInput(toDatetimeLocal(effectiveStart))
         setEndInput(toDatetimeLocal(now))
-        setStartMs(nextStrategy.stMs)
+        setStartMs(effectiveStart)
         setEndMs(now)
         setSelectedSymbols(null)
       })
@@ -256,6 +280,8 @@ export function PnlStrategyPage() {
       : pnl.symbols
   }, [pnl, symbolSearch])
 
+  const effectiveStartMs = initialSnapshot?.snapshotTsMs ?? strategy?.stMs ?? 0
+
   function applyRange() {
     if (!strategy) return
     const nextStart = fromDatetimeLocal(startInput)
@@ -264,7 +290,7 @@ export function PnlStrategyPage() {
       setPnlError('请选择有效时间')
       return
     }
-    if (nextStart < strategy.stMs || nextEnd < nextStart) {
+    if (nextStart < effectiveStartMs || nextEnd < nextStart) {
       setPnlError('时间范围无效')
       return
     }
@@ -277,12 +303,48 @@ export function PnlStrategyPage() {
     const nextEnd = fromDatetimeLocal(endInput) || Date.now()
     const nextStart =
       days === null
-        ? strategy.stMs
-        : Math.max(strategy.stMs, nextEnd - days * 86_400_000)
+        ? effectiveStartMs
+        : Math.max(effectiveStartMs, nextEnd - days * 86_400_000)
     setStartInput(toDatetimeLocal(nextStart))
     setEndInput(toDatetimeLocal(nextEnd))
     setStartMs(nextStart)
     setEndMs(nextEnd)
+  }
+
+  async function applyInitialSnapshot() {
+    if (!strategy || selectedSnapshotTs === null) return
+    setSnapshotBusy(true)
+    setPnlError(null)
+    try {
+      const selected = await setInitialSnapshot(strategy.slug, selectedSnapshotTs)
+      setInitialSnapshotState(selected)
+      setStartInput(toDatetimeLocal(selected.snapshotTsMs))
+      setStartMs(selected.snapshotTsMs)
+      setSelectedSymbols(null)
+      setPnl(null)
+    } catch (reason: unknown) {
+      setPnlError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setSnapshotBusy(false)
+    }
+  }
+
+  async function removeInitialSnapshot() {
+    if (!strategy) return
+    setSnapshotBusy(true)
+    setPnlError(null)
+    try {
+      await clearInitialSnapshot(strategy.slug)
+      setInitialSnapshotState(null)
+      setStartInput(toDatetimeLocal(strategy.stMs))
+      setStartMs(strategy.stMs)
+      setSelectedSymbols(null)
+      setPnl(null)
+    } catch (reason: unknown) {
+      setPnlError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setSnapshotBusy(false)
+    }
   }
 
   function toggleSymbol(symbol: string) {
@@ -401,7 +463,7 @@ export function PnlStrategyPage() {
               <input
                 type="datetime-local"
                 value={startInput}
-                min={toDatetimeLocal(strategy.stMs)}
+                min={toDatetimeLocal(effectiveStartMs)}
                 max={endInput}
                 onChange={(event) => setStartInput(event.target.value)}
               />
@@ -432,6 +494,53 @@ export function PnlStrategyPage() {
               </button>
             ))}
           </div>
+        </section>
+
+        <section className="initial-snapshot-bar" aria-label="初始快照">
+          <div className="initial-snapshot-field">
+            <Database size={16} />
+            <label htmlFor="initial-snapshot-select">初始快照</label>
+            <select
+              id="initial-snapshot-select"
+              value={selectedSnapshotTs ?? ''}
+              disabled={snapshotBusy || snapshotHistory.length === 0}
+              onChange={(event) => setSelectedSnapshotTs(Number(event.target.value))}
+            >
+              {snapshotHistory.length === 0 && <option value="">暂无快照</option>}
+              {snapshotHistory.map((snapshot) => (
+                <option key={snapshot.snapshotTsMs} value={snapshot.snapshotTsMs}>
+                  {new Date(snapshot.snapshotTsMs).toLocaleString()}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="snapshot-apply-button"
+              disabled={
+                snapshotBusy ||
+                selectedSnapshotTs === null ||
+                selectedSnapshotTs === initialSnapshot?.snapshotTsMs
+              }
+              onClick={applyInitialSnapshot}
+            >
+              设为初始
+            </button>
+            <button
+              type="button"
+              className="icon-button snapshot-clear-button"
+              disabled={snapshotBusy || initialSnapshot === null}
+              onClick={removeInitialSnapshot}
+              title="清除初始快照"
+              aria-label="清除初始快照"
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+          <span>
+            {initialSnapshot
+              ? new Date(initialSnapshot.snapshotTsMs).toLocaleString()
+              : '未启用'}
+          </span>
         </section>
 
         {pnlError && (
@@ -615,9 +724,17 @@ export function PnlStrategyPage() {
                     ? pnl.source.returnedPoints
                     : pnl.source.returnedSymbolPoints,
                 )}{' '}
-                points
+                15min ticks
               </span>
               <span>{selectedSet.size} symbols</span>
+              {pnl.source.initialSnapshotTsMs !== null && (
+                <span>
+                  snapshot {compactNumber(pnl.source.initialPositionCount)} symbols
+                </span>
+              )}
+              {pnl.source.skippedInitialPositionCount > 0 && (
+                <span>unpriced {pnl.source.skippedInitialPositionCount}</span>
+              )}
               {pnl.source.sampled && <span>sampled</span>}
             </div>
           )}

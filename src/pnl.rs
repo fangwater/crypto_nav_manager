@@ -9,6 +9,8 @@ use sqlx::{AssertSqlSafe, FromRow, PgPool};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+const PNL_TICK_INTERVAL_MS: i64 = 15 * 60 * 1_000;
+
 const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
 // Binance records Spot MM2 maker commission as zero and settles the rebate
 // through the next-hour wallet distribution.
@@ -84,7 +86,16 @@ pub struct FundingEvent {
 pub struct InterestEvent {
     pub symbol: String,
     pub cost_usdt: Option<f64>,
+    pub spot_quantity_delta: f64,
     pub ts: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct InitialPosition {
+    pub symbol: String,
+    pub spot_quantity: f64,
+    pub futures_quantity: f64,
+    pub mark_price: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -92,6 +103,7 @@ pub struct PnlInputs {
     pub trades: Vec<NormalizedTrade>,
     pub funding: Vec<FundingEvent>,
     pub interest: Vec<InterestEvent>,
+    pub initial_positions: Vec<InitialPosition>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +115,8 @@ pub struct PnlCalculation {
     pub end_ms: i64,
     pub selected_symbols: Vec<String>,
     pub max_points: usize,
+    pub initial_snapshot_ts_ms: Option<i64>,
+    pub skipped_initial_position_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -182,6 +196,9 @@ pub struct PnlSourceInfo {
     pub returned_symbol_points: usize,
     pub sampled: bool,
     pub interest_included: bool,
+    pub initial_snapshot_ts_ms: Option<i64>,
+    pub initial_position_count: usize,
+    pub skipped_initial_position_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -254,6 +271,34 @@ struct SymbolState {
 }
 
 impl SymbolState {
+    fn seed_position(&mut self, position: &InitialPosition) -> Result<()> {
+        if !position.mark_price.is_finite() || position.mark_price <= 0.0 {
+            bail!("invalid initial mark price for {}", position.symbol);
+        }
+        seed_fifo(
+            &mut self.spot_fifo,
+            position.spot_quantity,
+            position.mark_price,
+        )?;
+        seed_fifo(
+            &mut self.futures_fifo,
+            position.futures_quantity,
+            position.mark_price,
+        )?;
+        self.spot_position_qty = position.spot_quantity;
+        self.futures_position_qty = position.futures_quantity;
+        self.mark_price = Some(position.mark_price);
+        self.spot_snapshot = Some(
+            self.spot_fifo
+                .snapshot(position.mark_price, position.mark_price)?,
+        );
+        self.futures_snapshot = Some(
+            self.futures_fifo
+                .snapshot(position.mark_price, position.mark_price)?,
+        );
+        Ok(())
+    }
+
     fn apply_trade(&mut self, trade: &NormalizedTrade) -> Result<()> {
         let fee = trade.fee_usdt.unwrap_or_else(|| {
             self.unconverted_fee_count += 1;
@@ -315,6 +360,23 @@ impl SymbolState {
             unconverted_interest_count: self.unconverted_interest_count,
         }
     }
+}
+
+fn seed_fifo(fifo: &mut FifoPnl, quantity: f64, mark_price: f64) -> Result<()> {
+    if !quantity.is_finite() {
+        bail!("initial quantity must be finite");
+    }
+    if quantity.abs() <= f64::EPSILON {
+        return Ok(());
+    }
+    let side = if quantity > 0.0 {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    fifo.apply_fill(side, mark_price, quantity.abs() * mark_price, 0.0)
+        .context("seed venue FIFO from initial snapshot")?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -394,7 +456,11 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
     let loaded_trade_rows = inputs.trades.len();
     let loaded_funding_rows = inputs.funding.len();
     let loaded_interest_rows = inputs.interest.len();
+    let initial_position_count = inputs.initial_positions.len();
     let mut available = BTreeSet::new();
+    for position in &inputs.initial_positions {
+        available.insert(position.symbol.clone());
+    }
     for trade in &inputs.trades {
         available.insert(trade.symbol.clone());
     }
@@ -442,6 +508,13 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
         .cloned()
         .map(|symbol| (symbol, SymbolState::default()))
         .collect::<HashMap<_, _>>();
+
+    for position in &inputs.initial_positions {
+        states
+            .get_mut(&position.symbol)
+            .context("initial position symbol is missing from state map")?
+            .seed_position(position)?;
+    }
 
     let split = events.partition_point(|event| event.ts() < request.start_ms);
     for event in &events[..split] {
@@ -550,6 +623,12 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
         .last()
         .map(|point| point.exposure_usdt)
         .unwrap_or_default();
+    let points = resample_fixed_interval(
+        points,
+        request.start_ms,
+        request.end_ms,
+        PNL_TICK_INTERVAL_MS,
+    );
     let original_points = points.len();
     let points = downsample_extrema(points, request.max_points.max(2));
     let returned_points = points.len();
@@ -560,7 +639,12 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
     let symbol_points = selected_symbols
         .iter()
         .map(|symbol| {
-            let original = points_by_symbol.remove(symbol).unwrap_or_default();
+            let original = resample_fixed_interval(
+                points_by_symbol.remove(symbol).unwrap_or_default(),
+                request.start_ms,
+                request.end_ms,
+                PNL_TICK_INTERVAL_MS,
+            );
             let original_len = original.len();
             let points = downsample_extrema(original, symbol_max_points);
             sampled_symbol_points |= points.len() < original_len;
@@ -591,6 +675,9 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
             returned_symbol_points,
             sampled: returned_points < original_points || sampled_symbol_points,
             interest_included: request.source.interest_included(&request.exchange),
+            initial_snapshot_ts_ms: request.initial_snapshot_ts_ms,
+            initial_position_count,
+            skipped_initial_position_count: request.skipped_initial_position_count,
         },
     })
 }
@@ -606,6 +693,7 @@ fn apply_event(states: &mut HashMap<String, SymbolState>, event: &PnlEvent) -> R
             Ok(())
         }
         PnlEvent::Interest(interest) => {
+            state.spot_position_qty += interest.spot_quantity_delta;
             if let Some(cost) = interest.cost_usdt {
                 state.interest_cost_usdt += cost;
             } else {
@@ -728,6 +816,49 @@ fn push_or_replace_point(points: &mut Vec<PnlPoint>, point: PnlPoint) {
         return;
     }
     points.push(point);
+}
+
+fn resample_fixed_interval(
+    points: Vec<PnlPoint>,
+    start_ms: i64,
+    end_ms: i64,
+    interval_ms: i64,
+) -> Vec<PnlPoint> {
+    if points.is_empty() || interval_ms <= 0 || end_ms < start_ms {
+        return points;
+    }
+
+    let mut sampled = Vec::with_capacity(
+        usize::try_from((end_ms - start_ms) / interval_ms + 2).unwrap_or(points.len()),
+    );
+    let mut source_index = 0;
+    let mut current = points[0];
+    let mut push_at = |ts: i64, sampled: &mut Vec<PnlPoint>| {
+        while source_index + 1 < points.len() && points[source_index + 1].ts <= ts {
+            source_index += 1;
+            current = points[source_index];
+        }
+        current.ts = ts;
+        sampled.push(current);
+    };
+
+    push_at(start_ms, &mut sampled);
+    let mut tick_ms = start_ms
+        .div_euclid(interval_ms)
+        .saturating_add(1)
+        .saturating_mul(interval_ms);
+    while tick_ms < end_ms {
+        push_at(tick_ms, &mut sampled);
+        let next_tick_ms = tick_ms.saturating_add(interval_ms);
+        if next_tick_ms == tick_ms {
+            break;
+        }
+        tick_ms = next_tick_ms;
+    }
+    if end_ms > start_ms {
+        push_at(end_ms, &mut sampled);
+    }
+    sampled
 }
 
 fn downsample_extrema(points: Vec<PnlPoint>, max_points: usize) -> Vec<PnlPoint> {
@@ -953,6 +1084,7 @@ async fn load_binance_intra_inputs(
         trades,
         funding,
         interest: Vec::new(),
+        initial_positions: Vec::new(),
     })
 }
 
@@ -1083,6 +1215,7 @@ async fn load_market_making_inputs(
         trades,
         funding,
         interest: Vec::new(),
+        initial_positions: Vec::new(),
     })
 }
 
@@ -1139,7 +1272,7 @@ fn spot_swap_position_quantity(
     commission_asset: &str,
     base_asset: &str,
 ) -> f64 {
-    if matches!(exchange, "gate" | "bitget")
+    if matches!(exchange, "gate" | "bitget" | "bybit")
         && leg == PositionLeg::Spot
         && !base_asset.is_empty()
         && commission_asset == base_asset
@@ -1313,6 +1446,13 @@ async fn load_spot_swap_inputs(
             InterestEvent {
                 symbol,
                 cost_usdt,
+                spot_quantity_delta: if exchange == "bybit"
+                    && !STABLECOINS.contains(&currency.as_str())
+                {
+                    row.interest
+                } else {
+                    0.0
+                },
                 ts: row.ts,
             }
         })
@@ -1322,6 +1462,7 @@ async fn load_spot_swap_inputs(
         trades,
         funding,
         interest,
+        initial_positions: Vec::new(),
     })
 }
 
@@ -1385,7 +1526,44 @@ mod tests {
             end_ms,
             selected_symbols: Vec::new(),
             max_points: 1_000,
+            initial_snapshot_ts_ms: None,
+            skipped_initial_position_count: 0,
         }
+    }
+
+    #[test]
+    fn resamples_pnl_to_fifteen_minute_ticks() {
+        let points = vec![
+            PnlPoint {
+                ts: 100_000,
+                total_pnl_usdt: 1.0,
+                ..PnlPoint::default()
+            },
+            PnlPoint {
+                ts: 950_000,
+                total_pnl_usdt: 2.0,
+                ..PnlPoint::default()
+            },
+            PnlPoint {
+                ts: 1_810_000,
+                total_pnl_usdt: 3.0,
+                ..PnlPoint::default()
+            },
+        ];
+
+        let sampled = resample_fixed_interval(points, 100_000, 1_810_000, 900_000);
+
+        assert_eq!(
+            sampled.iter().map(|point| point.ts).collect::<Vec<_>>(),
+            vec![100_000, 900_000, 1_800_000, 1_810_000]
+        );
+        assert_eq!(
+            sampled
+                .iter()
+                .map(|point| point.total_pnl_usdt)
+                .collect::<Vec<_>>(),
+            vec![1.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
@@ -1467,8 +1645,10 @@ mod tests {
             interest: vec![InterestEvent {
                 symbol: "BTCUSDT".to_string(),
                 cost_usdt: Some(2.0),
+                spot_quantity_delta: 0.0,
                 ts: 1_350,
             }],
+            initial_positions: Vec::new(),
         };
 
         let response = calculate(inputs, request(1_000, 1_400)).unwrap();
@@ -1499,6 +1679,89 @@ mod tests {
             response.source.returned_symbol_points,
             symbol_series.points.len()
         );
+    }
+
+    #[test]
+    fn initial_snapshot_seeds_independent_venue_fifos_without_initial_pnl() {
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    110.0,
+                    110.0,
+                    1.0,
+                    0.0,
+                    1_100,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Futures,
+                    Side::Buy,
+                    90.0,
+                    90.0,
+                    1.0,
+                    0.0,
+                    1_150,
+                ),
+            ],
+            initial_positions: vec![InitialPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot_quantity: 10.0,
+                futures_quantity: -10.0,
+                mark_price: 100.0,
+            }],
+            ..PnlInputs::default()
+        };
+        let mut calculation = request(1_000, 1_200);
+        calculation.initial_snapshot_ts_ms = Some(1_000);
+
+        let response = calculate(inputs, calculation).unwrap();
+        let initial = response.points.first().unwrap();
+        let final_point = response.points.last().unwrap();
+
+        assert_eq!(initial.total_pnl_usdt, 0.0);
+        assert_eq!(initial.spot_position_qty, 10.0);
+        assert_eq!(initial.futures_position_qty, -10.0);
+        assert!((response.summary.fee_before_pnl_usdt - 20.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 22.0).abs() < 1e-9);
+        assert_eq!(final_point.spot_position_qty, 9.0);
+        assert_eq!(final_point.futures_position_qty, -9.0);
+        assert_eq!(final_point.exposure_qty, 0.0);
+        assert_eq!(response.source.initial_snapshot_ts_ms, Some(1_000));
+        assert_eq!(response.source.initial_position_count, 1);
+    }
+
+    #[test]
+    fn bybit_base_interest_reduces_spot_quantity_without_double_counting_pnl() {
+        let inputs = PnlInputs {
+            trades: vec![trade(
+                "BTCUSDT",
+                PositionLeg::Spot,
+                Side::Buy,
+                100.0,
+                1_000.0,
+                10.0,
+                0.0,
+                1_100,
+            )],
+            interest: vec![InterestEvent {
+                symbol: "BTCUSDT".to_string(),
+                cost_usdt: Some(100.0),
+                spot_quantity_delta: -1.0,
+                ts: 1_200,
+            }],
+            ..PnlInputs::default()
+        };
+
+        let response = calculate(inputs, request(1_000, 1_300)).unwrap();
+        let final_point = response.points.last().unwrap();
+
+        assert_eq!(final_point.spot_position_qty, 9.0);
+        assert_eq!(final_point.spot_position_usdt, 900.0);
+        assert_eq!(response.summary.interest_cost_usdt, 100.0);
+        assert_eq!(response.summary.total_pnl_usdt, -100.0);
     }
 
     #[test]
@@ -1723,6 +1986,18 @@ mod tests {
                 "BTC",
             ),
             9.8
+        );
+        assert_eq!(
+            spot_swap_position_quantity(
+                "bybit",
+                PositionLeg::Spot,
+                Side::Buy,
+                10.0,
+                -0.2,
+                "BTC",
+                "BTC",
+            ),
+            10.2
         );
     }
 

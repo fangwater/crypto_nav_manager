@@ -17,6 +17,44 @@ export interface Strategy {
   missingKeys: string[]
 }
 
+export interface StrategySnapshotSummary {
+  strategySlug: string
+  snapshotTsMs: number
+  fetchedAtMs: number
+  sourceUrl: string
+}
+
+export interface AccountRisk {
+  strategySlug: string
+  exchange: Strategy['exchange']
+  connected: boolean
+  status: 'live' | 'stale' | 'waiting' | 'unavailable'
+  riskLevel: 'free_trade' | 'warning' | 'reduce_only' | 'liquidation' | null
+  scope: string | null
+  sourceTsMs: number | null
+  receivedAtMs: number | null
+  uniMmr: number | null
+  adjustedEquityUsd: number | null
+  actualEquityUsd: number | null
+  maintenanceMarginUsd: number | null
+  initialMarginUsd: number | null
+  borrowedUsd: number | null
+  notionalUsd: number | null
+}
+
+export interface HistorySyncDataset {
+  dataset: string
+  successEndMs: number | null
+  fetchedAtMs: number | null
+}
+
+export interface HistorySyncStatus {
+  strategySlug: string
+  scheduled: boolean
+  lastFetchedAtMs: number | null
+  datasets: HistorySyncDataset[]
+}
+
 export interface TradingFeeRate {
   market: string
   instrument: string
@@ -89,6 +127,9 @@ export interface PnlSourceInfo {
   returnedSymbolPoints: number
   sampled: boolean
   interestIncluded: boolean
+  initialSnapshotTsMs: number | null
+  initialPositionCount: number
+  skippedInitialPositionCount: number
 }
 
 export interface StrategyPnl {

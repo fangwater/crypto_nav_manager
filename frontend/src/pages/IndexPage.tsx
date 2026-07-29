@@ -3,13 +3,19 @@ import {
   ArrowRight,
   CheckCircle2,
   CircleAlert,
+  Clock3,
   Database,
   Percent,
+  ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getStrategies } from '../api'
-import type { Strategy } from '../types'
+import {
+  getAccountRisks,
+  getHistorySyncStatuses,
+  getStrategies,
+} from '../api'
+import type { AccountRisk, HistorySyncStatus, Strategy } from '../types'
 
 type Filter = 'all' | 'funding_rate' | 'intra_exchange' | 'market_making'
 
@@ -19,6 +25,16 @@ const filters: Array<{ value: Filter; label: string }> = [
   { value: 'intra_exchange', label: '所内套利' },
   { value: 'market_making', label: '做市' },
 ]
+
+const SYNC_INTERVAL_MS = 15 * 60 * 1_000
+const syncTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+})
 
 function modeLabel(mode: string) {
   switch (mode) {
@@ -39,8 +55,98 @@ function kindLabel(kind: Strategy['strategyKind']) {
   return '所内套利'
 }
 
+function usesUniMmr(strategy: Strategy) {
+  return (
+    strategy.strategyKind !== 'market_making' &&
+    strategy.accountMode !== 'usdm_futures'
+  )
+}
+
+function exchangeMark(exchange: Strategy['exchange']) {
+  switch (exchange) {
+    case 'binance':
+      return 'B'
+    case 'bybit':
+      return 'Y'
+    case 'gate':
+      return 'G'
+    case 'bitget':
+      return 'BG'
+    case 'okx':
+      return 'O'
+  }
+}
+
+function formatUniMmr(risk: AccountRisk | undefined) {
+  if (!risk) return '--'
+  if (risk.maintenanceMarginUsd !== null && risk.maintenanceMarginUsd <= 0) {
+    return '∞'
+  }
+  if (risk.uniMmr === null) return '--'
+  if (risk.uniMmr >= 100) return risk.uniMmr.toFixed(1)
+  return risk.uniMmr.toFixed(2)
+}
+
+function riskStatusLabel(risk: AccountRisk | undefined, host: string) {
+  if (!risk) return host === 'local' ? '未配置 IPC' : '远端未接入'
+  if (risk.status === 'unavailable') return 'Monitor 未连接'
+  if (risk.status === 'waiting') return '等待风险快照'
+  if (risk.status === 'stale') return '数据延迟'
+  if (risk.maintenanceMarginUsd !== null && risk.maintenanceMarginUsd <= 0) {
+    return '无保证金占用'
+  }
+  return '实时'
+}
+
+function syncIsHealthy(status: HistorySyncStatus | undefined, nowMs: number) {
+  return (
+    status?.scheduled === true &&
+    status.lastFetchedAtMs !== null &&
+    nowMs - status.lastFetchedAtMs < SYNC_INTERVAL_MS
+  )
+}
+
+function syncTone(status: HistorySyncStatus | undefined, nowMs: number) {
+  if (!status) return 'loading'
+  if (!status.scheduled) return 'disabled'
+  if (status.lastFetchedAtMs === null) return 'waiting'
+  return syncIsHealthy(status, nowMs) ? 'healthy' : 'stale'
+}
+
+function syncStatusLabel(status: HistorySyncStatus | undefined, nowMs: number) {
+  if (!status) return '读取中'
+  if (!status.scheduled) return '未启用'
+  if (status.lastFetchedAtMs === null) return '尚未成功'
+  if (syncIsHealthy(status, nowMs)) return '正常'
+  const ageMinutes = Math.floor((nowMs - status.lastFetchedAtMs) / 60_000)
+  return `延迟 ${Math.max(0, ageMinutes)}m`
+}
+
+function syncTime(status: HistorySyncStatus | undefined) {
+  if (!status?.scheduled) return '--'
+  if (status.lastFetchedAtMs === null) return '无成功记录'
+  return syncTimeFormatter.format(status.lastFetchedAtMs)
+}
+
+function syncStatusTitle(status: HistorySyncStatus | undefined) {
+  if (!status) return '正在读取拉取状态'
+  if (!status.scheduled) return '该策略未纳入 15 分钟定时拉取'
+  return status.datasets
+    .map((dataset) => {
+      const time =
+        dataset.fetchedAtMs === null
+          ? '无成功记录'
+          : syncTimeFormatter.format(dataset.fetchedAtMs)
+      return `${dataset.dataset}: ${time}`
+    })
+    .join('\n')
+}
+
 export function IndexPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([])
+  const [accountRisks, setAccountRisks] = useState<AccountRisk[]>([])
+  const [syncStatuses, setSyncStatuses] = useState<HistorySyncStatus[]>([])
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [filter, setFilter] = useState<Filter>('all')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -54,6 +160,37 @@ export function IndexPage() {
       .finally(() => setLoading(false))
   }, [])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => {
+      getAccountRisks(controller.signal)
+        .then(setAccountRisks)
+        .catch(() => undefined)
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 3_000)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => {
+      setNowMs(Date.now())
+      getHistorySyncStatuses(controller.signal)
+        .then(setSyncStatuses)
+        .catch(() => undefined)
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 30_000)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [])
+
   const visibleStrategies = useMemo(
     () =>
       filter === 'all'
@@ -64,11 +201,20 @@ export function IndexPage() {
   const readyCount = strategies.filter(
     (strategy) => strategy.credentialsReady,
   ).length
-  const binanceCount = strategies.filter(
-    (strategy) => strategy.exchange === 'binance',
+  const risksBySlug = useMemo(
+    () => new Map(accountRisks.map((risk) => [risk.strategySlug, risk])),
+    [accountRisks],
+  )
+  const syncBySlug = useMemo(
+    () => new Map(syncStatuses.map((status) => [status.strategySlug, status])),
+    [syncStatuses],
+  )
+  const connectedRiskCount = accountRisks.filter(
+    (risk) => risk.connected,
   ).length
-  const gateCount = strategies.filter(
-    (strategy) => strategy.exchange === 'gate',
+  const scheduledSyncs = syncStatuses.filter((status) => status.scheduled)
+  const healthySyncCount = scheduledSyncs.filter((status) =>
+    syncIsHealthy(status, nowMs),
   ).length
 
   return (
@@ -133,13 +279,18 @@ export function IndexPage() {
                 <strong>{readyCount}</strong>
               </div>
             </div>
-            <div className="summary-item summary-item--venues">
-              <span className="venue-count venue-count--binance">B</span>
+            <div className="summary-item">
+              <ShieldCheck size={17} />
               <div>
-                <span>Binance / Gate</span>
-                <strong>
-                  {binanceCount} / {gateCount}
-                </strong>
+                <span>UniMMR IPC</span>
+                <strong>{connectedRiskCount} / {accountRisks.length}</strong>
+              </div>
+            </div>
+            <div className="summary-item">
+              <Clock3 size={17} />
+              <div>
+                <span>15min 拉取正常</span>
+                <strong>{healthySyncCount} / {scheduledSyncs.length}</strong>
               </div>
             </div>
           </div>
@@ -168,52 +319,84 @@ export function IndexPage() {
 
         {!loading && !error && (
           <div className="strategy-grid">
-            {visibleStrategies.map((strategy) => (
-              <Link
-                className={
-                  'strategy-card strategy-card--' + strategy.exchange
-                }
-                to={'/strategies/' + strategy.slug}
-                key={strategy.slug}
-              >
-                <div className="strategy-card__top">
-                  <span className="exchange-mark" aria-hidden="true">
-                    {strategy.exchange === 'binance' ? 'B' : 'G'}
-                  </span>
-                  <span
-                    className={
-                      strategy.credentialsReady
-                        ? 'credential-state credential-state--ready'
-                        : 'credential-state credential-state--warning'
-                    }
-                  >
-                    <span className="status-dot" />
-                    {strategy.credentialsReady ? '凭证就绪' : '检查 env'}
-                  </span>
-                </div>
-                <div className="strategy-card__body">
-                  <span className="strategy-kind">
-                    {kindLabel(strategy.strategyKind)}
-                  </span>
-                  <h3>{strategy.displayName}</h3>
-                  <p>{modeLabel(strategy.accountMode)}</p>
-                </div>
-                <div className="strategy-card__footer">
-                  <code title={strategy.envPath}>{strategy.envPath}</code>
-                  <span
-                    className="icon-button"
-                    title="进入盘子"
-                    aria-label="进入盘子"
-                  >
-                    <ArrowRight size={17} />
-                  </span>
-                </div>
-              </Link>
-            ))}
+            {visibleStrategies.map((strategy) => {
+              const risk = risksBySlug.get(strategy.slug)
+              const syncStatus = syncBySlug.get(strategy.slug)
+              const riskTone =
+                risk?.status === 'live'
+                  ? (risk.riskLevel ?? 'live')
+                  : (risk?.status ?? 'missing')
+              return (
+                <Link
+                  className={
+                    'strategy-card strategy-card--' + strategy.exchange
+                  }
+                  to={'/strategies/' + strategy.slug}
+                  key={strategy.slug}
+                >
+                  <div className="strategy-card__top">
+                    <span className="exchange-mark" aria-hidden="true">
+                      {exchangeMark(strategy.exchange)}
+                    </span>
+                    <span
+                      className={
+                        strategy.credentialsReady
+                          ? 'credential-state credential-state--ready'
+                          : 'credential-state credential-state--warning'
+                      }
+                    >
+                      <span className="status-dot" />
+                      {strategy.credentialsReady ? '凭证就绪' : '检查 env'}
+                    </span>
+                  </div>
+                  <div className="strategy-card__body">
+                    <span className="strategy-kind">
+                      {kindLabel(strategy.strategyKind)}
+                    </span>
+                    <h3>{strategy.displayName}</h3>
+                    <p>{modeLabel(strategy.accountMode)}</p>
+                    {usesUniMmr(strategy) && (
+                      <div className={'account-risk account-risk--' + riskTone}>
+                        <div>
+                          <span>UniMMR</span>
+                          <strong>{formatUniMmr(risk)}</strong>
+                        </div>
+                        <small>{riskStatusLabel(risk, strategy.host)}</small>
+                      </div>
+                    )}
+                    <div
+                      className={
+                        'history-sync history-sync--' +
+                        syncTone(syncStatus, nowMs)
+                      }
+                      title={syncStatusTitle(syncStatus)}
+                    >
+                      <div>
+                        <span>最近完整拉取</span>
+                        <strong>{syncTime(syncStatus)}</strong>
+                      </div>
+                      <small>
+                        <span className="status-dot" />
+                        {syncStatusLabel(syncStatus, nowMs)}
+                      </small>
+                    </div>
+                  </div>
+                  <div className="strategy-card__footer">
+                    <code title={strategy.envPath}>{strategy.envPath}</code>
+                    <span
+                      className="icon-button"
+                      title="进入盘子"
+                      aria-label="进入盘子"
+                    >
+                      <ArrowRight size={17} />
+                    </span>
+                  </div>
+                </Link>
+              )
+            })}
           </div>
         )}
       </main>
     </>
   )
 }
-

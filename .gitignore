@@ -1,7 +1,6 @@
 /target
 /funding_*.csv
-/data/*.db*
-/data/*.sqlite*
+/data/
 __pycache__/
 *.py[cod]
 *.orig

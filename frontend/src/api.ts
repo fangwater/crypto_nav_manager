@@ -1,4 +1,11 @@
-import type { AccountFeeRates, Strategy, StrategyPnl } from './types'
+import type {
+  AccountFeeRates,
+  AccountRisk,
+  HistorySyncStatus,
+  Strategy,
+  StrategyPnl,
+  StrategySnapshotSummary,
+} from './types'
 
 const API_BASE = '/nav-api'
 
@@ -22,8 +29,74 @@ export function getStrategies(): Promise<Strategy[]> {
   return getJson<Strategy[]>('/strategies')
 }
 
+export function getAccountRisks(signal?: AbortSignal): Promise<AccountRisk[]> {
+  return getJson<AccountRisk[]>('/account-risks', signal)
+}
+
+export function getHistorySyncStatuses(
+  signal?: AbortSignal,
+): Promise<HistorySyncStatus[]> {
+  return getJson<HistorySyncStatus[]>('/history-sync-status', signal)
+}
+
 export function getStrategy(slug: string): Promise<Strategy> {
   return getJson<Strategy>('/strategies/' + encodeURIComponent(slug))
+}
+
+export function getStrategySnapshots(
+  slug: string,
+): Promise<StrategySnapshotSummary[]> {
+  return getJson<StrategySnapshotSummary[]>(
+    '/snapshots/' + encodeURIComponent(slug) + '/history',
+  )
+}
+
+export function getInitialSnapshot(
+  slug: string,
+): Promise<StrategySnapshotSummary | null> {
+  return getJson<StrategySnapshotSummary | null>(
+    '/strategies/' + encodeURIComponent(slug) + '/initial-snapshot',
+  )
+}
+
+export async function setInitialSnapshot(
+  slug: string,
+  snapshotTsMs: number,
+): Promise<StrategySnapshotSummary> {
+  const response = await fetch(
+    API_BASE + '/strategies/' + encodeURIComponent(slug) + '/initial-snapshot',
+    {
+      method: 'PUT',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ snapshotTsMs }),
+    },
+  )
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { error?: string }
+      | null
+    throw new Error(payload?.error ?? 'HTTP ' + response.status)
+  }
+  return response.json() as Promise<StrategySnapshotSummary>
+}
+
+export async function clearInitialSnapshot(slug: string): Promise<void> {
+  const response = await fetch(
+    API_BASE + '/strategies/' + encodeURIComponent(slug) + '/initial-snapshot',
+    {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+    },
+  )
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { error?: string }
+      | null
+    throw new Error(payload?.error ?? 'HTTP ' + response.status)
+  }
 }
 
 export function getFeeRates(signal?: AbortSignal): Promise<AccountFeeRates[]> {

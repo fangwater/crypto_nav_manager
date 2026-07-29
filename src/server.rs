@@ -1,10 +1,11 @@
 use crate::{
+    account_risk::{AccountRiskCache, AccountRiskFeed, AccountRiskSnapshot},
     contract_multipliers, live_history,
     mark_prices::MarkPriceCache,
-    pnl::{self, PnlCalculation, PnlSourceKind},
+    pnl::{self, InitialPosition, PnlCalculation, PnlSourceKind},
     strategy_env::read_env_file,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
@@ -42,9 +43,17 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
+    account_risks: AccountRiskCache,
     mark_prices: MarkPriceCache,
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
     snapshot_sync: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, FromRow)]
+struct AccountRiskFeedRecord {
+    slug: String,
+    exchange: String,
+    sort_order: i32,
 }
 
 #[derive(Debug, FromRow)]
@@ -128,6 +137,26 @@ struct SnapshotResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SnapshotSummaryResponse {
+    strategy_slug: String,
+    snapshot_ts_ms: i64,
+    fetched_at_ms: i64,
+    source_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetInitialSnapshotRequest {
+    snapshot_ts_ms: i64,
+}
+
+struct ParsedInitialPositions {
+    positions: Vec<InitialPosition>,
+    skipped_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SnapshotSyncResult {
     strategy_slug: String,
     stored: bool,
@@ -142,6 +171,39 @@ struct SnapshotSyncResponse {
     stored: usize,
     failed: usize,
     results: Vec<SnapshotSyncResult>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct HistorySyncStrategyRecord {
+    slug: String,
+    host: String,
+    exchange: String,
+    strategy_kind: String,
+}
+
+#[derive(Debug, FromRow)]
+struct HistorySyncWatermarkRecord {
+    strategy_slug: String,
+    dataset: String,
+    success_end_ms: i64,
+    fetched_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistorySyncDatasetResponse {
+    dataset: &'static str,
+    success_end_ms: Option<i64>,
+    fetched_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistorySyncStatusResponse {
+    strategy_slug: String,
+    scheduled: bool,
+    last_fetched_at_ms: Option<i64>,
+    datasets: Vec<HistorySyncDatasetResponse>,
 }
 
 #[derive(Debug, FromRow)]
@@ -245,6 +307,22 @@ pub async fn run() -> Result<()> {
         .run(&pool)
         .await
         .context("run PostgreSQL migrations")?;
+    let account_risk_feeds = sqlx::query_as::<_, AccountRiskFeedRecord>(
+        r#"SELECT slug,exchange,sort_order
+           FROM strategy_envs
+           WHERE enabled
+             AND host = 'local'
+             AND account_mode IN ('portfolio_margin','unified')
+             AND strategy_kind <> 'market_making'
+           ORDER BY sort_order,slug"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .context("load local account risk feeds")?
+    .into_iter()
+    .filter_map(|row| AccountRiskFeed::new(row.slug, row.exchange, row.sort_order))
+    .collect();
+    let account_risks = AccountRiskCache::start(account_risk_feeds);
     contract_multipliers::spawn(pool.clone());
     live_history::spawn(pool.clone())?;
     let mark_prices = MarkPriceCache::start().await;
@@ -252,16 +330,29 @@ pub async fn run() -> Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
+        .route("/api/account-risks", get(list_account_risks))
+        .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
         .route("/api/snapshots", get(list_latest_snapshots))
         .route("/api/snapshots/sync", post(sync_snapshots))
+        .route(
+            "/api/snapshots/{slug}/history",
+            get(list_strategy_snapshots),
+        )
         .route("/api/snapshots/{slug}", get(get_latest_snapshot))
         .route("/api/strategies/{slug}", get(get_strategy))
+        .route(
+            "/api/strategies/{slug}/initial-snapshot",
+            get(get_initial_snapshot)
+                .put(set_initial_snapshot)
+                .delete(clear_initial_snapshot),
+        )
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
         .with_state(AppState {
             pool,
+            account_risks,
             mark_prices,
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
             snapshot_sync: Arc::new(Mutex::new(())),
@@ -278,6 +369,119 @@ pub async fn run() -> Result<()> {
         .await
         .context("serve HTTP")?;
     Ok(())
+}
+
+async fn list_account_risks(State(state): State<AppState>) -> Json<Vec<AccountRiskSnapshot>> {
+    Json(state.account_risks.snapshots())
+}
+
+async fn list_history_sync_status(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<HistorySyncStatusResponse>>, ApiError> {
+    let strategies = sqlx::query_as::<_, HistorySyncStrategyRecord>(
+        r#"SELECT slug,host,exchange,strategy_kind
+           FROM strategy_envs
+           WHERE enabled
+           ORDER BY sort_order,slug"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let watermarks = sqlx::query_as::<_, HistorySyncWatermarkRecord>(
+        r#"SELECT strategy_slug,dataset,success_end_ms,
+                  (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS fetched_at_ms
+           FROM history_sync_watermarks"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut watermarks_by_strategy: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
+    for watermark in watermarks {
+        watermarks_by_strategy
+            .entry(watermark.strategy_slug)
+            .or_default()
+            .insert(
+                watermark.dataset,
+                (watermark.success_end_ms, watermark.fetched_at_ms),
+            );
+    }
+
+    Ok(Json(
+        strategies
+            .into_iter()
+            .map(|strategy| {
+                let expected = expected_history_datasets(
+                    &strategy.slug,
+                    &strategy.host,
+                    &strategy.exchange,
+                    &strategy.strategy_kind,
+                );
+                let watermarks = watermarks_by_strategy.get(&strategy.slug);
+                let datasets = expected
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|dataset| {
+                        let watermark = watermarks.and_then(|items| items.get(*dataset));
+                        HistorySyncDatasetResponse {
+                            dataset,
+                            success_end_ms: watermark.map(|value| value.0),
+                            fetched_at_ms: watermark.map(|value| value.1),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let last_fetched_at_ms = (!datasets.is_empty()
+                    && datasets
+                        .iter()
+                        .all(|dataset| dataset.fetched_at_ms.is_some()))
+                .then(|| {
+                    datasets
+                        .iter()
+                        .filter_map(|dataset| dataset.fetched_at_ms)
+                        .min()
+                        .expect("non-empty complete history sync datasets")
+                });
+                HistorySyncStatusResponse {
+                    strategy_slug: strategy.slug,
+                    scheduled: expected.is_some(),
+                    last_fetched_at_ms,
+                    datasets,
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn expected_history_datasets(
+    slug: &str,
+    host: &str,
+    exchange: &str,
+    strategy_kind: &str,
+) -> Option<&'static [&'static str]> {
+    const BINANCE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
+    const GATE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
+    const BITGET_FR: &[&str] = &["trades", "funding", "interest"];
+    const BINANCE_INTRA: &[&str] = &["trades", "funding"];
+    const BYBIT_INTRA: &[&str] = &["trades", "funding", "interest"];
+
+    let scheduled = (host == "local" && exchange == "binance" && strategy_kind == "funding_rate")
+        || matches!(
+            slug,
+            "binance-intra-arb01"
+                | "bybit-intra-arb01"
+                | "bybit-intra-arb02"
+                | "bitget_fr_arb02"
+                | "gate_fr_arb01"
+                | "gate_fr_arb02"
+        );
+    if !scheduled {
+        return None;
+    }
+    match (exchange, strategy_kind) {
+        ("binance", "funding_rate") => Some(BINANCE_FR),
+        ("gate", "funding_rate") => Some(GATE_FR),
+        ("bitget", "funding_rate") => Some(BITGET_FR),
+        ("binance", "intra_exchange") => Some(BINANCE_INTRA),
+        ("bybit", "intra_exchange") => Some(BYBIT_INTRA),
+        _ => None,
+    }
 }
 
 async fn sync_snapshots(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -433,6 +637,110 @@ async fn get_latest_snapshot(
     })
 }
 
+async fn list_strategy_snapshots(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Vec<SnapshotSummaryResponse>>, ApiError> {
+    let rows = sqlx::query_as::<_, SnapshotRecord>(
+        r#"SELECT strategy_slug,snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  source_url,payload
+           FROM strategy_snapshots
+           WHERE strategy_slug=$1
+           ORDER BY snapshot_ts_ms DESC"#,
+    )
+    .bind(slug)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter().map(snapshot_summary_response).collect(),
+    ))
+}
+
+async fn get_initial_snapshot(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Option<SnapshotSummaryResponse>>, ApiError> {
+    let row = load_initial_snapshot(&state.pool, &slug).await?;
+    Ok(Json(row.map(snapshot_summary_response)))
+}
+
+async fn set_initial_snapshot(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<SetInitialSnapshotRequest>,
+) -> Result<Response, ApiError> {
+    let strategy_start_ms =
+        sqlx::query_scalar::<_, i64>("SELECT st_ms FROM strategy_envs WHERE enabled AND slug=$1")
+            .bind(&slug)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some(strategy_start_ms) = strategy_start_ms else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "strategy not found",
+            }),
+        )
+            .into_response());
+    };
+    if request.snapshot_ts_ms < strategy_start_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "initial snapshot must not be earlier than strategy stMs",
+            }),
+        )
+            .into_response());
+    }
+
+    let snapshot = load_snapshot(&state.pool, &slug, request.snapshot_ts_ms).await?;
+    let Some(snapshot) = snapshot else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "snapshot not found",
+            }),
+        )
+            .into_response());
+    };
+    let parsed = parse_initial_positions(&snapshot.payload)?;
+    if parsed.positions.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: "snapshot does not contain priced spot/swap positions",
+            }),
+        )
+            .into_response());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO strategy_initial_snapshots
+              (strategy_slug,snapshot_ts_ms,selected_at)
+           VALUES ($1,$2,CURRENT_TIMESTAMP)
+           ON CONFLICT (strategy_slug) DO UPDATE SET
+              snapshot_ts_ms=EXCLUDED.snapshot_ts_ms,
+              selected_at=CURRENT_TIMESTAMP"#,
+    )
+    .bind(&slug)
+    .bind(request.snapshot_ts_ms)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(snapshot_summary_response(snapshot)).into_response())
+}
+
+async fn clear_initial_snapshot(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    sqlx::query("DELETE FROM strategy_initial_snapshots WHERE strategy_slug=$1")
+        .bind(slug)
+        .execute(&state.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn snapshot_response(row: SnapshotRecord) -> SnapshotResponse {
     SnapshotResponse {
         strategy_slug: row.strategy_slug,
@@ -441,6 +749,117 @@ fn snapshot_response(row: SnapshotRecord) -> SnapshotResponse {
         source_url: row.source_url,
         payload: row.payload,
     }
+}
+
+fn snapshot_summary_response(row: SnapshotRecord) -> SnapshotSummaryResponse {
+    SnapshotSummaryResponse {
+        strategy_slug: row.strategy_slug,
+        snapshot_ts_ms: row.snapshot_ts_ms,
+        fetched_at_ms: row.fetched_at_ms,
+        source_url: row.source_url,
+    }
+}
+
+async fn load_snapshot(
+    pool: &PgPool,
+    slug: &str,
+    snapshot_ts_ms: i64,
+) -> Result<Option<SnapshotRecord>> {
+    sqlx::query_as::<_, SnapshotRecord>(
+        r#"SELECT strategy_slug,snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  source_url,payload
+           FROM strategy_snapshots
+           WHERE strategy_slug=$1 AND snapshot_ts_ms=$2"#,
+    )
+    .bind(slug)
+    .bind(snapshot_ts_ms)
+    .fetch_optional(pool)
+    .await
+    .context("load strategy snapshot")
+}
+
+async fn load_initial_snapshot(pool: &PgPool, slug: &str) -> Result<Option<SnapshotRecord>> {
+    sqlx::query_as::<_, SnapshotRecord>(
+        r#"SELECT snapshots.strategy_slug,snapshots.snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM snapshots.fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  snapshots.source_url,snapshots.payload
+           FROM strategy_initial_snapshots selected
+           JOIN strategy_snapshots snapshots
+             ON snapshots.strategy_slug=selected.strategy_slug
+            AND snapshots.snapshot_ts_ms=selected.snapshot_ts_ms
+           WHERE selected.strategy_slug=$1"#,
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .context("load initial strategy snapshot")
+}
+
+fn parse_initial_positions(payload: &Value) -> Result<ParsedInitialPositions> {
+    let entries = payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .context("snapshot entries are missing")?;
+    let rows = entries
+        .iter()
+        .find(|entry| entry.get("type").and_then(Value::as_str) == Some("pre_trade_exposure"))
+        .and_then(|entry| entry.get("entry"))
+        .and_then(|entry| entry.get("rows"))
+        .and_then(Value::as_array)
+        .context("snapshot pre_trade_exposure rows are missing")?;
+
+    let mut positions = Vec::new();
+    let mut skipped_count = 0;
+    for row in rows {
+        if row.get("is_total").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(asset) = row.get("asset").and_then(Value::as_str) else {
+            continue;
+        };
+        let spot_quantity = row.get("open_qty").and_then(Value::as_f64).unwrap_or(0.0);
+        let futures_quantity = row.get("hedge_qty").and_then(Value::as_f64).unwrap_or(0.0);
+        if !spot_quantity.is_finite() || !futures_quantity.is_finite() {
+            bail!("snapshot contains a non-finite position quantity");
+        }
+        if spot_quantity.abs() <= f64::EPSILON && futures_quantity.abs() <= f64::EPSILON {
+            continue;
+        }
+
+        let mut priced_quantity = 0.0;
+        let mut priced_notional = 0.0;
+        for (quantity, field) in [
+            (spot_quantity, "open_usdt"),
+            (futures_quantity, "hedge_usdt"),
+        ] {
+            let notional = row.get(field).and_then(Value::as_f64).unwrap_or(0.0);
+            if quantity.abs() > f64::EPSILON && notional.is_finite() && notional.abs() > 0.0 {
+                priced_quantity += quantity.abs();
+                priced_notional += notional.abs();
+            }
+        }
+        if priced_quantity <= f64::EPSILON || priced_notional <= f64::EPSILON {
+            skipped_count += 1;
+            continue;
+        }
+        let asset = asset.trim().to_ascii_uppercase();
+        let symbol = if asset.ends_with("USDT") {
+            asset
+        } else {
+            format!("{asset}USDT")
+        };
+        positions.push(InitialPosition {
+            symbol,
+            spot_quantity,
+            futures_quantity,
+            mark_price: priced_notional / priced_quantity,
+        });
+    }
+    Ok(ParsedInitialPositions {
+        positions,
+        skipped_count,
+    })
 }
 
 fn postgres_options() -> Result<PgConnectOptions> {
@@ -743,7 +1162,7 @@ async fn get_strategy_pnl(
         WHERE enabled AND slug = $1
         "#,
     )
-    .bind(slug)
+    .bind(&slug)
     .fetch_optional(&state.pool)
     .await?;
     let Some(strategy) = strategy else {
@@ -770,15 +1189,24 @@ async fn get_strategy_pnl(
             .into_response());
     };
 
-    let start_ms = query.start_ms.unwrap_or(strategy.st_ms);
+    let initial_snapshot = load_initial_snapshot(&state.pool, &slug).await?;
+    let parsed_initial = initial_snapshot
+        .as_ref()
+        .map(|snapshot| parse_initial_positions(&snapshot.payload))
+        .transpose()?;
+    let initial_snapshot_ts_ms = initial_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot_ts_ms);
+    let effective_start_ms = initial_snapshot_ts_ms.unwrap_or(strategy.st_ms);
+    let start_ms = query.start_ms.unwrap_or(effective_start_ms);
     let end_ms = query
         .end_ms
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    if start_ms < strategy.st_ms {
+    if start_ms < effective_start_ms {
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "startMs must be greater than or equal to strategy stMs",
+                error: "startMs must not be earlier than the effective PnL start",
             }),
         )
             .into_response());
@@ -801,26 +1229,37 @@ async fn get_strategy_pnl(
         .filter(|symbol| !symbol.is_empty())
         .map(str::to_ascii_uppercase)
         .collect::<Vec<_>>();
-    let inputs = pnl::load_inputs(
+    let load_start_ms = initial_snapshot_ts_ms
+        .map(|snapshot_ts_ms| snapshot_ts_ms.saturating_add(1))
+        .unwrap_or(strategy.st_ms);
+    let mut inputs = pnl::load_inputs(
         &state.pool,
         source,
         &strategy.db_schema,
         &strategy.exchange,
         &state.mark_prices,
-        strategy.st_ms,
+        load_start_ms,
         end_ms,
     )
     .await?;
+    if let Some(parsed) = parsed_initial.as_ref() {
+        inputs.initial_positions = parsed.positions.clone();
+    }
     let response = pnl::calculate(
         inputs,
         PnlCalculation {
             source,
             exchange: strategy.exchange,
-            strategy_start_ms: strategy.st_ms,
+            strategy_start_ms: effective_start_ms,
             start_ms,
             end_ms,
             selected_symbols,
             max_points: query.max_points.unwrap_or(3_000).clamp(200, 10_000),
+            initial_snapshot_ts_ms,
+            skipped_initial_position_count: parsed_initial
+                .as_ref()
+                .map(|parsed| parsed.skipped_count)
+                .unwrap_or_default(),
         },
     )?;
 
@@ -928,7 +1367,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assigned_env_keys, is_default_bybit_instrument, snapshot_source_url, valid_schema,
+        assigned_env_keys, expected_history_datasets, is_default_bybit_instrument,
+        parse_initial_positions, snapshot_source_url, valid_schema,
     };
 
     #[test]
@@ -983,5 +1423,61 @@ mod tests {
             "http://47.131.162.78:4191/intra/bybit-intra-arb01/snapshot"
         );
         assert!(snapshot_source_url("sg", "/intra/bybit-intra-arb01/config").is_err());
+    }
+
+    #[test]
+    fn parses_priced_initial_positions_and_reports_unpriced_balances() {
+        let payload = serde_json::json!({
+            "entries": [{
+                "type": "pre_trade_exposure",
+                "entry": {"rows": [
+                    {
+                        "asset": "BTC",
+                        "is_total": false,
+                        "open_qty": -2.0,
+                        "hedge_qty": 1.0,
+                        "open_usdt": -200.0,
+                        "hedge_usdt": 100.0
+                    },
+                    {
+                        "asset": "EUR",
+                        "is_total": false,
+                        "open_qty": 0.01,
+                        "hedge_qty": 0.0,
+                        "open_usdt": 0.0,
+                        "hedge_usdt": 0.0
+                    },
+                    {
+                        "asset": "TOTAL",
+                        "is_total": true
+                    }
+                ]}
+            }]
+        });
+
+        let parsed = parse_initial_positions(&payload).unwrap();
+
+        assert_eq!(parsed.positions.len(), 1);
+        assert_eq!(parsed.skipped_count, 1);
+        assert_eq!(parsed.positions[0].symbol, "BTCUSDT");
+        assert_eq!(parsed.positions[0].spot_quantity, -2.0);
+        assert_eq!(parsed.positions[0].futures_quantity, 1.0);
+        assert_eq!(parsed.positions[0].mark_price, 100.0);
+    }
+
+    #[test]
+    fn identifies_recurring_history_datasets() {
+        assert_eq!(
+            expected_history_datasets("binance_fr_arb01", "local", "binance", "funding_rate"),
+            Some(["trades", "funding", "interest", "liquidations"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("bybit-intra-arb01", "sg", "bybit", "intra_exchange"),
+            Some(["trades", "funding", "interest"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("bybit_mm_alpha", "sg", "bybit", "market_making"),
+            None
+        );
     }
 }

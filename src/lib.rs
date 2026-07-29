@@ -1,3 +1,4 @@
+pub mod account_risk;
 pub mod contract_multipliers;
 pub mod exchange;
 pub mod fee_rate_store;
