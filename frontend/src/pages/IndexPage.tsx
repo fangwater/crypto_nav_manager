@@ -1,10 +1,12 @@
 import {
   Activity,
   ArrowRight,
+  Ban,
   CheckCircle2,
   CircleAlert,
   Clock3,
   Database,
+  GitCompareArrows,
   Percent,
   ShieldCheck,
 } from 'lucide-react'
@@ -12,10 +14,22 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   getAccountRisks,
+  getAlignmentStatuses,
   getHistorySyncStatuses,
   getStrategies,
 } from '../api'
-import type { AccountRisk, HistorySyncStatus, Strategy } from '../types'
+import {
+  alignmentLabel,
+  alignmentTime,
+  alignmentTitle,
+  alignmentTone,
+} from '../alignment'
+import type {
+  AccountRisk,
+  AlignmentStatus,
+  HistorySyncStatus,
+  Strategy,
+} from '../types'
 
 type Filter = 'all' | 'funding_rate' | 'intra_exchange' | 'market_making'
 
@@ -146,6 +160,7 @@ export function IndexPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [accountRisks, setAccountRisks] = useState<AccountRisk[]>([])
   const [syncStatuses, setSyncStatuses] = useState<HistorySyncStatus[]>([])
+  const [alignmentStatuses, setAlignmentStatuses] = useState<AlignmentStatus[]>([])
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [filter, setFilter] = useState<Filter>('all')
   const [error, setError] = useState<string | null>(null)
@@ -158,6 +173,21 @@ export function IndexPage() {
         setError(reason instanceof Error ? reason.message : String(reason))
       })
       .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => {
+      getAlignmentStatuses(controller.signal)
+        .then(setAlignmentStatuses)
+        .catch(() => undefined)
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 3_000)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
   }, [])
 
   useEffect(() => {
@@ -208,6 +238,13 @@ export function IndexPage() {
   const syncBySlug = useMemo(
     () => new Map(syncStatuses.map((status) => [status.strategySlug, status])),
     [syncStatuses],
+  )
+  const alignmentBySlug = useMemo(
+    () =>
+      new Map(
+        alignmentStatuses.map((status) => [status.strategySlug, status]),
+      ),
+    [alignmentStatuses],
   )
   const connectedRiskCount = accountRisks.filter(
     (risk) => risk.connected,
@@ -296,6 +333,12 @@ export function IndexPage() {
           </div>
         </section>
 
+        <section className="retired-notice" aria-label="已停用盘子">
+          <Ban size={16} />
+          <strong>binance nova01 / nova02</strong>
+          <span>已停用，不再拉取</span>
+        </section>
+
         {loading && (
           <div className="loading-grid" aria-label="正在加载盘子">
             {Array.from({ length: 7 }, (_, index) => (
@@ -322,6 +365,7 @@ export function IndexPage() {
             {visibleStrategies.map((strategy) => {
               const risk = risksBySlug.get(strategy.slug)
               const syncStatus = syncBySlug.get(strategy.slug)
+              const alignmentStatus = alignmentBySlug.get(strategy.slug)
               const riskTone =
                 risk?.status === 'live'
                   ? (risk.riskLevel ?? 'live')
@@ -380,6 +424,33 @@ export function IndexPage() {
                         {syncStatusLabel(syncStatus, nowMs)}
                       </small>
                     </div>
+                    {alignmentStatus && (
+                      <div
+                        className={
+                          'alignment-check alignment-check--' +
+                          alignmentTone(alignmentStatus)
+                        }
+                        title={alignmentTitle(alignmentStatus)}
+                      >
+                        <GitCompareArrows size={15} />
+                        <div>
+                          <span>订单校对</span>
+                          <strong>{alignmentTime(alignmentStatus)}</strong>
+                          {alignmentStatus.state === 'running' && (
+                            <i
+                              aria-hidden="true"
+                              style={{
+                                width: alignmentStatus.progressPercent + '%',
+                              }}
+                            />
+                          )}
+                        </div>
+                        <small>
+                          <span className="status-dot" />
+                          {alignmentLabel(alignmentStatus)}
+                        </small>
+                      </div>
+                    )}
                   </div>
                   <div className="strategy-card__footer">
                     <code title={strategy.envPath}>{strategy.envPath}</code>

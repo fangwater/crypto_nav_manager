@@ -55,6 +55,25 @@ export interface HistorySyncStatus {
   datasets: HistorySyncDataset[]
 }
 
+export interface AlignmentStatus {
+  strategySlug: string
+  state: 'waiting' | 'running' | 'succeeded' | 'mismatch' | 'failed'
+  phase: string
+  progressPercent: number
+  startedAtMs: number | null
+  updatedAtMs: number
+  completedAtMs: number | null
+  candidateEndMs: number | null
+  scanStartMs: number | null
+  pgSuccessEndMs: number | null
+  actualEndMs: number | null
+  groupCount: number | null
+  mismatchCount: number | null
+  pgEventCount: number | null
+  localEventCount: number | null
+  message: string | null
+}
+
 export interface TradingFeeRate {
   market: string
   instrument: string

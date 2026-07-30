@@ -1,6 +1,7 @@
 import type {
   AccountFeeRates,
   AccountRisk,
+  AlignmentStatus,
   HistorySyncStatus,
   Strategy,
   StrategyPnl,
@@ -37,6 +38,12 @@ export function getHistorySyncStatuses(
   signal?: AbortSignal,
 ): Promise<HistorySyncStatus[]> {
   return getJson<HistorySyncStatus[]>('/history-sync-status', signal)
+}
+
+export function getAlignmentStatuses(
+  signal?: AbortSignal,
+): Promise<AlignmentStatus[]> {
+  return getJson<AlignmentStatus[]>('/alignment-status', signal)
 }
 
 export function getStrategy(slug: string): Promise<Strategy> {

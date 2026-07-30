@@ -206,6 +206,27 @@ struct HistorySyncStatusResponse {
     datasets: Vec<HistorySyncDatasetResponse>,
 }
 
+#[derive(Debug, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentStatusResponse {
+    strategy_slug: String,
+    state: String,
+    phase: String,
+    progress_percent: i32,
+    started_at_ms: Option<i64>,
+    updated_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    candidate_end_ms: Option<i64>,
+    scan_start_ms: Option<i64>,
+    pg_success_end_ms: Option<i64>,
+    actual_end_ms: Option<i64>,
+    group_count: Option<i32>,
+    mismatch_count: Option<i32>,
+    pg_event_count: Option<i64>,
+    local_event_count: Option<i64>,
+    message: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct FeeRateRecord {
     market: String,
@@ -332,6 +353,7 @@ pub async fn run() -> Result<()> {
         .route("/api/strategies", get(list_strategies))
         .route("/api/account-risks", get(list_account_risks))
         .route("/api/history-sync-status", get(list_history_sync_status))
+        .route("/api/alignment-status", get(list_alignment_status))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
@@ -447,6 +469,26 @@ async fn list_history_sync_status(
             })
             .collect(),
     ))
+}
+
+async fn list_alignment_status(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AlignmentStatusResponse>>, ApiError> {
+    let rows = sqlx::query_as::<_, AlignmentStatusResponse>(
+        r#"SELECT a.strategy_slug,a.state,a.phase,a.progress_percent,
+                  (EXTRACT(EPOCH FROM a.started_at) * 1000)::bigint AS started_at_ms,
+                  (EXTRACT(EPOCH FROM a.updated_at) * 1000)::bigint AS updated_at_ms,
+                  (EXTRACT(EPOCH FROM a.completed_at) * 1000)::bigint AS completed_at_ms,
+                  a.candidate_end_ms,a.scan_start_ms,a.pg_success_end_ms,a.actual_end_ms,
+                  a.group_count,a.mismatch_count,a.pg_event_count,a.local_event_count,a.message
+           FROM rocksdb_alignment_status a
+           JOIN strategy_envs s ON s.slug=a.strategy_slug
+           WHERE s.enabled
+           ORDER BY s.sort_order,s.slug"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows))
 }
 
 fn expected_history_datasets(

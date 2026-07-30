@@ -5,6 +5,7 @@ import {
   CircleAlert,
   Database,
   ExternalLink,
+  GitCompareArrows,
   LoaderCircle,
   RefreshCw,
   Search,
@@ -15,18 +16,26 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   clearInitialSnapshot,
+  getAlignmentStatuses,
   getInitialSnapshot,
   getStrategy,
   getStrategyPnl,
   getStrategySnapshots,
   setInitialSnapshot,
 } from '../api'
+import {
+  alignmentLabel,
+  alignmentTime,
+  alignmentTitle,
+  alignmentTone,
+} from '../alignment'
 import { PnlChart } from '../components/PnlChart'
 import { PositionChart } from '../components/PositionChart'
 import type {
   PnlSeriesKey,
   PositionSeriesKey,
   PositionUnit,
+  AlignmentStatus,
   Strategy,
   StrategyPnl,
   StrategySnapshotSummary,
@@ -202,6 +211,8 @@ export function PnlStrategyPage() {
   const [strategyError, setStrategyError] = useState<string | null>(null)
   const [pnlError, setPnlError] = useState<string | null>(null)
   const [loadingPnl, setLoadingPnl] = useState(false)
+  const [alignmentStatus, setAlignmentStatus] =
+    useState<AlignmentStatus | null>(null)
 
   useEffect(() => {
     setStrategy(null)
@@ -231,6 +242,26 @@ export function PnlStrategyPage() {
       .catch((reason: unknown) => {
         setStrategyError(reason instanceof Error ? reason.message : String(reason))
       })
+  }, [slug])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setAlignmentStatus(null)
+    const refresh = () => {
+      getAlignmentStatuses(controller.signal)
+        .then((statuses) => {
+          setAlignmentStatus(
+            statuses.find((status) => status.strategySlug === slug) ?? null,
+          )
+        })
+        .catch(() => undefined)
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 3_000)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
   }, [slug])
 
   useEffect(() => {
@@ -542,6 +573,32 @@ export function PnlStrategyPage() {
               : '未启用'}
           </span>
         </section>
+
+        {alignmentStatus && (
+          <section
+            className={
+              'alignment-detail alignment-detail--' +
+              alignmentTone(alignmentStatus)
+            }
+            aria-label="订单校对状态"
+            title={alignmentTitle(alignmentStatus)}
+          >
+            <GitCompareArrows size={17} />
+            <div className="alignment-detail__state">
+              <span>订单校对</span>
+              <strong>{alignmentLabel(alignmentStatus)}</strong>
+            </div>
+            <div className="alignment-detail__progress" aria-hidden="true">
+              <i
+                style={{ width: alignmentStatus.progressPercent + '%' }}
+              />
+            </div>
+            <div className="alignment-detail__time">
+              <span>已验证终点</span>
+              <strong>{alignmentTime(alignmentStatus)}</strong>
+            </div>
+          </section>
+        )}
 
         {pnlError && (
           <div className="error-state pnl-error">
