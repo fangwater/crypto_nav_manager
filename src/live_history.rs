@@ -225,6 +225,8 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                (host = 'local' AND exchange = 'binance' AND strategy_kind = 'funding_rate')
                OR slug IN (
                  'binance-intra-arb01',
+                 'binance_mm_alpha',
+                 'bybit_mm_alpha',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
                  'bitget_fr_arb02',
@@ -242,8 +244,8 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
 fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> Result<SyncReport> {
     let mut failures = Vec::new();
     let mut summaries = Vec::new();
-    let needs_symbols = strategy.exchange == "binance";
-    let symbols = if needs_symbols {
+    let needs_online_symbols = uses_online_symbols(&strategy);
+    let symbols = if needs_online_symbols {
         match load_online_symbols(config, &strategy) {
             Ok(symbols) if symbols.is_empty() => {
                 warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
@@ -263,7 +265,7 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
         Vec::new()
     };
 
-    let trades_succeeded = if !needs_symbols || !symbols.is_empty() {
+    let trades_succeeded = if !needs_online_symbols || !symbols.is_empty() {
         match run_incremental_or_bootstrap(config, &strategy.slug, "trades", &symbols) {
             Ok(summary) => {
                 summaries.push(summary);
@@ -319,8 +321,16 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
 fn alignment_check_enabled(slug: &str) -> bool {
     matches!(
         slug,
-        "binance-intra-arb01" | "bybit-intra-arb01" | "bybit-intra-arb02"
+        "binance_mm_alpha"
+            | "bybit_mm_alpha"
+            | "binance-intra-arb01"
+            | "bybit-intra-arb01"
+            | "bybit-intra-arb02"
     )
+}
+
+fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
+    strategy.exchange == "binance" && strategy.strategy_kind != "market_making"
 }
 
 fn run_alignment_check(config: &LiveHistoryConfig, slug: &str) -> Result<String> {
@@ -548,7 +558,7 @@ mod tests {
 
     use super::{
         LiveHistoryStrategy, account_datasets, alignment_check_enabled, delay_until_next_slot,
-        normalize_online_symbol, online_symbol_keys, parse_redis_mget,
+        normalize_online_symbol, online_symbol_keys, parse_redis_mget, uses_online_symbols,
     };
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
@@ -628,11 +638,27 @@ mod tests {
     }
 
     #[test]
-    fn limits_alignment_checks_to_reconciled_intra_accounts() {
+    fn limits_alignment_checks_to_reconciled_accounts() {
+        assert!(alignment_check_enabled("binance_mm_alpha"));
+        assert!(alignment_check_enabled("bybit_mm_alpha"));
         assert!(alignment_check_enabled("binance-intra-arb01"));
         assert!(alignment_check_enabled("bybit-intra-arb01"));
         assert!(alignment_check_enabled("bybit-intra-arb02"));
         assert!(!alignment_check_enabled("binance_fr_arb03"));
+    }
+
+    #[test]
+    fn market_making_uses_symbols_already_stored_in_postgres() {
+        assert!(!uses_online_symbols(&strategy(
+            "binance_mm_alpha",
+            "binance",
+            "market_making"
+        )));
+        assert!(uses_online_symbols(&strategy(
+            "binance-intra-arb01",
+            "binance",
+            "intra_exchange"
+        )));
     }
 
     #[test]

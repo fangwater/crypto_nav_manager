@@ -502,11 +502,14 @@ fn expected_history_datasets(
     const BITGET_FR: &[&str] = &["trades", "funding", "interest"];
     const BINANCE_INTRA: &[&str] = &["trades", "funding"];
     const BYBIT_INTRA: &[&str] = &["trades", "funding", "interest"];
+    const MM: &[&str] = &["trades"];
 
     let scheduled = (host == "local" && exchange == "binance" && strategy_kind == "funding_rate")
         || matches!(
             slug,
-            "binance-intra-arb01"
+            "binance_mm_alpha"
+                | "bybit_mm_alpha"
+                | "binance-intra-arb01"
                 | "bybit-intra-arb01"
                 | "bybit-intra-arb02"
                 | "bitget_fr_arb02"
@@ -522,6 +525,7 @@ fn expected_history_datasets(
         ("bitget", "funding_rate") => Some(BITGET_FR),
         ("binance", "intra_exchange") => Some(BINANCE_INTRA),
         ("bybit", "intra_exchange") => Some(BYBIT_INTRA),
+        ("binance" | "bybit", "market_making") => Some(MM),
         _ => None,
     }
 }
@@ -1519,7 +1523,7 @@ mod tests {
         );
         assert_eq!(
             expected_history_datasets("bybit_mm_alpha", "sg", "bybit", "market_making"),
-            None
+            Some(["trades"].as_slice())
         );
     }
 }
