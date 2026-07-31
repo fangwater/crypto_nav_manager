@@ -90,9 +90,9 @@ impl LiveHistoryConfig {
         let alignment_check = env::var_os("CRYPTO_NAV_ALIGNMENT_CHECK_BIN")
             .map(PathBuf::from)
             .unwrap_or(
-                env::current_dir()
-                    .context("resolve NAV working directory")?
-                    .join("scripts/reconcile_rocksdb_incremental.py"),
+                env::current_exe()
+                    .context("resolve NAV server executable")?
+                    .with_file_name("reconcile_rocksdb"),
             );
         Ok(Some(Self {
             sync_interval: Duration::from_secs(sync_interval_secs),
