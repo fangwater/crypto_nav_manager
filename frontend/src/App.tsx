@@ -15,6 +15,12 @@ const FeeRatesPage = lazy(() =>
   })),
 )
 
+const IntraMatchingPage = lazy(() =>
+  import('./pages/IntraMatchingPage').then((module) => ({
+    default: module.IntraMatchingPage,
+  })),
+)
+
 export default function App() {
   return (
     <Suspense
@@ -27,6 +33,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<IndexPage />} />
         <Route path="/fee-rates" element={<FeeRatesPage />} />
+        <Route path="/intra-matching" element={<IntraMatchingPage />} />
         <Route path="/strategies/:slug" element={<StrategyPage />} />
       </Routes>
     </Suspense>

@@ -3,6 +3,7 @@ import type {
   AccountRisk,
   AlignmentStatus,
   HistorySyncStatus,
+  IntraMatchingSummary,
   Strategy,
   StrategyPnl,
   StrategySnapshotSummary,
@@ -44,6 +45,12 @@ export function getAlignmentStatuses(
   signal?: AbortSignal,
 ): Promise<AlignmentStatus[]> {
   return getJson<AlignmentStatus[]>('/alignment-status', signal)
+}
+
+export function getIntraMatchingSummaries(
+  signal?: AbortSignal,
+): Promise<IntraMatchingSummary[]> {
+  return getJson<IntraMatchingSummary[]>('/intra-matching', signal)
 }
 
 export function getStrategy(slug: string): Promise<Strategy> {

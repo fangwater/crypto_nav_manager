@@ -74,6 +74,31 @@ export interface AlignmentStatus {
   message: string | null
 }
 
+export interface IntraMatchingSummary {
+  strategySlug: string
+  displayName: string
+  exchange: 'binance' | 'bybit'
+  sourceReadThroughUs: number
+  eventsReleasedThroughUs: number
+  marginFinalizedThroughUs: number
+  verifiedThroughMs: number
+  reorderWindowUs: number
+  updatedAtMs: number
+  totalOrders: number
+  pendingOrders: number
+  completedOrders: number
+  nettedOrders: number
+  mixedOrders: number
+  pendingFillAmount: number
+  pendingRemainingAmount: number
+  pendingNotional: number
+  totalHedges: number
+  unallocatedHedges: number
+  unallocatedAmount: number
+  anchorMisses: number
+  lastOrderUpdatedAtMs: number | null
+}
+
 export interface TradingFeeRate {
   market: string
   instrument: string

@@ -268,6 +268,10 @@ export function IndexPage() {
             </div>
           </div>
           <div className="header-actions">
+            <Link className="header-nav-link" to="/intra-matching">
+              <GitCompareArrows size={16} />
+              订单匹配
+            </Link>
             <Link className="header-nav-link" to="/fee-rates">
               <Percent size={16} />
               手续费

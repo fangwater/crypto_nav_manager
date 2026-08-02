@@ -228,6 +228,72 @@ struct AlignmentStatusResponse {
 }
 
 #[derive(Debug, FromRow)]
+struct IntraMatchingStrategyRecord {
+    slug: String,
+    alias: Option<String>,
+    db_schema: String,
+    exchange: String,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraMatchingWatermarkRecord {
+    source_read_through_us: i64,
+    events_released_through_us: i64,
+    margin_finalized_through_us: i64,
+    verified_through_ms: i64,
+    reorder_window_us: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraMatchingCountRecord {
+    total_orders: i64,
+    pending_orders: i64,
+    completed_orders: i64,
+    netted_orders: i64,
+    mixed_orders: i64,
+    pending_fill_amount: f64,
+    pending_remaining_amount: f64,
+    pending_notional: f64,
+    last_order_updated_at_ms: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraHedgeCountRecord {
+    total_hedges: i64,
+    unallocated_hedges: i64,
+    unallocated_amount: f64,
+    anchor_misses: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntraMatchingSummaryResponse {
+    strategy_slug: String,
+    display_name: String,
+    exchange: String,
+    source_read_through_us: i64,
+    events_released_through_us: i64,
+    margin_finalized_through_us: i64,
+    verified_through_ms: i64,
+    reorder_window_us: i64,
+    updated_at_ms: i64,
+    total_orders: i64,
+    pending_orders: i64,
+    completed_orders: i64,
+    netted_orders: i64,
+    mixed_orders: i64,
+    pending_fill_amount: f64,
+    pending_remaining_amount: f64,
+    pending_notional: f64,
+    total_hedges: i64,
+    unallocated_hedges: i64,
+    unallocated_amount: f64,
+    anchor_misses: i64,
+    last_order_updated_at_ms: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
 struct FeeRateRecord {
     market: String,
     instrument: String,
@@ -354,6 +420,7 @@ pub async fn run() -> Result<()> {
         .route("/api/account-risks", get(list_account_risks))
         .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/alignment-status", get(list_alignment_status))
+        .route("/api/intra-matching", get(list_intra_matching))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
@@ -489,6 +556,105 @@ async fn list_alignment_status(
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(rows))
+}
+
+async fn list_intra_matching(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<IntraMatchingSummaryResponse>>, ApiError> {
+    let strategies = sqlx::query_as::<_, IntraMatchingStrategyRecord>(
+        r#"SELECT slug,alias,db_schema,exchange
+           FROM strategy_envs
+           WHERE enabled
+             AND slug IN (
+                 'binance-intra-arb01',
+                 'bybit-intra-arb01',
+                 'bybit-intra-arb02'
+             )
+           ORDER BY sort_order,slug"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut summaries = Vec::with_capacity(strategies.len());
+    for strategy in strategies {
+        if !valid_schema(&strategy.db_schema) {
+            return Err(anyhow::anyhow!("invalid strategy schema: {}", strategy.db_schema).into());
+        }
+        let watermark_query = format!(
+            "SELECT source_read_through_us,events_released_through_us,
+             margin_finalized_through_us,verified_through_ms,reorder_window_us,
+             (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms
+             FROM {}.intra_match_watermark WHERE singleton",
+            strategy.db_schema
+        );
+        let watermark = sqlx::query_as::<_, IntraMatchingWatermarkRecord>(sqlx::AssertSqlSafe(
+            watermark_query.as_str(),
+        ))
+        .fetch_one(&state.pool)
+        .await?;
+
+        let counts_query = format!(
+            "SELECT COUNT(*)::bigint AS total_orders,
+             COUNT(*) FILTER (WHERE matching_state='pending')::bigint AS pending_orders,
+             COUNT(*) FILTER (WHERE matching_state='completed')::bigint AS completed_orders,
+             COUNT(*) FILTER (WHERE matching_state='netted')::bigint AS netted_orders,
+             COUNT(*) FILTER (WHERE matching_state='mixed')::bigint AS mixed_orders,
+             COALESCE(SUM(open_fill_amount) FILTER (WHERE matching_state='pending'),0)::double precision AS pending_fill_amount,
+             COALESCE(SUM(remaining_amount) FILTER (WHERE matching_state='pending'),0)::double precision AS pending_remaining_amount,
+             COALESCE(SUM(remaining_amount * price) FILTER (WHERE matching_state='pending'),0)::double precision AS pending_notional,
+             (EXTRACT(EPOCH FROM MAX(updated_at)) * 1000)::bigint AS last_order_updated_at_ms
+             FROM {}.intra_orders",
+            strategy.db_schema
+        );
+        let counts = sqlx::query_as::<_, IntraMatchingCountRecord>(sqlx::AssertSqlSafe(
+            counts_query.as_str(),
+        ))
+        .fetch_one(&state.pool)
+        .await?;
+
+        let hedge_query = format!(
+            "SELECT COUNT(*)::bigint AS total_hedges,
+             COUNT(*) FILTER (WHERE unallocated_amount > 1e-8)::bigint AS unallocated_hedges,
+             COALESCE(SUM(unallocated_amount),0)::double precision AS unallocated_amount,
+             COUNT(*) FILTER (WHERE main_fkey IS NOT NULL AND NOT anchor_matched)::bigint AS anchor_misses
+             FROM {}.intra_hedges",
+            strategy.db_schema
+        );
+        let hedges =
+            sqlx::query_as::<_, IntraHedgeCountRecord>(sqlx::AssertSqlSafe(hedge_query.as_str()))
+                .fetch_one(&state.pool)
+                .await?;
+
+        let display_name = strategy
+            .alias
+            .filter(|alias| !alias.trim().is_empty())
+            .unwrap_or_else(|| strategy.slug.clone());
+        summaries.push(IntraMatchingSummaryResponse {
+            strategy_slug: strategy.slug,
+            display_name,
+            exchange: strategy.exchange,
+            source_read_through_us: watermark.source_read_through_us,
+            events_released_through_us: watermark.events_released_through_us,
+            margin_finalized_through_us: watermark.margin_finalized_through_us,
+            verified_through_ms: watermark.verified_through_ms,
+            reorder_window_us: watermark.reorder_window_us,
+            updated_at_ms: watermark.updated_at_ms,
+            total_orders: counts.total_orders,
+            pending_orders: counts.pending_orders,
+            completed_orders: counts.completed_orders,
+            netted_orders: counts.netted_orders,
+            mixed_orders: counts.mixed_orders,
+            pending_fill_amount: counts.pending_fill_amount,
+            pending_remaining_amount: counts.pending_remaining_amount,
+            pending_notional: counts.pending_notional,
+            total_hedges: hedges.total_hedges,
+            unallocated_hedges: hedges.unallocated_hedges,
+            unallocated_amount: hedges.unallocated_amount,
+            anchor_misses: hedges.anchor_misses,
+            last_order_updated_at_ms: counts.last_order_updated_at_ms,
+        });
+    }
+    Ok(Json(summaries))
 }
 
 fn expected_history_datasets(

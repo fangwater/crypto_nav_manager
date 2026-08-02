@@ -9,9 +9,13 @@ use sqlx::{
     AssertSqlSafe, PgPool, Postgres, QueryBuilder, Row, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{collections::BTreeMap, env, io::Cursor, time::Duration};
+use std::{collections::BTreeMap, env, io::Cursor, process::Command, time::Duration};
 
-const SUPPORTED: [&str; 1] = ["binance-intra-arb01"];
+const SUPPORTED: [&str; 3] = [
+    "binance-intra-arb01",
+    "bybit-intra-arb01",
+    "bybit-intra-arb02",
+];
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Incrementally synthesize intra Margin/Futures order lifecycles")]
@@ -294,7 +298,8 @@ fn fetch_lifecycle_deltas(
     }
     let endpoint = format!("{}/v1/read", args.persist_read_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(60))
         .build()
         .context("build persist read client")?;
     let chunk_us = args
@@ -303,23 +308,60 @@ fn fetch_lifecycle_deltas(
         .context("source chunk overflow")?;
     let mut lifecycle = BTreeMap::<(String, i64), Lifecycle>::new();
     let mut row_count = 0usize;
+    let mut use_curl = false;
     let mut cursor = start_us;
     while cursor < end_us {
         let window_end = cursor.saturating_add(chunk_us).min(end_us);
-        let response = client
-            .get(&endpoint)
-            .query(&[
-                ("table", "uniform_orders".to_string()),
-                ("source_id", args.strategy.clone()),
-                ("start_us", cursor.to_string()),
-                ("end_us", window_end.to_string()),
-                ("format", "parquet".to_string()),
-            ])
-            .send()
-            .with_context(|| format!("read center {} {cursor}..{window_end}", args.strategy))?
-            .error_for_status()
-            .with_context(|| format!("center rejected {} {cursor}..{window_end}", args.strategy))?;
-        let body = response.bytes().context("read center parquet body")?;
+        let params = [
+            ("table", "uniform_orders".to_string()),
+            ("source_id", args.strategy.clone()),
+            ("start_us", cursor.to_string()),
+            ("end_us", window_end.to_string()),
+            ("format", "parquet".to_string()),
+        ];
+        let url = reqwest::Url::parse_with_params(&endpoint, &params)
+            .with_context(|| format!("build center URL for {}", args.strategy))?;
+        let read_with_curl = || -> Result<Vec<u8>> {
+            let output = Command::new("curl")
+                .args(["--fail", "--silent", "--show-error", "--max-time", "60"])
+                .arg(url.as_str())
+                .output()
+                .with_context(|| {
+                    format!(
+                        "run curl for {} uniform_orders {cursor}..{window_end}",
+                        args.strategy
+                    )
+                })?;
+            if !output.status.success() {
+                bail!(
+                    "curl failed for {} uniform_orders {cursor}..{window_end}: {}",
+                    args.strategy,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(output.stdout)
+        };
+        let body = if use_curl {
+            read_with_curl()?
+        } else {
+            match client
+                .get(url.clone())
+                .header(reqwest::header::CONNECTION, "close")
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .and_then(reqwest::blocking::Response::bytes)
+            {
+                Ok(body) => body.to_vec(),
+                Err(error) => {
+                    use_curl = true;
+                    eprintln!(
+                        "center read switching to curl strategy={} table=uniform_orders window={cursor}..{window_end}: {error}",
+                        args.strategy
+                    );
+                    read_with_curl()?
+                }
+            }
+        };
         let frame = ParquetReader::new(Cursor::new(body))
             .finish()
             .context("decode center uniform_orders parquet")?;

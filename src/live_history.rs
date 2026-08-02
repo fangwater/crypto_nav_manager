@@ -363,7 +363,10 @@ fn alignment_check_enabled(slug: &str) -> bool {
 }
 
 fn order_synthesis_enabled(slug: &str) -> bool {
-    slug == "binance-intra-arb01"
+    matches!(
+        slug,
+        "binance-intra-arb01" | "bybit-intra-arb01" | "bybit-intra-arb02"
+    )
 }
 
 fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
@@ -710,10 +713,10 @@ mod tests {
     }
 
     #[test]
-    fn enables_order_synthesis_only_for_center_backed_binance_intra() {
+    fn enables_order_synthesis_for_center_backed_intra() {
         assert!(order_synthesis_enabled("binance-intra-arb01"));
-        assert!(!order_synthesis_enabled("bybit-intra-arb01"));
-        assert!(!order_synthesis_enabled("bybit-intra-arb02"));
+        assert!(order_synthesis_enabled("bybit-intra-arb01"));
+        assert!(order_synthesis_enabled("bybit-intra-arb02"));
     }
 
     #[test]
