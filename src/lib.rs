@@ -3,6 +3,7 @@ pub mod contract_multipliers;
 pub mod exchange;
 pub mod fee_rate_store;
 pub mod fifo_pnl;
+pub mod intra_order_match;
 pub mod live_history;
 pub mod mark_prices;
 pub mod models;

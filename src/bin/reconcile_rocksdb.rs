@@ -106,6 +106,14 @@ impl Market {
         }
     }
 
+    fn from_alignment_name(value: &str) -> Result<Self> {
+        match value {
+            "spot" => Ok(Self::Spot),
+            "swap" => Ok(Self::Swap),
+            _ => bail!("unsupported alignment exclusion market {value:?}"),
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Spot => "spot",
@@ -444,11 +452,13 @@ async fn reconcile(
 
     set_phase(pool, strategy, "comparing", 85, None, None, None).await?;
     let selected_symbols = selected_symbols(strategy);
+    let trade_exclusions = load_trade_exclusions(pool, strategy).await?;
     let pg = pg_groups(
         &pg_dir,
         scan_start_ms,
         actual_end_ms,
         selected_symbols.as_ref(),
+        &trade_exclusions,
     )?;
     let start_us = scan_start_ms
         .checked_mul(1_000)
@@ -646,6 +656,23 @@ async fn load_checkpoint(pool: &PgPool, strategy: &str) -> Result<Checkpoint> {
     })
 }
 
+async fn load_trade_exclusions(
+    pool: &PgPool,
+    strategy: &str,
+) -> Result<BTreeSet<(Market, String)>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT market,order_id FROM rocksdb_alignment_trade_exclusions \
+         WHERE strategy_slug=$1",
+    )
+    .bind(strategy)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("load alignment trade exclusions for {strategy}"))?;
+    rows.into_iter()
+        .map(|(market, order_id)| Ok((Market::from_alignment_name(&market)?, order_id)))
+        .collect()
+}
+
 fn sibling_binary(name: &str) -> Result<PathBuf> {
     Ok(env::current_exe()
         .context("resolve current executable")?
@@ -704,11 +731,13 @@ fn export_center_orders(
         .context("center end timestamp overflow")?;
     let endpoint = format!("{}/v1/read", args.persist_read_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(60))
         .build()
         .context("build persist read client")?;
     fs::create_dir_all(output_root)
         .with_context(|| format!("create center export {}", output_root.display()))?;
+    let mut use_curl = false;
 
     for table in [
         "uniform_orders",
@@ -719,22 +748,51 @@ fn export_center_orders(
         let mut cursor = start_us;
         while cursor < end_us {
             let window_end = cursor.saturating_add(3_600_000_000).min(end_us);
-            let response = client
-                .get(&endpoint)
-                .query(&[
-                    ("table", table.to_string()),
-                    ("source_id", strategy.to_string()),
-                    ("start_us", cursor.to_string()),
-                    ("end_us", window_end.to_string()),
-                    ("format", "parquet".to_string()),
-                ])
-                .send()
-                .with_context(|| format!("read center {strategy}/{table} {cursor}..{window_end}"))?
-                .error_for_status()
-                .with_context(|| {
-                    format!("center rejected {strategy}/{table} {cursor}..{window_end}")
-                })?;
-            let body = response.bytes().context("read center parquet body")?;
+            let params = [
+                ("table", table.to_string()),
+                ("source_id", strategy.to_string()),
+                ("start_us", cursor.to_string()),
+                ("end_us", window_end.to_string()),
+                ("format", "parquet".to_string()),
+            ];
+            let url = reqwest::Url::parse_with_params(&endpoint, &params)
+                .with_context(|| format!("build center URL for {strategy}/{table}"))?;
+            let read_with_curl = || -> Result<Vec<u8>> {
+                let output = Command::new("curl")
+                    .args(["--fail", "--silent", "--show-error", "--max-time", "60"])
+                    .arg(url.as_str())
+                    .output()
+                    .with_context(|| {
+                        format!("run curl for {strategy}/{table} {cursor}..{window_end}")
+                    })?;
+                if !output.status.success() {
+                    bail!(
+                        "curl failed for {strategy}/{table} {cursor}..{window_end}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                Ok(output.stdout)
+            };
+            let body = if use_curl {
+                read_with_curl()?
+            } else {
+                match client
+                    .get(url.clone())
+                    .header(reqwest::header::CONNECTION, "close")
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .and_then(reqwest::blocking::Response::bytes)
+                {
+                    Ok(body) => body.to_vec(),
+                    Err(error) => {
+                        use_curl = true;
+                        eprintln!(
+                            "center read switching to curl strategy={strategy} table={table} window={cursor}..{window_end}: {error}"
+                        );
+                        read_with_curl()?
+                    }
+                }
+            };
             let frame = ParquetReader::new(Cursor::new(body))
                 .finish()
                 .with_context(|| format!("decode center parquet for {strategy}/{table}"))?;
@@ -842,7 +900,10 @@ fn export_orders(
 }
 
 fn is_center(strategy: &str) -> bool {
-    strategy == "bybit_mm_alpha"
+    matches!(
+        strategy,
+        "bybit_mm_alpha" | "binance-intra-arb01" | "bybit-intra-arb01" | "bybit-intra-arb02"
+    )
 }
 
 fn is_remote(strategy: &str) -> bool {
@@ -959,6 +1020,7 @@ fn pg_groups(
     start_ms: i64,
     end_ms: i64,
     symbols: Option<&BTreeSet<String>>,
+    exclusions: &BTreeSet<(Market, String)>,
 ) -> Result<BTreeMap<GroupKey, Stat>> {
     let mut groups = BTreeMap::new();
     let mut seen = BTreeMap::<(Market, String, String), (GroupKey, String, u64)>::new();
@@ -986,6 +1048,9 @@ fn pg_groups(
                 bail!("non-finite PostgreSQL quantity in {}", path.display());
             }
             let market = Market::from_sid(row.sid.trim())?;
+            if exclusions.contains(&(market, row.order_id.clone())) {
+                continue;
+            }
             let key = group_key(market, &row.symbol, &row.side)?;
             if symbols.is_some_and(|selected| !selected.contains(&key.symbol)) {
                 continue;
@@ -1257,6 +1322,14 @@ mod tests {
     fn supports_bybit_venues() {
         assert_eq!(Market::from_venue("BybitMargin").unwrap(), Market::Spot);
         assert_eq!(Market::from_venue("BybitFutures").unwrap(), Market::Swap);
+    }
+
+    #[test]
+    fn reads_configured_order_sources_from_center() {
+        assert!(is_center("binance-intra-arb01"));
+        assert!(is_center("bybit_mm_alpha"));
+        assert!(is_center("bybit-intra-arb01"));
+        assert!(is_center("bybit-intra-arb02"));
     }
 
     #[test]

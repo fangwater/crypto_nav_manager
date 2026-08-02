@@ -35,6 +35,7 @@ struct LiveHistoryConfig {
     redis_db: String,
     sync_history: PathBuf,
     alignment_check: PathBuf,
+    order_synthesis: PathBuf,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -52,6 +53,7 @@ struct SyncReport {
     symbol_count: usize,
     summaries: Vec<String>,
     alignment_summary: Option<String>,
+    synthesis_summary: Option<String>,
 }
 
 pub fn spawn(pool: PgPool) -> Result<()> {
@@ -94,6 +96,13 @@ impl LiveHistoryConfig {
                     .context("resolve NAV server executable")?
                     .with_file_name("reconcile_rocksdb"),
             );
+        let order_synthesis = env::var_os("CRYPTO_NAV_INTRA_ORDER_SYNC_BIN")
+            .map(PathBuf::from)
+            .unwrap_or(
+                env::current_exe()
+                    .context("resolve NAV server executable")?
+                    .with_file_name("sync_intra_orders"),
+            );
         Ok(Some(Self {
             sync_interval: Duration::from_secs(sync_interval_secs),
             redis_cli: env::var_os("CRYPTO_NAV_REDIS_CLI")
@@ -107,6 +116,7 @@ impl LiveHistoryConfig {
                 .unwrap_or_else(|_| DEFAULT_REDIS_DB.to_string()),
             sync_history,
             alignment_check,
+            order_synthesis,
         }))
     }
 }
@@ -177,6 +187,7 @@ async fn run_strategy(config: LiveHistoryConfig, strategy: LiveHistoryStrategy) 
                 online_symbols = report.symbol_count,
                 summaries = %report.summaries.join("; "),
                 alignment = report.alignment_summary.as_deref().unwrap_or("not scheduled"),
+                synthesis = report.synthesis_summary.as_deref().unwrap_or("not scheduled"),
                 "live history sync complete"
             ),
             Ok(Err(error)) => {
@@ -287,15 +298,36 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
         }
     }
 
+    let mut alignment_succeeded = false;
     let alignment_summary = if trades_succeeded && alignment_check_enabled(&strategy.slug) {
         match run_alignment_check(config, &strategy.slug) {
-            Ok(summary) => Some(summary),
+            Ok(summary) => {
+                alignment_succeeded = true;
+                Some(summary)
+            }
             Err(error) => {
                 warn!(
                     strategy = %strategy.slug,
                     error = ?error,
                     "automatic RocksDB alignment check failed"
                 );
+                Some(format!("failed: {error:#}"))
+            }
+        }
+    } else {
+        None
+    };
+
+    let synthesis_summary = if alignment_succeeded && order_synthesis_enabled(&strategy.slug) {
+        match run_order_synthesis(config, &strategy.slug) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                warn!(
+                    strategy = %strategy.slug,
+                    error = ?error,
+                    "automatic intra order synthesis failed"
+                );
+                failures.push(format!("order synthesis: {error:#}"));
                 Some(format!("failed: {error:#}"))
             }
         }
@@ -315,6 +347,7 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
         symbol_count: symbols.len(),
         summaries,
         alignment_summary,
+        synthesis_summary,
     })
 }
 
@@ -327,6 +360,10 @@ fn alignment_check_enabled(slug: &str) -> bool {
             | "bybit-intra-arb01"
             | "bybit-intra-arb02"
     )
+}
+
+fn order_synthesis_enabled(slug: &str) -> bool {
+    slug == "binance-intra-arb01"
 }
 
 fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
@@ -343,6 +380,30 @@ fn run_alignment_check(config: &LiveHistoryConfig, slug: &str) -> Result<String>
         bail!(
             "{} exited with {}: {}",
             config.alignment_check.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("completed")
+        .trim()
+        .to_string())
+}
+
+fn run_order_synthesis(config: &LiveHistoryConfig, slug: &str) -> Result<String> {
+    let output = Command::new(&config.order_synthesis)
+        .args(["--strategy", slug])
+        .output()
+        .with_context(|| format!("run {} for {slug}", config.order_synthesis.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} exited with {}: {}",
+            config.order_synthesis.display(),
             output.status,
             stderr.trim()
         );
@@ -558,7 +619,8 @@ mod tests {
 
     use super::{
         LiveHistoryStrategy, account_datasets, alignment_check_enabled, delay_until_next_slot,
-        normalize_online_symbol, online_symbol_keys, parse_redis_mget, uses_online_symbols,
+        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_redis_mget,
+        uses_online_symbols,
     };
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
@@ -645,6 +707,13 @@ mod tests {
         assert!(alignment_check_enabled("bybit-intra-arb01"));
         assert!(alignment_check_enabled("bybit-intra-arb02"));
         assert!(!alignment_check_enabled("binance_fr_arb03"));
+    }
+
+    #[test]
+    fn enables_order_synthesis_only_for_center_backed_binance_intra() {
+        assert!(order_synthesis_enabled("binance-intra-arb01"));
+        assert!(!order_synthesis_enabled("bybit-intra-arb01"));
+        assert!(!order_synthesis_enabled("bybit-intra-arb02"));
     }
 
     #[test]
