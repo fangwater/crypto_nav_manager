@@ -14,6 +14,8 @@ static void *(*bpf_map_lookup_elem)(const void *map, const void *key) = (void *)
 static long (*bpf_map_update_elem)(const void *map, const void *key,
                                    const void *value, __u64 flags) = (void *)2;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
+static long (*bpf_probe_read_kernel)(void *dst, __u32 size,
+                                     const void *unsafe_ptr) = (void *)113;
 
 enum event_kind {
     EVENT_RETRANSMIT = 1,
@@ -68,13 +70,15 @@ static __always_inline int copy_flow(struct flow_key *key, __u16 family,
     key->sport = sport;
     key->dport = dport;
     if (family == 2) {
-        __builtin_memcpy(key->saddr, saddr, 4);
-        __builtin_memcpy(key->daddr, daddr, 4);
+        if (bpf_probe_read_kernel(key->saddr, 4, saddr) != 0 ||
+            bpf_probe_read_kernel(key->daddr, 4, daddr) != 0)
+            return -1;
         return 0;
     }
     if (family == 10) {
-        __builtin_memcpy(key->saddr, saddr_v6, 16);
-        __builtin_memcpy(key->daddr, daddr_v6, 16);
+        if (bpf_probe_read_kernel(key->saddr, 16, saddr_v6) != 0 ||
+            bpf_probe_read_kernel(key->daddr, 16, daddr_v6) != 0)
+            return -1;
         return 0;
     }
     return -1;
