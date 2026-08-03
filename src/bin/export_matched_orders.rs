@@ -78,13 +78,6 @@ struct OrderRow {
     crange: f64,
     tlen: Option<f64>,
     pnlu: Option<f64>,
-    open_fill_amount: f64,
-    remaining_amount: f64,
-    netted_amount: f64,
-    close_notional: f64,
-    matching_state: String,
-    open_source_ts_us: i64,
-    updated_at_us: i64,
 }
 
 #[derive(Debug, Default)]
@@ -338,9 +331,7 @@ async fn load_day_snapshot(
         .with_context(|| format!("no matched orders in {schema} on {date}"))?;
     let sql = format!(
         "SELECT fkey,symbol,side,cts,open_uts,fts,holding,holding_close,close_count,price,\
-         amount,cprice,camount,range,crange,tlen,pnlu,open_fill_amount,remaining_amount,\
-         netted_amount,close_notional,matching_state,open_source_ts_us,\
-         (EXTRACT(EPOCH FROM updated_at)*1000000)::bigint AS updated_at_us \
+         amount,cprice,camount,range,crange,tlen,pnlu \
          FROM {schema}.intra_orders WHERE cts >= $1 AND cts < $2 ORDER BY cts,fkey"
     );
     let query_rows = sqlx::query(AssertSqlSafe(sql))
@@ -378,13 +369,6 @@ async fn load_day_snapshot(
                 crange: row.try_get("crange")?,
                 tlen: row.try_get("tlen")?,
                 pnlu: row.try_get("pnlu")?,
-                open_fill_amount: row.try_get("open_fill_amount")?,
-                remaining_amount: row.try_get("remaining_amount")?,
-                netted_amount: row.try_get("netted_amount")?,
-                close_notional: row.try_get("close_notional")?,
-                matching_state: row.try_get("matching_state")?,
-                open_source_ts_us: row.try_get("open_source_ts_us")?,
-                updated_at_us: row.try_get("updated_at_us")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -460,13 +444,6 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
     let mut crange = Vec::with_capacity(rows.len());
     let mut tlen = Vec::with_capacity(rows.len());
     let mut pnlu = Vec::with_capacity(rows.len());
-    let mut open_fill_amount = Vec::with_capacity(rows.len());
-    let mut remaining_amount = Vec::with_capacity(rows.len());
-    let mut netted_amount = Vec::with_capacity(rows.len());
-    let mut close_notional = Vec::with_capacity(rows.len());
-    let mut matching_state = Vec::with_capacity(rows.len());
-    let mut open_source_ts_us = Vec::with_capacity(rows.len());
-    let mut updated_at_us = Vec::with_capacity(rows.len());
 
     for row in rows {
         fkey.push(row.fkey);
@@ -486,13 +463,6 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         crange.push(row.crange);
         tlen.push(row.tlen);
         pnlu.push(row.pnlu);
-        open_fill_amount.push(row.open_fill_amount);
-        remaining_amount.push(row.remaining_amount);
-        netted_amount.push(row.netted_amount);
-        close_notional.push(row.close_notional);
-        matching_state.push(row.matching_state);
-        open_source_ts_us.push(row.open_source_ts_us);
-        updated_at_us.push(row.updated_at_us);
     }
 
     DataFrame::new(vec![
@@ -513,13 +483,6 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         Series::new("crange".into(), crange),
         Series::new("tlen".into(), tlen),
         Series::new("pnlu".into(), pnlu),
-        Series::new("open_fill_amount".into(), open_fill_amount),
-        Series::new("remaining_amount".into(), remaining_amount),
-        Series::new("netted_amount".into(), netted_amount),
-        Series::new("close_notional".into(), close_notional),
-        Series::new("matching_state".into(), matching_state),
-        Series::new("open_source_ts_us".into(), open_source_ts_us),
-        Series::new("updated_at_us".into(), updated_at_us),
     ])
     .context("build matched-order DataFrame")
 }

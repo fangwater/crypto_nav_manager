@@ -215,10 +215,11 @@ The default output template is
 `/home/ubuntu/order_data/{strategy_alias}/matched_order/{YYYYMMDD}.parquet`.
 Configured display aliases are normalized for directories, so `binance mt`,
 `bybit mt`, and `bybit cta` become `binance-mt`, `bybit-mt`, and `bybit-cta`.
-Trade dates are derived from `cts` in UTC. Each file contains every synthesized
-order state for that date (`pending`, `completed`, `netted`, and `mixed`) and is
-replaced atomically. Export checkpoints live below the output root's hidden
-`.export_state` directory so unchanged historical files are not rewritten.
+Trade dates are derived from `cts` in UTC. Each file contains only the 17
+matched-order business columns from `fkey` through `pnlu`; matching-engine
+bookkeeping fields are not exported. Files are replaced atomically. Export
+checkpoints live below the output root's hidden `.export_state` directory so
+unchanged historical files are not rewritten.
 
 The deploy directory contains `crypto-matched-order-export.service` and its
 five-minute timer. The exporter only reads PostgreSQL and does not call exchange
