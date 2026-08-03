@@ -197,6 +197,33 @@ Funding and interest files use the existing 12-column cash format. The CSV
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
 
+### Matched intra-order Parquet export
+
+Export synthesized intra orders from PostgreSQL into daily UTC Parquet files:
+
+```bash
+cargo run --release --bin export_matched_orders
+
+# Rebuild one strategy/date explicitly.
+cargo run --release --bin export_matched_orders -- \
+  --strategy binance-intra-arb01 \
+  --trade-date 20260731 \
+  --force
+```
+
+The default output template is
+`/home/ubuntu/order_data/{strategy_alias}/matched_order/{YYYYMMDD}.parquet`.
+Configured display aliases are normalized for directories, so `binance mt`,
+`bybit mt`, and `bybit cta` become `binance-mt`, `bybit-mt`, and `bybit-cta`.
+Trade dates are derived from `cts` in UTC. Each file contains every synthesized
+order state for that date (`pending`, `completed`, `netted`, and `mixed`) and is
+replaced atomically. Export checkpoints live below the output root's hidden
+`.export_state` directory so unchanged historical files are not rewritten.
+
+The deploy directory contains `crypto-matched-order-export.service` and its
+five-minute timer. The exporter only reads PostgreSQL and does not call exchange
+APIs or modify the matching tables. `raw_order` is not exported.
+
 ## CLI example
 
 ```bash

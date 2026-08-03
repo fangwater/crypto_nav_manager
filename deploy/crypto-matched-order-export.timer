@@ -1,0 +1,12 @@
+[Unit]
+Description=Run matched-order Parquet export every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=crypto-matched-order-export.service
+
+[Install]
+WantedBy=timers.target

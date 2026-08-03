@@ -1,0 +1,18 @@
+[Unit]
+Description=Export matched intra orders to daily Parquet files
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crypto_nav_manager
+ExecStart=/home/ubuntu/crypto_nav_manager/target/release/export_matched_orders --output-root /home/ubuntu/order_data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/order_data
+UMask=0022
+TimeoutStartSec=10min
