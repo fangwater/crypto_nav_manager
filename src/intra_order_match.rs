@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Side {
@@ -57,6 +57,7 @@ pub struct MarginOrder {
     pub side: Side,
     pub cts: i64,
     pub open_uts: i64,
+    pub hts: Option<i64>,
     pub fts: Option<i64>,
     pub close_count: i64,
     pub price: f64,
@@ -103,6 +104,7 @@ pub struct FuturesOrder {
     pub side: Side,
     pub create_ts_us: i64,
     pub update_ts_us: i64,
+    pub fill_ts_us: Option<i64>,
     pub source_ts_us: i64,
     pub amount: f64,
     pub cprice: Option<f64>,
@@ -142,6 +144,10 @@ pub struct MatchEngine {
     epsilon: f64,
     orders: BTreeMap<i64, MarginOrder>,
     queues: BTreeMap<(String, Side), VecDeque<i64>>,
+    first_hedge_create_ts_us: BTreeMap<i64, i64>,
+    last_hedge_fill_ts_us: BTreeMap<i64, i64>,
+    hedge_order_counts: BTreeMap<i64, i64>,
+    seen_hedge_orders: BTreeSet<(i64, i64)>,
 }
 
 impl MatchEngine {
@@ -154,6 +160,10 @@ impl MatchEngine {
             epsilon,
             orders: BTreeMap::new(),
             queues: BTreeMap::new(),
+            first_hedge_create_ts_us: BTreeMap::new(),
+            last_hedge_fill_ts_us: BTreeMap::new(),
+            hedge_order_counts: BTreeMap::new(),
+            seen_hedge_orders: BTreeSet::new(),
         };
         for mut order in pending {
             if order.remaining_amount <= epsilon {
@@ -165,6 +175,13 @@ impl MatchEngine {
             order.matching_state = MatchingState::Pending;
             let key = (order.symbol.clone(), order.side);
             let fkey = order.fkey;
+            if let Some(hts) = order.hts {
+                engine.first_hedge_create_ts_us.insert(fkey, hts);
+            }
+            if let Some(fts) = order.fts {
+                engine.last_hedge_fill_ts_us.insert(fkey, fts);
+            }
+            engine.hedge_order_counts.insert(fkey, order.close_count);
             if engine.orders.insert(fkey, order).is_some() {
                 bail!("duplicate pending Margin fkey {fkey}");
             }
@@ -185,12 +202,68 @@ impl MatchEngine {
         Ok(hedges)
     }
 
+    pub fn seed_hedge_history(
+        &mut self,
+        history: impl IntoIterator<Item = (i64, i64, Option<i64>, i64)>,
+    ) {
+        for (main_fkey, create_ts_us, fill_ts_us, order_count) in history {
+            let hts = self
+                .first_hedge_create_ts_us
+                .entry(main_fkey)
+                .or_insert(create_ts_us);
+            *hts = (*hts).min(create_ts_us);
+            let count = self.hedge_order_counts.entry(main_fkey).or_default();
+            *count = (*count).max(order_count);
+            if let Some(fill_ts_us) = fill_ts_us {
+                let fts = self
+                    .last_hedge_fill_ts_us
+                    .entry(main_fkey)
+                    .or_insert(fill_ts_us);
+                *fts = (*fts).max(fill_ts_us);
+            }
+            if let Some(margin) = self.orders.get_mut(&main_fkey) {
+                margin.hts = Some(margin.hts.map_or(*hts, |current| current.min(*hts)));
+                margin.fts = self.last_hedge_fill_ts_us.get(&main_fkey).copied();
+                margin.close_count = margin.close_count.max(*count);
+            }
+        }
+    }
+
     pub fn orders(&self) -> impl Iterator<Item = &MarginOrder> {
         self.orders.values()
     }
 
     pub fn into_orders(self) -> Vec<MarginOrder> {
         self.orders.into_values().collect()
+    }
+
+    fn record_hedge_order(
+        &mut self,
+        main_fkey: i64,
+        client_order_id: i64,
+        create_ts_us: i64,
+        fill_ts_us: Option<i64>,
+    ) {
+        let hts = *self
+            .first_hedge_create_ts_us
+            .entry(main_fkey)
+            .and_modify(|current| *current = (*current).min(create_ts_us))
+            .or_insert(create_ts_us);
+        if self.seen_hedge_orders.insert((main_fkey, client_order_id)) {
+            *self.hedge_order_counts.entry(main_fkey).or_default() += 1;
+        }
+        if let Some(fill_ts_us) = fill_ts_us {
+            let fts = self
+                .last_hedge_fill_ts_us
+                .entry(main_fkey)
+                .or_insert(fill_ts_us);
+            *fts = (*fts).max(fill_ts_us);
+        }
+        if let Some(margin) = self.orders.get_mut(&main_fkey) {
+            margin.hts = Some(margin.hts.map_or(hts, |current| current.min(hts)));
+            margin.fts = self.last_hedge_fill_ts_us.get(&main_fkey).copied();
+            margin.close_count = self.hedge_order_counts[&main_fkey];
+        }
     }
 
     fn apply_margin(&mut self, mut order: MarginOrder) -> Result<()> {
@@ -203,6 +276,15 @@ impl MatchEngine {
         order.remaining_amount = order.open_fill_amount;
         order.matching_state = MatchingState::Pending;
         let fkey = order.fkey;
+        if let Some(&hts) = self.first_hedge_create_ts_us.get(&fkey) {
+            order.hts = Some(order.hts.map_or(hts, |current| current.min(hts)));
+        }
+        if let Some(&fts) = self.last_hedge_fill_ts_us.get(&fkey) {
+            order.fts = Some(order.fts.map_or(fts, |current| current.max(fts)));
+        }
+        if let Some(&count) = self.hedge_order_counts.get(&fkey) {
+            order.close_count = order.close_count.max(count);
+        }
         let symbol = order.symbol.clone();
         let side = order.side;
         self.orders.insert(fkey, order);
@@ -257,9 +339,23 @@ impl MatchEngine {
                 order.client_order_id
             );
         }
+        if order.amount > self.epsilon && order.fill_ts_us.is_none() {
+            bail!(
+                "filled Futures order {} has no actual fill timestamp",
+                order.client_order_id
+            );
+        }
+        if let Some(main_fkey) = order.main_fkey {
+            self.record_hedge_order(
+                main_fkey,
+                order.client_order_id,
+                order.create_ts_us,
+                order.fill_ts_us,
+            );
+        }
         let queue_key = (order.symbol.clone(), order.side.opposite());
         let mut remaining = order.amount.max(0.0);
-        let mut anchor_matched = false;
+        let mut anchor_matched = order.amount <= self.epsilon;
         while remaining > self.epsilon {
             let Some(fkey) = self
                 .queues
@@ -276,12 +372,6 @@ impl MatchEngine {
             if let Some(price) = order.cprice {
                 margin.close_notional += quantity * price;
             }
-            margin.fts = Some(
-                margin
-                    .fts
-                    .map_or(order.update_ts_us, |fts| fts.max(order.update_ts_us)),
-            );
-            margin.close_count += order.event_count;
             refresh_state(margin, self.epsilon);
             anchor_matched |= order.main_fkey == Some(fkey);
             remaining = clamp_zero(remaining - quantity, self.epsilon);
@@ -325,6 +415,7 @@ mod tests {
             side,
             cts: timestamp - 10,
             open_uts: timestamp,
+            hts: None,
             fts: None,
             close_count: 0,
             price: 100.0,
@@ -341,14 +432,15 @@ mod tests {
         })
     }
 
-    fn futures(id: i64, side: Side, timestamp: i64, amount: f64) -> MatchEvent {
+    fn futures(id: i64, main_fkey: i64, side: Side, timestamp: i64, amount: f64) -> MatchEvent {
         MatchEvent::Futures(FuturesOrder {
             client_order_id: id,
-            main_fkey: Some(2),
+            main_fkey: Some(main_fkey),
             symbol: "BTCUSDT".to_string(),
             side,
             create_ts_us: timestamp,
             update_ts_us: timestamp + 5,
+            fill_ts_us: Some(timestamp + 5),
             source_ts_us: timestamp + 10,
             amount,
             cprice: Some(101.0),
@@ -356,9 +448,25 @@ mod tests {
         })
     }
 
+    fn canceled_futures(id: i64, main_fkey: i64, side: Side, timestamp: i64) -> MatchEvent {
+        MatchEvent::Futures(FuturesOrder {
+            client_order_id: id,
+            main_fkey: Some(main_fkey),
+            symbol: "BTCUSDT".to_string(),
+            side,
+            create_ts_us: timestamp,
+            update_ts_us: timestamp + 5,
+            fill_ts_us: None,
+            source_ts_us: timestamp + 10,
+            amount: 0.0,
+            cprice: None,
+            event_count: 2,
+        })
+    }
+
     fn events() -> Vec<MatchEvent> {
         vec![
-            futures(20, Side::Sell, 40, 2.5),
+            futures(20, 2, Side::Sell, 40, 2.5),
             margin(1, Side::Buy, 10, 1.0),
             margin(2, Side::Buy, 20, 2.0),
             margin(3, Side::Sell, 30, 0.5),
@@ -420,7 +528,7 @@ mod tests {
             .apply(vec![
                 margin(1, Side::Buy, 10, 1.0),
                 margin(2, Side::Buy, 20, 2.0),
-                futures(20, Side::Sell, 30, 2.5),
+                futures(20, 2, Side::Sell, 30, 2.5),
             ])
             .unwrap();
         assert!(hedges[0].anchor_matched);
@@ -428,6 +536,41 @@ mod tests {
         let orders = engine.orders().collect::<Vec<_>>();
         assert_eq!(orders[0].matching_state, MatchingState::Completed);
         assert_eq!(orders[1].remaining_amount, 0.5);
+    }
+
+    #[test]
+    fn close_timestamps_include_canceled_hedge_and_last_fill() {
+        let mut engine = MatchEngine::new(Vec::new(), 1e-8).unwrap();
+        engine
+            .apply(vec![
+                margin(1, Side::Buy, 10, 2.0),
+                canceled_futures(19, 1, Side::Sell, 20),
+                canceled_futures(19, 1, Side::Sell, 20),
+                futures(20, 1, Side::Sell, 30, 1.0),
+                futures(21, 1, Side::Sell, 40, 1.0),
+            ])
+            .unwrap();
+        let order = engine.orders().next().unwrap();
+        assert_eq!(order.hts, Some(20));
+        assert_eq!(order.fts, Some(45));
+        assert_eq!(order.holding_close(), Some(35));
+        assert_eq!(order.close_count, 3);
+    }
+
+    #[test]
+    fn restores_first_hedge_time_from_an_earlier_sync_batch() {
+        let mut engine = MatchEngine::new(Vec::new(), 1e-8).unwrap();
+        engine.seed_hedge_history([(1, 20, None, 1)]);
+        engine
+            .apply(vec![
+                margin(1, Side::Buy, 10, 1.0),
+                futures(20, 1, Side::Sell, 30, 1.0),
+            ])
+            .unwrap();
+        let order = engine.orders().next().unwrap();
+        assert_eq!(order.hts, Some(20));
+        assert_eq!(order.fts, Some(35));
+        assert_eq!(order.close_count, 2);
     }
 
     #[test]

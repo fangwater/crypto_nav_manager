@@ -42,6 +42,10 @@ struct Args {
 
     #[arg(long, default_value_t = 1e-8)]
     qty_epsilon: f64,
+
+    /// Clears synthesized state and rebuilds this strategy from its aligned source start.
+    #[arg(long)]
+    rebuild: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +56,7 @@ struct Lifecycle {
     last_source_ts_us: i64,
     create_ts_us: i64,
     update_ts_us: i64,
+    last_fill_update_ts_us: Option<i64>,
     symbol: String,
     side: String,
     price: f64,
@@ -98,7 +103,11 @@ async fn main() -> Result<()> {
         .await
         .context("run PostgreSQL migrations")?;
 
-    let (schema, verified_through_ms) = strategy_scope(&pool, &args.strategy).await?;
+    let (schema, aligned_from_ms, verified_through_ms) =
+        strategy_scope(&pool, &args.strategy).await?;
+    if args.rebuild {
+        reset_synthesis(&pool, &schema, aligned_from_ms).await?;
+    }
     let target_ms = args
         .end_ms
         .unwrap_or(verified_through_ms)
@@ -139,15 +148,22 @@ async fn main() -> Result<()> {
     upsert_lifecycles(&mut tx, &schema, &deltas).await?;
     let ready = load_ready_lifecycles(&mut tx, &schema, released_through_us).await?;
     let pending = load_pending_orders(&mut tx, &schema).await?;
-    let (events, released_keys, margin_count, futures_count) =
-        lifecycle_events(&ready, args.qty_epsilon)?;
+    let hedge_history = load_hedge_history(&mut tx, &schema, &ready, args.qty_epsilon).await?;
+    let (events, margin_count, futures_count) = lifecycle_events(&ready, args.qty_epsilon)?;
     let mut engine = MatchEngine::new(pending, args.qty_epsilon)?;
+    engine.seed_hedge_history(hedge_history);
     let hedges = engine.apply(events)?;
     let orders = engine.into_orders();
 
     upsert_orders(&mut tx, &schema, &orders).await?;
     insert_hedges(&mut tx, &schema, &hedges).await?;
-    delete_released_lifecycles(&mut tx, &schema, &released_keys).await?;
+    delete_released_lifecycles(
+        &mut tx,
+        &schema,
+        released_through_us,
+        u64::try_from(ready.len()).context("released lifecycle count exceeds u64")?,
+    )
+    .await?;
     let margin_finalized_through_us =
         margin_finalized_watermark(&mut tx, &schema, released_through_us).await?;
     update_watermark(
@@ -231,9 +247,9 @@ async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
         .context("connect PostgreSQL")
 }
 
-async fn strategy_scope(pool: &PgPool, strategy: &str) -> Result<(String, i64)> {
+async fn strategy_scope(pool: &PgPool, strategy: &str) -> Result<(String, i64, i64)> {
     let row = sqlx::query(
-        "SELECT s.db_schema,c.verified_through_ms FROM strategy_envs s \
+        "SELECT s.db_schema,c.aligned_from_ms,c.verified_through_ms FROM strategy_envs s \
          JOIN rocksdb_alignment_checkpoints c ON c.strategy_slug=s.slug \
          WHERE s.slug=$1",
     )
@@ -244,7 +260,11 @@ async fn strategy_scope(pool: &PgPool, strategy: &str) -> Result<(String, i64)> 
     .with_context(|| format!("missing strategy/checkpoint for {strategy}"))?;
     let schema: String = row.try_get("db_schema")?;
     validate_schema(&schema)?;
-    Ok((schema, row.try_get("verified_through_ms")?))
+    Ok((
+        schema,
+        row.try_get("aligned_from_ms")?,
+        row.try_get("verified_through_ms")?,
+    ))
 }
 
 fn validate_schema(schema: &str) -> Result<()> {
@@ -271,6 +291,47 @@ async fn load_watermark(pool: &PgPool, schema: &str) -> Result<Watermark> {
         source_read_through_us: row.try_get("source_read_through_us")?,
         events_released_through_us: row.try_get("events_released_through_us")?,
     })
+}
+
+async fn reset_synthesis(pool: &PgPool, schema: &str, aligned_from_ms: i64) -> Result<()> {
+    let start_us = aligned_from_ms
+        .checked_mul(1_000)
+        .context("aligned source start overflows microseconds")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin synthesis rebuild reset")?;
+    let sql = format!("LOCK TABLE {schema}.intra_match_watermark IN EXCLUSIVE MODE");
+    sqlx::query(AssertSqlSafe(sql))
+        .execute(&mut *tx)
+        .await
+        .context("lock synthesis watermark table for rebuild")?;
+    for table in ["intra_order_lifecycle", "intra_hedges", "intra_orders"] {
+        let sql = format!("DELETE FROM {schema}.{table}");
+        sqlx::query(AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("clear {schema}.{table} for rebuild"))?;
+    }
+    let sql = format!(
+        "INSERT INTO {schema}.intra_match_watermark (singleton,source_read_through_us,\
+         events_released_through_us,margin_finalized_through_us,verified_through_ms,\
+         reorder_window_us,updated_at) VALUES (TRUE,$1,$1-1,$1-1,$2,600000000,CURRENT_TIMESTAMP) \
+         ON CONFLICT (singleton) DO UPDATE SET source_read_through_us=EXCLUDED.source_read_through_us,\
+         events_released_through_us=EXCLUDED.events_released_through_us,\
+         margin_finalized_through_us=EXCLUDED.margin_finalized_through_us,\
+         verified_through_ms=EXCLUDED.verified_through_ms,updated_at=CURRENT_TIMESTAMP"
+    );
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(start_us)
+        .bind(aligned_from_ms)
+        .execute(&mut *tx)
+        .await
+        .context("recreate synthesis watermark")?;
+    tx.commit()
+        .await
+        .context("commit synthesis rebuild reset")?;
+    Ok(())
 }
 
 async fn lock_watermark(tx: &mut Transaction<'_, Postgres>, schema: &str) -> Result<Watermark> {
@@ -407,6 +468,7 @@ fn fold_frame(
         let row_price = price.get(row).context("null price")?;
         let key = (venue.to_string(), id);
         let terminal = is_terminal(row_status);
+        let fill_update = fill_update_ts(row_status, fill, update);
         match lifecycle.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Lifecycle {
@@ -416,6 +478,7 @@ fn fold_frame(
                     last_source_ts_us: source,
                     create_ts_us: create_ts.get(row).context("null create_ts")?,
                     update_ts_us: update,
+                    last_fill_update_ts_us: fill_update,
                     symbol: symbol.get(row).context("null symbol")?.to_string(),
                     side: side.get(row).context("null side")?.to_ascii_lowercase(),
                     price: row_price,
@@ -440,6 +503,11 @@ fn fold_frame(
                 aggregate.fill_notional += fill * row_price;
                 aggregate.event_count += 1;
                 aggregate.terminal |= terminal;
+                aggregate.last_fill_update_ts_us =
+                    match (aggregate.last_fill_update_ts_us, fill_update) {
+                        (Some(current), Some(incoming)) => Some(current.max(incoming)),
+                        (current, incoming) => current.or(incoming),
+                    };
                 if (update, source) >= (aggregate.update_ts_us, aggregate.last_source_ts_us) {
                     aggregate.update_ts_us = update;
                     aggregate.symbol = symbol.get(row).context("null symbol")?.to_string();
@@ -454,6 +522,14 @@ fn fold_frame(
         }
     }
     Ok(frame.height())
+}
+
+fn fill_update_ts(status: &str, amount_update: f64, update_ts: i64) -> Option<i64> {
+    if amount_update > 0.0 || status.eq_ignore_ascii_case("FILLED") {
+        Some(update_ts)
+    } else {
+        None
+    }
 }
 
 fn is_terminal(status: &str) -> bool {
@@ -471,7 +547,8 @@ async fn upsert_lifecycles(
     for chunk in rows.chunks(2_000) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.intra_order_lifecycle (trading_venue,client_order_id,\
-             first_source_ts_us,last_source_ts_us,create_ts_us,update_ts_us,symbol,side,price,\
+             first_source_ts_us,last_source_ts_us,create_ts_us,update_ts_us,last_fill_update_ts_us,\
+             symbol,side,price,\
              price_offset,amount_init,filled_amount,fill_notional,status,from_key,event_count,terminal) "
         ));
         query.push_values(chunk, |mut values, row| {
@@ -482,6 +559,7 @@ async fn upsert_lifecycles(
                 .push_bind(row.last_source_ts_us)
                 .push_bind(row.create_ts_us)
                 .push_bind(row.update_ts_us)
+                .push_bind(row.last_fill_update_ts_us)
                 .push_bind(&row.symbol)
                 .push_bind(&row.side)
                 .push_bind(row.price)
@@ -500,6 +578,9 @@ async fn upsert_lifecycles(
              last_source_ts_us=GREATEST({schema}.intra_order_lifecycle.last_source_ts_us,EXCLUDED.last_source_ts_us),\
              create_ts_us=LEAST({schema}.intra_order_lifecycle.create_ts_us,EXCLUDED.create_ts_us),\
              update_ts_us=GREATEST({schema}.intra_order_lifecycle.update_ts_us,EXCLUDED.update_ts_us),\
+             last_fill_update_ts_us=GREATEST(\
+               {schema}.intra_order_lifecycle.last_fill_update_ts_us,\
+               EXCLUDED.last_fill_update_ts_us),\
              symbol=EXCLUDED.symbol,side=EXCLUDED.side,price=EXCLUDED.price,\
              price_offset=EXCLUDED.price_offset,amount_init=EXCLUDED.amount_init,\
              filled_amount={schema}.intra_order_lifecycle.filled_amount+EXCLUDED.filled_amount,\
@@ -524,7 +605,8 @@ async fn load_ready_lifecycles(
 ) -> Result<Vec<Lifecycle>> {
     let sql = format!(
         "SELECT trading_venue,client_order_id,first_source_ts_us,last_source_ts_us,\
-         create_ts_us,update_ts_us,symbol,side,price,price_offset,amount_init,filled_amount,\
+         create_ts_us,update_ts_us,last_fill_update_ts_us,symbol,side,price,price_offset,\
+         amount_init,filled_amount,\
          fill_notional,status,from_key,event_count,terminal \
          FROM {schema}.intra_order_lifecycle \
          WHERE terminal AND last_source_ts_us <= $1"
@@ -543,6 +625,7 @@ async fn load_ready_lifecycles(
                 last_source_ts_us: row.try_get("last_source_ts_us")?,
                 create_ts_us: row.try_get("create_ts_us")?,
                 update_ts_us: row.try_get("update_ts_us")?,
+                last_fill_update_ts_us: row.try_get("last_fill_update_ts_us")?,
                 symbol: row.try_get("symbol")?,
                 side: row.try_get("side")?,
                 price: row.try_get("price")?,
@@ -564,7 +647,7 @@ async fn load_pending_orders(
     schema: &str,
 ) -> Result<Vec<MarginOrder>> {
     let sql = format!(
-        "SELECT fkey,symbol,side,cts,open_uts,fts,close_count,price,amount,range,tlen,\
+        "SELECT fkey,symbol,side,cts,open_uts,hts,fts,close_count,price,amount,range,tlen,\
          open_fill_amount,remaining_amount,camount,netted_amount,close_notional,\
          open_source_ts_us FROM {schema}.intra_orders WHERE matching_state='pending' \
          ORDER BY open_uts,open_source_ts_us,fkey"
@@ -581,6 +664,7 @@ async fn load_pending_orders(
                 side: Side::parse(row.try_get::<&str, _>("side")?)?,
                 cts: row.try_get("cts")?,
                 open_uts: row.try_get("open_uts")?,
+                hts: row.try_get("hts")?,
                 fts: row.try_get("fts")?,
                 close_count: row.try_get("close_count")?,
                 price: row.try_get("price")?,
@@ -599,28 +683,69 @@ async fn load_pending_orders(
         .collect()
 }
 
-fn lifecycle_events(
-    rows: &[Lifecycle],
+async fn load_hedge_history(
+    tx: &mut Transaction<'_, Postgres>,
+    schema: &str,
+    ready: &[Lifecycle],
     epsilon: f64,
-) -> Result<(Vec<MatchEvent>, Vec<(String, i64)>, usize, usize)> {
+) -> Result<Vec<(i64, i64, Option<i64>, i64)>> {
+    let mut fkeys = ready
+        .iter()
+        .filter(|row| row.venue.ends_with("Margin") && row.filled_amount > epsilon)
+        .map(|row| row.client_order_id)
+        .collect::<Vec<_>>();
+    fkeys.sort_unstable();
+    fkeys.dedup();
+    if fkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT main_fkey,MIN(create_ts_us) AS hts,MAX(fill_ts_us) AS fts,\
+         COUNT(*)::bigint AS close_count \
+         FROM {schema}.intra_hedges \
+         WHERE main_fkey=ANY($1) GROUP BY main_fkey"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(&fkeys)
+        .fetch_all(&mut **tx)
+        .await
+        .context("load historical Futures hedge summaries")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("main_fkey")?,
+                row.try_get("hts")?,
+                row.try_get("fts")?,
+                row.try_get("close_count")?,
+            ))
+        })
+        .collect()
+}
+
+fn lifecycle_events(rows: &[Lifecycle], epsilon: f64) -> Result<(Vec<MatchEvent>, usize, usize)> {
     let mut events = Vec::new();
-    let mut released = Vec::with_capacity(rows.len());
     let mut margins = 0usize;
     let mut futures = 0usize;
     for row in rows {
-        released.push((row.venue.clone(), row.client_order_id));
-        if row.filled_amount <= epsilon {
-            continue;
-        }
         let side = Side::parse(&row.side)?;
         if row.venue.ends_with("Margin") {
+            if row.filled_amount <= epsilon {
+                continue;
+            }
+            let open_uts = row.last_fill_update_ts_us.with_context(|| {
+                format!(
+                    "filled Margin order {}/{} has no FILLED or PARTIALLY_FILLED timestamp",
+                    row.venue, row.client_order_id
+                )
+            })?;
             margins += 1;
             events.push(MatchEvent::Margin(MarginOrder {
                 fkey: row.client_order_id,
                 symbol: row.symbol.clone(),
                 side,
                 cts: row.create_ts_us,
-                open_uts: row.update_ts_us,
+                open_uts,
+                hts: None,
                 fts: None,
                 close_count: 0,
                 price: row.price,
@@ -636,6 +761,16 @@ fn lifecycle_events(
                 open_source_ts_us: row.last_source_ts_us,
             }));
         } else if row.venue.ends_with("Futures") {
+            let fill_ts_us = if row.filled_amount > epsilon {
+                Some(row.last_fill_update_ts_us.with_context(|| {
+                    format!(
+                        "filled Futures order {}/{} has no FILLED or PARTIALLY_FILLED timestamp",
+                        row.venue, row.client_order_id
+                    )
+                })?)
+            } else {
+                None
+            };
             futures += 1;
             events.push(MatchEvent::Futures(FuturesOrder {
                 client_order_id: row.client_order_id,
@@ -644,6 +779,7 @@ fn lifecycle_events(
                 side,
                 create_ts_us: row.create_ts_us,
                 update_ts_us: row.update_ts_us,
+                fill_ts_us,
                 source_ts_us: row.last_source_ts_us,
                 amount: row.filled_amount,
                 cprice: (row.filled_amount > epsilon)
@@ -652,7 +788,7 @@ fn lifecycle_events(
             }));
         }
     }
-    Ok((events, released, margins, futures))
+    Ok((events, margins, futures))
 }
 
 fn parse_tlen(from_key: &str) -> Option<f64> {
@@ -672,7 +808,7 @@ async fn upsert_orders(
 ) -> Result<()> {
     for chunk in rows.chunks(1_500) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.intra_orders (fkey,symbol,side,cts,open_uts,fts,holding,\
+            "INSERT INTO {schema}.intra_orders (fkey,symbol,side,cts,open_uts,hts,fts,holding,\
              holding_close,close_count,price,amount,cprice,camount,range,crange,tlen,pnlu,\
              open_fill_amount,remaining_amount,netted_amount,close_notional,matching_state,\
              open_source_ts_us,updated_at) "
@@ -684,6 +820,7 @@ async fn upsert_orders(
                 .push_bind(row.side.as_str())
                 .push_bind(row.cts)
                 .push_bind(row.open_uts)
+                .push_bind(row.hts)
                 .push_bind(row.fts)
                 .push_bind(row.holding())
                 .push_bind(row.holding_close())
@@ -705,7 +842,7 @@ async fn upsert_orders(
                 .push("CURRENT_TIMESTAMP");
         });
         query.push(
-            " ON CONFLICT (fkey) DO UPDATE SET fts=EXCLUDED.fts,\
+            " ON CONFLICT (fkey) DO UPDATE SET hts=EXCLUDED.hts,fts=EXCLUDED.fts,\
              holding_close=EXCLUDED.holding_close,close_count=EXCLUDED.close_count,\
              cprice=EXCLUDED.cprice,camount=EXCLUDED.camount,pnlu=EXCLUDED.pnlu,\
              remaining_amount=EXCLUDED.remaining_amount,netted_amount=EXCLUDED.netted_amount,\
@@ -729,7 +866,7 @@ async fn insert_hedges(
     for chunk in rows.chunks(2_000) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.intra_hedges (client_order_id,main_fkey,symbol,side,\
-             create_ts_us,update_ts_us,source_ts_us,amount,cprice,event_count,allocated_amount,\
+             create_ts_us,update_ts_us,fill_ts_us,source_ts_us,amount,cprice,event_count,allocated_amount,\
              unallocated_amount,anchor_matched) "
         ));
         query.push_values(chunk, |mut values, row| {
@@ -740,6 +877,7 @@ async fn insert_hedges(
                 .push_bind(row.order.side.as_str())
                 .push_bind(row.order.create_ts_us)
                 .push_bind(row.order.update_ts_us)
+                .push_bind(row.order.fill_ts_us)
                 .push_bind(row.order.source_ts_us)
                 .push_bind(row.order.amount)
                 .push_bind(row.order.cprice)
@@ -761,20 +899,21 @@ async fn insert_hedges(
 async fn delete_released_lifecycles(
     tx: &mut Transaction<'_, Postgres>,
     schema: &str,
-    rows: &[(String, i64)],
+    released_through_us: i64,
+    expected: u64,
 ) -> Result<()> {
-    for chunk in rows.chunks(2_000) {
-        let mut query = QueryBuilder::<Postgres>::new(format!(
-            "DELETE FROM {schema}.intra_order_lifecycle WHERE (trading_venue,client_order_id) IN "
-        ));
-        query.push_tuples(chunk, |mut tuple, (venue, client_id)| {
-            tuple.push_bind(venue).push_bind(*client_id);
-        });
-        query
-            .build()
-            .execute(&mut **tx)
-            .await
-            .context("delete released lifecycle aggregates")?;
+    let sql = format!(
+        "DELETE FROM {schema}.intra_order_lifecycle \
+         WHERE terminal AND last_source_ts_us <= $1"
+    );
+    let deleted = sqlx::query(AssertSqlSafe(sql))
+        .bind(released_through_us)
+        .execute(&mut **tx)
+        .await
+        .context("delete released lifecycle aggregates")?
+        .rows_affected();
+    if deleted != expected {
+        bail!("released lifecycle delete mismatch: expected {expected}, deleted {deleted}");
     }
     Ok(())
 }
@@ -846,5 +985,15 @@ mod tests {
         }
         assert!(!is_terminal("NEW"));
         assert!(!is_terminal("PARTIALLY_FILLED"));
+    }
+
+    #[test]
+    fn selects_only_actual_fill_timestamps() {
+        assert_eq!(fill_update_ts("PARTIALLY_FILLED", 2.5, 1_000), Some(1_000));
+        assert_eq!(fill_update_ts("FILLED", 0.0, 2_000), Some(2_000));
+        assert_eq!(fill_update_ts("PARTIALLY_FILLED", 0.0, 3_000), None);
+        assert_eq!(fill_update_ts("CANCELED", 2.5, 4_000), Some(4_000));
+        assert_eq!(fill_update_ts("CANCELED", 0.0, 4_500), None);
+        assert_eq!(fill_update_ts("EXPIRED", 0.0, 5_000), None);
     }
 }

@@ -66,6 +66,7 @@ struct OrderRow {
     side: String,
     cts: i64,
     open_uts: i64,
+    hts: Option<i64>,
     fts: Option<i64>,
     holding: i64,
     holding_close: Option<i64>,
@@ -330,7 +331,7 @@ async fn load_day_snapshot(
         .await?
         .with_context(|| format!("no matched orders in {schema} on {date}"))?;
     let sql = format!(
-        "SELECT fkey,symbol,side,cts,open_uts,fts,holding,holding_close,close_count,price,\
+        "SELECT fkey,symbol,side,cts,open_uts,hts,fts,holding,holding_close,close_count,price,\
          amount,cprice,camount,range,crange,tlen,pnlu \
          FROM {schema}.intra_orders WHERE cts >= $1 AND cts < $2 ORDER BY cts,fkey"
     );
@@ -357,6 +358,7 @@ async fn load_day_snapshot(
                 side: row.try_get("side")?,
                 cts: row.try_get("cts")?,
                 open_uts: row.try_get("open_uts")?,
+                hts: row.try_get("hts")?,
                 fts: row.try_get("fts")?,
                 holding: row.try_get("holding")?,
                 holding_close: row.try_get("holding_close")?,
@@ -432,6 +434,7 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
     let mut side = Vec::with_capacity(rows.len());
     let mut cts = Vec::with_capacity(rows.len());
     let mut open_uts = Vec::with_capacity(rows.len());
+    let mut hts = Vec::with_capacity(rows.len());
     let mut fts = Vec::with_capacity(rows.len());
     let mut holding = Vec::with_capacity(rows.len());
     let mut holding_close = Vec::with_capacity(rows.len());
@@ -451,6 +454,7 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         side.push(row.side);
         cts.push(row.cts);
         open_uts.push(row.open_uts);
+        hts.push(row.hts);
         fts.push(row.fts);
         holding.push(row.holding);
         holding_close.push(row.holding_close);
@@ -471,6 +475,7 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         Series::new("side".into(), side),
         Series::new("cts".into(), cts),
         Series::new("open_uts".into(), open_uts),
+        Series::new("hts".into(), hts),
         Series::new("fts".into(), fts),
         Series::new("holding".into(), holding),
         Series::new("holding_close".into(), holding_close),
