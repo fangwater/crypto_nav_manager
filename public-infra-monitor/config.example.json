@@ -1,0 +1,48 @@
+{
+  "listen": "127.0.0.1:9918",
+  "sample_interval_secs": 10,
+  "interface": "ens41",
+  "executable": "spread_pbs",
+  "bpf_enabled": true,
+  "thresholds": {
+    "recv_queue_warn_bytes": 65536,
+    "recv_queue_critical_bytes": 1048576,
+    "retrans_warn": 1,
+    "retrans_critical": 10,
+    "socket_drop_warn": 1,
+    "socket_drop_critical": 10,
+    "reconnect_warn": 2,
+    "reconnect_critical": 10,
+    "softnet_drop_warn": 1,
+    "softnet_time_squeeze_warn": 1,
+    "rx_idle_warn_secs": 30,
+    "rx_idle_critical_secs": 120
+  },
+  "targets": [
+    {
+      "name": "spp_bn_mg",
+      "venue": "binance-margin",
+      "expected_cpu": 8
+    },
+    {
+      "name": "spp_bn_fu",
+      "venue": "binance-futures",
+      "expected_cpu": 9
+    },
+    {
+      "name": "spp_gt_bo",
+      "venue": "gate-both",
+      "expected_cpu": 10
+    },
+    {
+      "name": "spp_bg_bo",
+      "venue": "bitget-both",
+      "expected_cpu": 11
+    },
+    {
+      "name": "spp_ok_bo",
+      "venue": "okex-both",
+      "expected_cpu": 12
+    }
+  ]
+}
