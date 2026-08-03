@@ -213,6 +213,7 @@ struct AlignmentStatusResponse {
     state: String,
     phase: String,
     progress_percent: i32,
+    automatic_enabled: bool,
     started_at_ms: Option<i64>,
     updated_at_ms: i64,
     completed_at_ms: Option<i64>,
@@ -225,6 +226,18 @@ struct AlignmentStatusResponse {
     pg_event_count: Option<i64>,
     local_event_count: Option<i64>,
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetAlignmentAutomaticRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentAutomaticResponse {
+    strategy_slug: String,
+    automatic_enabled: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -420,6 +433,10 @@ pub async fn run() -> Result<()> {
         .route("/api/account-risks", get(list_account_risks))
         .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/alignment-status", get(list_alignment_status))
+        .route(
+            "/api/alignment-status/{slug}",
+            axum::routing::put(set_alignment_automatic),
+        )
         .route("/api/intra-matching", get(list_intra_matching))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
@@ -542,7 +559,7 @@ async fn list_alignment_status(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AlignmentStatusResponse>>, ApiError> {
     let rows = sqlx::query_as::<_, AlignmentStatusResponse>(
-        r#"SELECT a.strategy_slug,a.state,a.phase,a.progress_percent,
+        r#"SELECT a.strategy_slug,a.state,a.phase,a.progress_percent,a.automatic_enabled,
                   (EXTRACT(EPOCH FROM a.started_at) * 1000)::bigint AS started_at_ms,
                   (EXTRACT(EPOCH FROM a.updated_at) * 1000)::bigint AS updated_at_ms,
                   (EXTRACT(EPOCH FROM a.completed_at) * 1000)::bigint AS completed_at_ms,
@@ -556,6 +573,38 @@ async fn list_alignment_status(
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(rows))
+}
+
+async fn set_alignment_automatic(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<SetAlignmentAutomaticRequest>,
+) -> Result<Response, ApiError> {
+    let updated = sqlx::query_as::<_, (String, bool)>(
+        r#"UPDATE rocksdb_alignment_status
+           SET automatic_enabled=$2,automatic_updated_at=CURRENT_TIMESTAMP
+           WHERE strategy_slug=$1
+           RETURNING strategy_slug,automatic_enabled"#,
+    )
+    .bind(&slug)
+    .bind(request.enabled)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(match updated {
+        Some((strategy_slug, automatic_enabled)) => Json(AlignmentAutomaticResponse {
+            strategy_slug,
+            automatic_enabled,
+        })
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "alignment strategy not found",
+            }),
+        )
+            .into_response(),
+    })
 }
 
 async fn list_intra_matching(

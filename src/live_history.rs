@@ -144,7 +144,7 @@ async fn run(pool: PgPool, config: LiveHistoryConfig) {
             continue;
         }
         let task_config = config.clone();
-        tasks.spawn(run_strategy(task_config, strategy));
+        tasks.spawn(run_strategy(pool.clone(), task_config, strategy));
     }
 
     while let Some(joined) = tasks.join_next().await {
@@ -155,7 +155,7 @@ async fn run(pool: PgPool, config: LiveHistoryConfig) {
     }
 }
 
-async fn run_strategy(config: LiveHistoryConfig, strategy: LiveHistoryStrategy) {
+async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHistoryStrategy) {
     loop {
         let (delay, next_sync_at_ms) = match delay_until_next_slot(
             SystemTime::now(),
@@ -178,9 +178,24 @@ async fn run_strategy(config: LiveHistoryConfig, strategy: LiveHistoryStrategy) 
         );
         tokio::time::sleep(delay).await;
 
+        let automatic_alignment_enabled =
+            match load_automatic_alignment_enabled(&pool, &strategy.slug).await {
+                Ok(enabled) => enabled,
+                Err(error) => {
+                    warn!(
+                        strategy = %strategy.slug,
+                        error = ?error,
+                        "load automatic alignment switch failed; skip alignment"
+                    );
+                    false
+                }
+            };
         let task_config = config.clone();
         let task_strategy = strategy.clone();
-        match tokio::task::spawn_blocking(move || sync_strategy(&task_config, task_strategy)).await
+        match tokio::task::spawn_blocking(move || {
+            sync_strategy(&task_config, task_strategy, automatic_alignment_enabled)
+        })
+        .await
         {
             Ok(Ok(report)) => info!(
                 strategy = %report.slug,
@@ -224,6 +239,17 @@ fn delay_until_next_slot(
     Ok((Duration::from_millis(delay_ms as u64), next_sync_at_ms))
 }
 
+async fn load_automatic_alignment_enabled(pool: &PgPool, slug: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT automatic_enabled FROM rocksdb_alignment_status WHERE strategy_slug=$1",
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .context("load automatic RocksDB alignment switch")?
+    .unwrap_or(true))
+}
+
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     sqlx::query_as(
         r#"SELECT s.slug, s.env_path, s.exchange, s.strategy_kind,
@@ -252,7 +278,11 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     .context("query live history strategies")
 }
 
-fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> Result<SyncReport> {
+fn sync_strategy(
+    config: &LiveHistoryConfig,
+    strategy: LiveHistoryStrategy,
+    automatic_alignment_enabled: bool,
+) -> Result<SyncReport> {
     let mut failures = Vec::new();
     let mut summaries = Vec::new();
     let needs_online_symbols = uses_online_symbols(&strategy);
@@ -299,7 +329,9 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
     }
 
     let mut alignment_succeeded = false;
-    let alignment_summary = if trades_succeeded && alignment_check_enabled(&strategy.slug) {
+    let alignment_summary = if trades_succeeded
+        && alignment_check_enabled(&strategy.slug, automatic_alignment_enabled)
+    {
         match run_alignment_check(config, &strategy.slug) {
             Ok(summary) => {
                 alignment_succeeded = true;
@@ -351,15 +383,16 @@ fn sync_strategy(config: &LiveHistoryConfig, strategy: LiveHistoryStrategy) -> R
     })
 }
 
-fn alignment_check_enabled(slug: &str) -> bool {
-    matches!(
-        slug,
-        "binance_mm_alpha"
-            | "bybit_mm_alpha"
-            | "binance-intra-arb01"
-            | "bybit-intra-arb01"
-            | "bybit-intra-arb02"
-    )
+fn alignment_check_enabled(slug: &str, automatic_enabled: bool) -> bool {
+    automatic_enabled
+        && matches!(
+            slug,
+            "binance_mm_alpha"
+                | "bybit_mm_alpha"
+                | "binance-intra-arb01"
+                | "bybit-intra-arb01"
+                | "bybit-intra-arb02"
+        )
 }
 
 fn order_synthesis_enabled(slug: &str) -> bool {
@@ -704,12 +737,13 @@ mod tests {
 
     #[test]
     fn limits_alignment_checks_to_reconciled_accounts() {
-        assert!(alignment_check_enabled("binance_mm_alpha"));
-        assert!(alignment_check_enabled("bybit_mm_alpha"));
-        assert!(alignment_check_enabled("binance-intra-arb01"));
-        assert!(alignment_check_enabled("bybit-intra-arb01"));
-        assert!(alignment_check_enabled("bybit-intra-arb02"));
-        assert!(!alignment_check_enabled("binance_fr_arb03"));
+        assert!(alignment_check_enabled("binance_mm_alpha", true));
+        assert!(alignment_check_enabled("bybit_mm_alpha", true));
+        assert!(!alignment_check_enabled("bybit_mm_alpha", false));
+        assert!(alignment_check_enabled("binance-intra-arb01", true));
+        assert!(alignment_check_enabled("bybit-intra-arb01", true));
+        assert!(alignment_check_enabled("bybit-intra-arb02", true));
+        assert!(!alignment_check_enabled("binance_fr_arb03", true));
     }
 
     #[test]

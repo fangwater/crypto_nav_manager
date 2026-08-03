@@ -20,6 +20,7 @@ const phaseLabels: Record<string, string> = {
 }
 
 export function alignmentTone(status: AlignmentStatus) {
+  if (!status.automaticEnabled) return 'waiting'
   if (status.state === 'running') return 'running'
   if (status.state === 'succeeded') return 'succeeded'
   if (status.state === 'mismatch') return 'mismatch'
@@ -28,6 +29,7 @@ export function alignmentTone(status: AlignmentStatus) {
 }
 
 export function alignmentLabel(status: AlignmentStatus) {
+  if (!status.automaticEnabled) return '自动校对已暂停'
   if (status.state === 'running') {
     return `${phaseLabels[status.phase] ?? status.phase} ${status.progressPercent}%`
   }

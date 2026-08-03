@@ -60,6 +60,7 @@ export interface AlignmentStatus {
   state: 'waiting' | 'running' | 'succeeded' | 'mismatch' | 'failed'
   phase: string
   progressPercent: number
+  automaticEnabled: boolean
   startedAtMs: number | null
   updatedAtMs: number
   completedAtMs: number | null
