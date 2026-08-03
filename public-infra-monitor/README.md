@@ -62,7 +62,10 @@ sysfs NIC statistics but does not yet implement ENA vendor counters through
 ethtool netlink, and leaves runqlat unset. Scheduler tracing should remain an
 on-demand bounded window because `sched_switch` is a hot tracepoint.
 
-The example systemd unit grants only `CAP_BPF` and `CAP_PERFMON`. Some older
-kernels may require `CAP_SYS_ADMIN`; add it only after validating the target
-kernel, rather than granting it by default. A BPF load/attach failure is
+The example systemd unit grants `CAP_BPF`, `CAP_PERFMON` and
+`CAP_DAC_READ_SEARCH`. Some older kernels may require `CAP_SYS_ADMIN`; add it
+only after validating the target kernel. A BPF load/attach failure is
 reported in `capabilities.bpf_reason` while INET_DIAG monitoring continues.
+`CAP_DAC_READ_SEARCH` is limited to the monitor service because some tracefs
+mounts expose tracepoint ID files as `0440 root:root`; libbpf must read those
+IDs before opening the perf events.

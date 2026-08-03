@@ -18,8 +18,8 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-AmbientCapabilities=CAP_BPF CAP_PERFMON
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_DAC_READ_SEARCH
 LimitMEMLOCK=infinity
 
 [Install]
