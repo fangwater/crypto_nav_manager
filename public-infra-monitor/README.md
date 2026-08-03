@@ -50,7 +50,13 @@ Daemon mode serves:
 
 - `GET /healthz`
 - `GET /v1/snapshot`
+- `GET /v1/history?hours=24`
 - `GET /metrics`
+
+Completed sampling windows are aggregated into one-minute buckets and retained
+for 24 hours (at most 1,440 buckets per target). Once per minute the daemon
+atomically replaces `/var/lib/public-infra-monitor/history.json`; it does not
+create daily or append-only files.
 
 The frontend route is `/nav/#/market-data`. In development, Vite proxies
 `/market-data-api/` to the loopback listener. For nginx, apply the reviewed

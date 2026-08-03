@@ -11,8 +11,11 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { MarketDataHistoryChart } from '../components/MarketDataHistoryChart'
 import {
+  getMarketDataHistory,
   getMarketDataSnapshot,
+  type MarketDataHistory,
   type MarketDataSnapshot,
   type MarketDataTarget,
 } from '../marketDataApi'
@@ -113,6 +116,8 @@ function feedReason(target: MarketDataTarget) {
 
 export function MarketDataNetworkPage() {
   const [snapshot, setSnapshot] = useState<MarketDataSnapshot | null>(null)
+  const [history, setHistory] = useState<MarketDataHistory | null>(null)
+  const [historyError, setHistoryError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
 
@@ -136,6 +141,35 @@ export function MarketDataNetworkPage() {
     }
     refresh()
     const timer = window.setInterval(refresh, 5_000)
+    return () => {
+      active = false
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [refreshKey])
+
+  useEffect(() => {
+    let active = true
+    let controller = new AbortController()
+    const refresh = () => {
+      controller.abort()
+      const requestController = new AbortController()
+      controller = requestController
+      getMarketDataHistory(24, requestController.signal)
+        .then((next) => {
+          if (!active) return
+          setHistory(next)
+          setHistoryError(null)
+        })
+        .catch((reason: unknown) => {
+          if (!active || requestController.signal.aborted) return
+          setHistoryError(
+            reason instanceof Error ? reason.message : String(reason),
+          )
+        })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 60_000)
     return () => {
       active = false
       controller.abort()
@@ -394,6 +428,28 @@ export function MarketDataNetworkPage() {
               </div>
             )}
           </div>
+        </section>
+
+        <section className="market-history-section">
+          <div className="market-network-section-heading">
+            <h2>最近 24 小时</h2>
+            <span>1 分钟粒度</span>
+          </div>
+          {history &&
+          history.targets.some((target) => target.points.length > 0) ? (
+            <MarketDataHistoryChart history={history} />
+          ) : (
+            <div className="market-history-empty">
+              <RadioTower size={17} />
+              {historyError ? '历史状态暂不可用' : '等待首个历史分钟'}
+            </div>
+          )}
+          {historyError && history && (
+            <div className="market-history-error">
+              <CircleAlert size={15} />
+              历史状态刷新失败，图中保留上次数据
+            </div>
+          )}
         </section>
 
         {snapshot && snapshot.system.status !== 'OK' && (

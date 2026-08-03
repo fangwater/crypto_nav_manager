@@ -2,6 +2,7 @@ mod bpf;
 mod collector;
 mod config;
 mod health;
+mod history;
 mod model;
 mod procfs;
 mod sock_diag;
@@ -17,12 +18,13 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use clap::Parser;
+use serde::Deserialize;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -30,16 +32,27 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     collector::Monitor,
     config::MonitorConfig,
+    history::{HistoryResponse, HistoryStore, RETENTION_HOURS},
     model::{HealthStatus, Snapshot},
 };
 
 type SharedSnapshot = Arc<RwLock<Option<Snapshot>>>;
+type SharedHistory = Arc<RwLock<HistoryStore>>;
+
+#[derive(Clone)]
+struct AppState {
+    snapshot: SharedSnapshot,
+    history: SharedHistory,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Read-only process network health monitor")]
 struct Args {
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
+
+    #[arg(long, default_value = "/var/lib/public-infra-monitor/history.json")]
+    history_path: PathBuf,
 
     #[arg(long)]
     once: bool,
@@ -76,7 +89,7 @@ async fn main() -> Result<()> {
     if args.once {
         return run_once(config, args.window_secs).await;
     }
-    run_daemon(config).await
+    run_daemon(config, args.history_path).await
 }
 
 async fn run_once(config: MonitorConfig, window_secs: Option<u64>) -> Result<()> {
@@ -89,9 +102,21 @@ async fn run_once(config: MonitorConfig, window_secs: Option<u64>) -> Result<()>
     Ok(())
 }
 
-async fn run_daemon(config: MonitorConfig) -> Result<()> {
+async fn run_daemon(config: MonitorConfig, history_path: PathBuf) -> Result<()> {
     let listen = config.listen.clone();
     let interval = Duration::from_secs(config.sample_interval_secs);
+    let history_store = match HistoryStore::load(history_path.clone()) {
+        Ok(history) => history,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %history_path.display(),
+                "history load failed; starting with empty history"
+            );
+            HistoryStore::new(history_path)
+        }
+    };
+    let history = Arc::new(RwLock::new(history_store));
     let monitor = Arc::new(Mutex::new(Monitor::new(config)));
     let initial = monitor
         .lock()
@@ -102,6 +127,7 @@ async fn run_daemon(config: MonitorConfig) -> Result<()> {
 
     let collector_monitor = Arc::clone(&monitor);
     let collector_snapshot = Arc::clone(&snapshot);
+    let collector_history = Arc::clone(&history);
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         timer.tick().await;
@@ -112,30 +138,46 @@ async fn run_daemon(config: MonitorConfig) -> Result<()> {
                 .expect("monitor mutex poisoned")
                 .sample();
             match result {
-                Ok(value) => *collector_snapshot.write().await = Some(value),
+                Ok(value) => {
+                    *collector_snapshot.write().await = Some(value.clone());
+                    let mut history = collector_history.write().await;
+                    if history.record(&value)
+                        && let Err(error) = history.persist_if_due()
+                    {
+                        warn!(error = %error, "history persistence failed");
+                    }
+                }
                 Err(error) => error!(error = %error, "sampling failed"),
             }
         }
     });
 
+    let state = AppState {
+        snapshot: Arc::clone(&snapshot),
+        history: Arc::clone(&history),
+    };
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/snapshot", get(snapshot_json))
+        .route("/v1/history", get(history_json))
         .route("/metrics", get(metrics))
-        .with_state(snapshot);
+        .with_state(state);
     let listener = TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind HTTP listener {listen}"))?;
     info!(listen = %listen, "public-infra-monitor listening");
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve HTTP")?;
+        .await;
+    if let Err(error) = history.write().await.persist_latest() {
+        warn!(error = %error, "final history persistence failed");
+    }
+    serve_result.context("serve HTTP")?;
     Ok(())
 }
 
-async fn healthz(State(state): State<SharedSnapshot>) -> StatusCode {
-    let guard = state.read().await;
+async fn healthz(State(state): State<AppState>) -> StatusCode {
+    let guard = state.snapshot.read().await;
     match guard.as_ref() {
         Some(snapshot)
             if snapshot.system.status != HealthStatus::Critical
@@ -150,8 +192,9 @@ async fn healthz(State(state): State<SharedSnapshot>) -> StatusCode {
     }
 }
 
-async fn snapshot_json(State(state): State<SharedSnapshot>) -> Result<Json<Snapshot>, StatusCode> {
+async fn snapshot_json(State(state): State<AppState>) -> Result<Json<Snapshot>, StatusCode> {
     state
+        .snapshot
         .read()
         .await
         .clone()
@@ -159,8 +202,26 @@ async fn snapshot_json(State(state): State<SharedSnapshot>) -> Result<Json<Snaps
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
-async fn metrics(State(state): State<SharedSnapshot>) -> Response {
-    let guard = state.read().await;
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    hours: Option<u64>,
+}
+
+async fn history_json(
+    Query(query): Query<HistoryQuery>,
+    State(state): State<AppState>,
+) -> Json<HistoryResponse> {
+    Json(
+        state
+            .history
+            .read()
+            .await
+            .response(query.hours.unwrap_or(RETENTION_HOURS)),
+    )
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    let guard = state.snapshot.read().await;
     let Some(snapshot) = guard.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
