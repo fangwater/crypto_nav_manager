@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, net::SocketAddr};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ pub struct MonitorConfig {
     pub bpf_enabled: bool,
     #[serde(default)]
     pub thresholds: Thresholds,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
     pub targets: Vec<TargetConfig>,
 }
 
@@ -26,6 +28,44 @@ pub struct TargetConfig {
     pub name: String,
     pub venue: String,
     pub expected_cpu: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub address: String,
+    pub queue_capacity: usize,
+    pub request_timeout_ms: u64,
+    pub repeat_interval_secs: u64,
+    pub recovery_samples: u32,
+    pub disconnect_cooldown_secs: u64,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: "127.0.0.1:18100".to_owned(),
+            queue_capacity: 32,
+            request_timeout_ms: 250,
+            repeat_interval_secs: 15 * 60,
+            recovery_samples: 2,
+            disconnect_cooldown_secs: 5 * 60,
+        }
+    }
+}
+
+impl NotificationConfig {
+    pub fn socket_address(&self) -> Result<SocketAddr> {
+        let address = self.address.parse::<SocketAddr>().map_err(|error| {
+            anyhow::anyhow!("invalid notification address {}: {error}", self.address)
+        })?;
+        if !address.ip().is_loopback() {
+            bail!("notification address must be loopback: {address}");
+        }
+        Ok(address)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +117,25 @@ impl MonitorConfig {
         }
 
         let mut names = HashSet::new();
+        if self.notifications.enabled {
+            self.notifications.socket_address()?;
+            if !(1..=4_096).contains(&self.notifications.queue_capacity) {
+                bail!("notification queue_capacity must be in [1, 4096]");
+            }
+            if !(1..=5_000).contains(&self.notifications.request_timeout_ms) {
+                bail!("notification request_timeout_ms must be in [1, 5000]");
+            }
+            if self.notifications.repeat_interval_secs == 0 {
+                bail!("notification repeat_interval_secs must be greater than zero");
+            }
+            if !(1..=100).contains(&self.notifications.recovery_samples) {
+                bail!("notification recovery_samples must be in [1, 100]");
+            }
+            if self.notifications.disconnect_cooldown_secs == 0 {
+                bail!("notification disconnect_cooldown_secs must be greater than zero");
+            }
+        }
+
         let mut venues = HashSet::new();
         for target in &self.targets {
             if !names.insert(&target.name) {
@@ -119,6 +178,7 @@ mod tests {
             executable: default_executable(),
             bpf_enabled: true,
             thresholds: Thresholds::default(),
+            notifications: NotificationConfig::default(),
             targets: vec![
                 TargetConfig {
                     name: "a".to_owned(),
@@ -133,5 +193,15 @@ mod tests {
             ],
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_loopback_notification_address() {
+        let notifications = NotificationConfig {
+            address: "192.0.2.1:18100".to_owned(),
+            ..NotificationConfig::default()
+        };
+
+        assert!(notifications.socket_address().is_err());
     }
 }

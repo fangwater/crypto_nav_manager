@@ -4,6 +4,7 @@ mod config;
 mod health;
 mod history;
 mod model;
+mod notification;
 mod procfs;
 mod sock_diag;
 mod system;
@@ -34,6 +35,7 @@ use crate::{
     config::MonitorConfig,
     history::{HistoryResponse, HistoryStore, RETENTION_HOURS},
     model::{HealthStatus, Snapshot},
+    notification::{NotificationManager, NotificationStats, NotificationStatsSnapshot},
 };
 
 type SharedSnapshot = Arc<RwLock<Option<Snapshot>>>;
@@ -43,6 +45,7 @@ type SharedHistory = Arc<RwLock<HistoryStore>>;
 struct AppState {
     snapshot: SharedSnapshot,
     history: SharedHistory,
+    notification_stats: Arc<NotificationStats>,
 }
 
 #[derive(Debug, Parser)]
@@ -105,6 +108,8 @@ async fn run_once(config: MonitorConfig, window_secs: Option<u64>) -> Result<()>
 async fn run_daemon(config: MonitorConfig, history_path: PathBuf) -> Result<()> {
     let listen = config.listen.clone();
     let interval = Duration::from_secs(config.sample_interval_secs);
+    let (mut notification_manager, notification_stats) =
+        NotificationManager::new(config.notifications.clone())?;
     let history_store = match HistoryStore::load(history_path.clone()) {
         Ok(history) => history,
         Err(error) => {
@@ -140,12 +145,15 @@ async fn run_daemon(config: MonitorConfig, history_path: PathBuf) -> Result<()> 
             match result {
                 Ok(value) => {
                     *collector_snapshot.write().await = Some(value.clone());
-                    let mut history = collector_history.write().await;
-                    if history.record(&value)
-                        && let Err(error) = history.persist_if_due()
                     {
-                        warn!(error = %error, "history persistence failed");
+                        let mut history = collector_history.write().await;
+                        if history.record(&value)
+                            && let Err(error) = history.persist_if_due()
+                        {
+                            warn!(error = %error, "history persistence failed");
+                        }
                     }
+                    notification_manager.observe(&value);
                 }
                 Err(error) => error!(error = %error, "sampling failed"),
             }
@@ -155,6 +163,7 @@ async fn run_daemon(config: MonitorConfig, history_path: PathBuf) -> Result<()> 
     let state = AppState {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
+        notification_stats,
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -225,14 +234,15 @@ async fn metrics(State(state): State<AppState>) -> Response {
     let Some(snapshot) = guard.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let notification_stats = state.notification_stats.snapshot();
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        render_metrics(snapshot),
+        render_metrics(snapshot, &notification_stats),
     )
         .into_response()
 }
 
-fn render_metrics(snapshot: &Snapshot) -> String {
+fn render_metrics(snapshot: &Snapshot, notifications: &NotificationStatsSnapshot) -> String {
     let mut output = String::new();
     output.push_str("# TYPE public_infra_system_status gauge\n");
     output.push_str("# TYPE public_infra_target_status gauge\n");
@@ -248,6 +258,20 @@ fn render_metrics(snapshot: &Snapshot) -> String {
     output.push_str("# TYPE public_infra_tcp_counter_window gauge\n");
     output.push_str("# TYPE public_infra_softnet_counter_total counter\n");
     output.push_str("# TYPE public_infra_softnet_counter_window gauge\n");
+    output.push_str("# TYPE public_infra_notifications_enqueued_total counter\n");
+    output.push_str("# TYPE public_infra_notifications_accepted_total counter\n");
+    output.push_str("# TYPE public_infra_notifications_failed_total counter\n");
+    output.push_str("# TYPE public_infra_notifications_dropped_total counter\n");
+    for (name, value) in [
+        ("enqueued", notifications.enqueued),
+        ("accepted", notifications.accepted),
+        ("failed", notifications.failed),
+        ("dropped", notifications.dropped),
+    ] {
+        output.push_str(&format!(
+            "public_infra_notifications_{name}_total {value}\n"
+        ));
+    }
     let system_status = match snapshot.system.status {
         HealthStatus::Ok => 0,
         HealthStatus::Unknown => 1,

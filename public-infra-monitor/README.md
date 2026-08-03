@@ -58,6 +58,23 @@ for 24 hours (at most 1,440 buckets per target). Once per minute the daemon
 atomically replaces `/var/lib/public-infra-monitor/history.json`; it does not
 create daily or append-only files.
 
+## Notifications
+
+The monitor can reuse the host-local `notification_server` rather than owning a
+Telegram bot or token. When enabled, a bounded worker queue sends JSON requests
+to `POST /v1/notify` on `127.0.0.1:18100`; configuration rejects non-loopback
+addresses. Sampling never waits for delivery. Queue saturation and delivery
+failures are exposed by the `public_infra_notifications_*_total` metrics.
+
+Network/process WARN and CRITICAL states notify immediately, escalation notifies
+immediately, an unchanged fault repeats after 15 minutes, and recovery notifies
+after two consecutive healthy windows. A single observed disconnect has a
+five-minute per-target cooldown. CPU-affinity-only warnings do not notify.
+
+If the local notification API requires authentication, provide its bearer token
+as `PUBLIC_INFRA_NOTIFICATION_TOKEN` in the monitor service environment. Do not
+put the Telegram bot token in this monitor's configuration.
+
 The frontend route is `/nav/#/market-data`. In development, Vite proxies
 `/market-data-api/` to the loopback listener. For nginx, apply the reviewed
 `deploy/nginx-public-infra-monitor.patch` so the same path is proxied to

@@ -18,6 +18,15 @@
     "rx_idle_warn_secs": 30,
     "rx_idle_critical_secs": 120
   },
+  "notifications": {
+    "enabled": false,
+    "address": "127.0.0.1:18100",
+    "queue_capacity": 32,
+    "request_timeout_ms": 250,
+    "repeat_interval_secs": 900,
+    "recovery_samples": 2,
+    "disconnect_cooldown_secs": 300
+  },
   "targets": [
     {
       "name": "spp_bn_mg",
