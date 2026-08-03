@@ -52,6 +52,11 @@ Daemon mode serves:
 - `GET /v1/snapshot`
 - `GET /metrics`
 
+The frontend route is `/nav/#/market-data`. In development, Vite proxies
+`/market-data-api/` to the loopback listener. For nginx, apply the reviewed
+`deploy/nginx-public-infra-monitor.patch` so the same path is proxied to
+`127.0.0.1:9918`; the monitor itself should remain loopback-only.
+
 The snapshot reports capability gaps explicitly. Version 0.1 exposes standard
 sysfs NIC statistics but does not yet implement ENA vendor counters through
 ethtool netlink, and leaves runqlat unset. Scheduler tracing should remain an

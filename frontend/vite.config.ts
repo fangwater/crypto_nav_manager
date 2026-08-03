@@ -2,6 +2,8 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 const apiTarget = process.env.NAV_API_TARGET ?? 'http://127.0.0.1:4200'
+const marketDataApiTarget =
+  process.env.MARKET_DATA_API_TARGET ?? 'http://127.0.0.1:9918'
 
 export default defineConfig({
   base: '/nav/',
@@ -14,6 +16,11 @@ export default defineConfig({
         target: apiTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/nav-api/, '/api'),
+      },
+      '/market-data-api': {
+        target: marketDataApiTarget,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/market-data-api/, ''),
       },
     },
   },

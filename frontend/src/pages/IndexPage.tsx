@@ -8,6 +8,7 @@ import {
   Database,
   GitCompareArrows,
   Percent,
+  RadioTower,
   ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -268,6 +269,10 @@ export function IndexPage() {
             </div>
           </div>
           <div className="header-actions">
+            <Link className="header-nav-link" to="/market-data">
+              <RadioTower size={16} />
+              行情网络
+            </Link>
             <Link className="header-nav-link" to="/intra-matching">
               <GitCompareArrows size={16} />
               订单匹配
