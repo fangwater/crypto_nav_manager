@@ -24,8 +24,8 @@
     "queue_capacity": 32,
     "request_timeout_ms": 250,
     "repeat_interval_secs": 900,
-    "recovery_samples": 2,
-    "disconnect_cooldown_secs": 300
+    "alert_samples": 3,
+    "recovery_samples": 6
   },
   "targets": [
     {

@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { MarketDataHistoryChart } from '../components/MarketDataHistoryChart'
+import { MarketDataHistoryChart } from '../components/MarketDataTargetHistory'
 import {
   getMarketDataHistory,
   getMarketDataSnapshot,
@@ -433,7 +433,7 @@ export function MarketDataNetworkPage() {
         <section className="market-history-section">
           <div className="market-network-section-heading">
             <h2>最近 24 小时</h2>
-            <span>1 分钟粒度</span>
+            <span>每个进程独立 · 5 分钟聚合</span>
           </div>
           {history &&
           history.targets.some((target) => target.points.length > 0) ? (
@@ -441,7 +441,7 @@ export function MarketDataNetworkPage() {
           ) : (
             <div className="market-history-empty">
               <RadioTower size={17} />
-              {historyError ? '历史状态暂不可用' : '等待首个历史分钟'}
+              {historyError ? '历史状态暂不可用' : '等待首个历史窗口'}
             </div>
           )}
           {historyError && history && (

@@ -38,8 +38,8 @@ pub struct NotificationConfig {
     pub queue_capacity: usize,
     pub request_timeout_ms: u64,
     pub repeat_interval_secs: u64,
+    pub alert_samples: u32,
     pub recovery_samples: u32,
-    pub disconnect_cooldown_secs: u64,
 }
 
 impl Default for NotificationConfig {
@@ -50,8 +50,8 @@ impl Default for NotificationConfig {
             queue_capacity: 32,
             request_timeout_ms: 250,
             repeat_interval_secs: 15 * 60,
-            recovery_samples: 2,
-            disconnect_cooldown_secs: 5 * 60,
+            alert_samples: 3,
+            recovery_samples: 6,
         }
     }
 }
@@ -128,11 +128,11 @@ impl MonitorConfig {
             if self.notifications.repeat_interval_secs == 0 {
                 bail!("notification repeat_interval_secs must be greater than zero");
             }
+            if !(1..=100).contains(&self.notifications.alert_samples) {
+                bail!("notification alert_samples must be in [1, 100]");
+            }
             if !(1..=100).contains(&self.notifications.recovery_samples) {
                 bail!("notification recovery_samples must be in [1, 100]");
-            }
-            if self.notifications.disconnect_cooldown_secs == 0 {
-                bail!("notification disconnect_cooldown_secs must be greater than zero");
             }
         }
 

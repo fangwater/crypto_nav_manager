@@ -58,6 +58,9 @@ for 24 hours (at most 1,440 buckets per target). Once per minute the daemon
 atomically replaces `/var/lib/public-infra-monitor/history.json`; it does not
 create daily or append-only files.
 
+The frontend presents each target separately and folds those stored minute
+buckets into five-minute worst-state intervals for the 24-hour overview.
+
 ## Notifications
 
 The monitor can reuse the host-local `notification_server` rather than owning a
@@ -66,10 +69,13 @@ to `POST /v1/notify` on `127.0.0.1:18100`; configuration rejects non-loopback
 addresses. Sampling never waits for delivery. Queue saturation and delivery
 failures are exposed by the `public_infra_notifications_*_total` metrics.
 
-Network/process WARN and CRITICAL states notify immediately, escalation notifies
-immediately, an unchanged fault repeats after 15 minutes, and recovery notifies
-after two consecutive healthy windows. A single observed disconnect has a
-five-minute per-target cooldown. CPU-affinity-only warnings do not notify.
+Missing processes, missing established sockets and sustained RX silence notify
+immediately. Queue, retransmit, drop, reconnect and host-network degradation must
+persist for three consecutive windows. Escalation is immediate, an unchanged
+fault repeats after 15 minutes, and recovery requires six consecutive healthy
+windows. A recovered non-immediate incident cannot re-arm for 15 minutes.
+Isolated disconnects remain visible in history but do not notify.
+CPU-affinity-only warnings do not notify.
 
 If the local notification API requires authentication, provide its bearer token
 as `PUBLIC_INFRA_NOTIFICATION_TOKEN` in the monitor service environment. Do not

@@ -57,7 +57,7 @@ pub struct NotificationManager {
     sender: Option<SyncSender<NotifyRequest>>,
     stats: Arc<NotificationStats>,
     active: HashMap<String, ActiveAlert>,
-    last_disconnect_sent_at: HashMap<String, u64>,
+    last_incident_closed_at: HashMap<String, u64>,
 }
 
 impl NotificationManager {
@@ -104,7 +104,7 @@ impl NotificationManager {
             sender,
             stats: Arc::clone(&stats),
             active: HashMap::new(),
-            last_disconnect_sent_at: HashMap::new(),
+            last_incident_closed_at: HashMap::new(),
         };
         Ok((manager, stats))
     }
@@ -125,10 +125,6 @@ impl NotificationManager {
                     self.mark_state_action_delivered(&key, action, snapshot.timestamp_unix_ms);
                 }
             }
-
-            if condition == AlertCondition::Healthy {
-                self.observe_disconnect(snapshot, target);
-            }
         }
 
         let key = "system".to_owned();
@@ -141,26 +137,6 @@ impl NotificationManager {
         }
     }
 
-    fn observe_disconnect(&mut self, snapshot: &Snapshot, target: &TargetObservation) {
-        let disconnects = target.network.disconnects.unwrap_or_default();
-        if disconnects == 0 {
-            return;
-        }
-
-        let last_sent_at = self.last_disconnect_sent_at.get(&target.name).copied();
-        let cooldown_ms = self.config.disconnect_cooldown_secs.saturating_mul(1_000);
-        if last_sent_at
-            .is_some_and(|last| snapshot.timestamp_unix_ms.saturating_sub(last) < cooldown_ms)
-        {
-            return;
-        }
-
-        if self.enqueue(disconnect_request(snapshot, target, disconnects)) {
-            self.last_disconnect_sent_at
-                .insert(target.name.clone(), snapshot.timestamp_unix_ms);
-        }
-    }
-
     fn next_state_action(
         &mut self,
         key: &str,
@@ -170,6 +146,10 @@ impl NotificationManager {
         match condition {
             AlertCondition::Unknown => None,
             AlertCondition::Healthy => {
+                if self.active.get(key)?.last_sent_at_unix_ms.is_none() {
+                    self.active.remove(key);
+                    return None;
+                }
                 let state = self.active.get_mut(key)?;
                 state.healthy_samples = state.healthy_samples.saturating_add(1);
                 (state.healthy_samples >= self.config.recovery_samples).then_some(
@@ -178,27 +158,37 @@ impl NotificationManager {
                     },
                 )
             }
-            AlertCondition::Alert(level) => {
+            AlertCondition::Alert { level, immediate } => {
+                let rearm_blocked = !immediate
+                    && self.last_incident_closed_at.get(key).is_some_and(|last| {
+                        now_unix_ms.saturating_sub(*last)
+                            < self.config.repeat_interval_secs.saturating_mul(1_000)
+                    });
                 let state = self.active.entry(key.to_owned()).or_insert(ActiveAlert {
                     level,
                     opened_at_unix_ms: now_unix_ms,
                     last_sent_at_unix_ms: None,
                     healthy_samples: 0,
+                    fault_samples: 0,
                 });
-                state.healthy_samples = 0;
-                let escalated = level_rank(level) > level_rank(state.level);
-                if level_rank(level) < level_rank(state.level) {
+                let escalated = state.last_sent_at_unix_ms.is_some()
+                    && level_rank(level) > level_rank(state.level);
+                if state.last_sent_at_unix_ms.is_none() || escalated {
                     state.level = level;
                 }
-                if escalated {
-                    state.level = level;
+                state.healthy_samples = 0;
+                state.fault_samples = state.fault_samples.saturating_add(1);
+
+                if !immediate && state.fault_samples < self.config.alert_samples {
+                    return None;
                 }
 
                 let repeat_due = state.last_sent_at_unix_ms.is_some_and(|last| {
                     now_unix_ms.saturating_sub(last)
                         >= self.config.repeat_interval_secs.saturating_mul(1_000)
                 });
-                if state.last_sent_at_unix_ms.is_none() || escalated || repeat_due {
+                let initial_due = state.last_sent_at_unix_ms.is_none() && !rearm_blocked;
+                if initial_due || escalated || repeat_due {
                     Some(StateAction::Alert {
                         level,
                         repeated: state.last_sent_at_unix_ms.is_some() && !escalated,
@@ -219,6 +209,8 @@ impl NotificationManager {
             }
             StateAction::Recovery { .. } => {
                 self.active.remove(key);
+                self.last_incident_closed_at
+                    .insert(key.to_owned(), now_unix_ms);
             }
         }
     }
@@ -264,7 +256,7 @@ impl NotificationManager {
                 sender: Some(sender),
                 stats: Arc::clone(&stats),
                 active: HashMap::new(),
-                last_disconnect_sent_at: HashMap::new(),
+                last_incident_closed_at: HashMap::new(),
             },
             receiver,
             stats,
@@ -278,13 +270,14 @@ struct ActiveAlert {
     opened_at_unix_ms: u64,
     last_sent_at_unix_ms: Option<u64>,
     healthy_samples: u32,
+    fault_samples: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AlertCondition {
     Unknown,
     Healthy,
-    Alert(AlertLevel),
+    Alert { level: AlertLevel, immediate: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,9 +332,21 @@ fn target_condition(target: &TargetObservation) -> AlertCondition {
     if !has_network_reason {
         return AlertCondition::Healthy;
     }
+    let immediate = target.reasons.iter().any(|reason| {
+        reason == "target process is missing"
+            || reason.ends_with("matching processes found")
+            || reason.starts_with("RX has remained zero")
+            || reason == "no established TCP socket"
+    });
     match target.status {
-        HealthStatus::Critical => AlertCondition::Alert(AlertLevel::Critical),
-        HealthStatus::Warn => AlertCondition::Alert(AlertLevel::Warning),
+        HealthStatus::Critical => AlertCondition::Alert {
+            level: AlertLevel::Critical,
+            immediate,
+        },
+        HealthStatus::Warn => AlertCondition::Alert {
+            level: AlertLevel::Warning,
+            immediate,
+        },
         HealthStatus::Ok => AlertCondition::Healthy,
         HealthStatus::Unknown => AlertCondition::Unknown,
     }
@@ -350,8 +355,14 @@ fn target_condition(target: &TargetObservation) -> AlertCondition {
 const fn system_condition(system: &SystemObservation) -> AlertCondition {
     match system.status {
         HealthStatus::Ok => AlertCondition::Healthy,
-        HealthStatus::Warn => AlertCondition::Alert(AlertLevel::Warning),
-        HealthStatus::Critical => AlertCondition::Alert(AlertLevel::Critical),
+        HealthStatus::Warn => AlertCondition::Alert {
+            level: AlertLevel::Warning,
+            immediate: false,
+        },
+        HealthStatus::Critical => AlertCondition::Alert {
+            level: AlertLevel::Critical,
+            immediate: false,
+        },
         HealthStatus::Unknown => AlertCondition::Unknown,
     }
 }
@@ -452,27 +463,6 @@ fn system_state_request(snapshot: &Snapshot, action: StateAction) -> NotifyReque
         severity,
         fields,
         dedup_key: Some("public-infra-monitor:system:state".to_owned()),
-    }
-}
-
-fn disconnect_request(
-    snapshot: &Snapshot,
-    target: &TargetObservation,
-    disconnects: u64,
-) -> NotifyRequest {
-    let mut fields = target_fields(snapshot, target);
-    fields.insert("disconnects".to_owned(), disconnects.to_string());
-    NotifyRequest {
-        source: "public-infra-monitor".to_owned(),
-        title: format!("Market data TCP disconnect: {}", target.name),
-        message: "TCP disconnect event observed while the feed still has active data flow."
-            .to_owned(),
-        severity: NotificationSeverity::Warning,
-        fields,
-        dedup_key: Some(format!(
-            "public-infra-monitor:target:{}:disconnect",
-            target.name
-        )),
     }
 }
 
@@ -714,18 +704,26 @@ mod tests {
         let config = NotificationConfig {
             queue_capacity: 16,
             repeat_interval_secs: 60,
+            alert_samples: 2,
             recovery_samples: 2,
-            disconnect_cooldown_secs: 30,
             ..NotificationConfig::default()
         };
         NotificationManager::test_instance(config)
     }
 
     #[test]
-    fn deduplicates_repeats_and_sends_recovery() {
+    fn debounces_repeats_recovery_and_rearm() {
         let (mut manager, receiver, _) = test_manager();
         manager.observe(&snapshot(
             1_000,
+            HealthStatus::Warn,
+            vec!["reconnects: 2".to_owned()],
+            0,
+        ));
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        manager.observe(&snapshot(
+            2_000,
             HealthStatus::Warn,
             vec!["reconnects: 2".to_owned()],
             0,
@@ -766,10 +764,28 @@ mod tests {
         let recovery = receiver.try_recv().unwrap();
         assert!(recovery.title.contains("recovered"));
         assert!(matches!(recovery.severity, NotificationSeverity::Info));
+
+        for timestamp in [90_000, 100_000] {
+            manager.observe(&snapshot(
+                timestamp,
+                HealthStatus::Warn,
+                vec!["reconnects: 2".to_owned()],
+                0,
+            ));
+        }
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        manager.observe(&snapshot(
+            141_000,
+            HealthStatus::Warn,
+            vec!["reconnects: 2".to_owned()],
+            0,
+        ));
+        assert!(receiver.try_recv().unwrap().title.contains("WARN"));
     }
 
     #[test]
-    fn disconnect_events_have_a_cooldown() {
+    fn isolated_disconnect_is_timeline_only() {
         let (mut manager, receiver, _) = test_manager();
         manager.observe(&snapshot(
             1_000,
@@ -777,23 +793,19 @@ mod tests {
             vec!["process, affinity, sockets and window counters are healthy".to_owned()],
             1,
         ));
-        assert!(receiver.try_recv().unwrap().title.contains("disconnect"));
-
-        manager.observe(&snapshot(
-            20_000,
-            HealthStatus::Ok,
-            vec!["process, affinity, sockets and window counters are healthy".to_owned()],
-            1,
-        ));
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
 
+    #[test]
+    fn hard_socket_failure_is_immediate() {
+        let (mut manager, receiver, _) = test_manager();
         manager.observe(&snapshot(
-            32_000,
-            HealthStatus::Ok,
-            vec!["process, affinity, sockets and window counters are healthy".to_owned()],
-            1,
+            1_000,
+            HealthStatus::Critical,
+            vec!["no established TCP socket".to_owned()],
+            0,
         ));
-        assert!(receiver.try_recv().unwrap().title.contains("disconnect"));
+        assert!(receiver.try_recv().unwrap().title.contains("CRITICAL"));
     }
 
     #[test]
