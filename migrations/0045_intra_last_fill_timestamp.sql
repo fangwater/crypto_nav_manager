@@ -18,4 +18,4 @@ END;
 $$;
 
 COMMENT ON COLUMN binance_intra_arb01.intra_order_lifecycle.last_fill_update_ts_us IS
-    'Latest actual fill event time: any positive fill delta, or a FILLED terminal update, in microseconds.';
+    'Latest FILLED event time, or latest positive-delta PARTIALLY_FILLED event time, in microseconds.';

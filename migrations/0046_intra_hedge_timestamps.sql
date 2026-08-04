@@ -29,7 +29,7 @@ END;
 $$;
 
 COMMENT ON COLUMN binance_intra_arb01.intra_orders.hts IS
-    'Earliest Futures hedge order create time linked to this Margin order by main_fkey, in microseconds.';
+    'Earliest create time among Futures hedge orders allocated to this Margin order, in microseconds.';
 
 COMMENT ON COLUMN binance_intra_arb01.intra_orders.fts IS
-    'Latest actual fill event time among Futures hedge orders linked by main_fkey, in microseconds.';
+    'Latest actual fill event time among allocated Futures hedge orders, in microseconds.';
