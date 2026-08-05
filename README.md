@@ -225,7 +225,10 @@ microsecond timeline columns:
 - `open.terminal_ts`: `update_ts` from the first opening-order terminal event.
 - `open.terminal_ts_local`: `local_ts` paired with that terminal event.
 - `hedge.create_ts`: local `create_ts` of the earliest mapped hedge order.
-- `hedge.new_ts`: first `NEW` event time for that same hedge order.
+- `hedge.new_ts`: first `NEW` event time for that same hedge order. For a
+  `BybitFutures` direct taker hedge (`force_taker`, `lazy_model`, or
+  `lazy_taker`), use its terminal `update_ts` when Bybit acknowledges it
+  directly as terminal.
 - `hedge.terminal_ts`: first terminal event time for that same hedge order.
 
 The five `update_ts`/`mkt_ts` fields use exchange time; the two `create_ts`

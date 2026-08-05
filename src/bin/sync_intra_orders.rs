@@ -596,6 +596,28 @@ fn should_replace_first_event(current_source: Option<i64>, incoming_source: i64)
     current_source.map_or(true, |current| incoming_source < current)
 }
 
+fn hedge_new_ts(
+    venue: &str,
+    from_key: &str,
+    new_ts_us: Option<i64>,
+    terminal_ts_us: Option<i64>,
+) -> Option<i64> {
+    if new_ts_us.is_some() {
+        return new_ts_us;
+    }
+    let reason = from_key.split('|').nth(1);
+    let bybit_taker = venue == "BybitFutures"
+        && matches!(
+            reason,
+            Some(
+                "arb_hedge_force_taker_direct"
+                    | "arb_hedge_lazy_model_direct"
+                    | "arb_hedge_lazy_taker_direct"
+            )
+        );
+    if bybit_taker { terminal_ts_us } else { None }
+}
+
 fn fill_update_ts(status: &str, amount_update: f64, update_ts: i64) -> Option<i64> {
     if amount_update > 0.0 || status.eq_ignore_ascii_case("FILLED") {
         Some(update_ts)
@@ -934,7 +956,12 @@ fn lifecycle_events(rows: &[Lifecycle], epsilon: f64) -> Result<(Vec<MatchEvent>
                 side,
                 create_ts_us: row.create_ts_us,
                 update_ts_us: row.update_ts_us,
-                new_ts_us: row.new_ts_us,
+                new_ts_us: hedge_new_ts(
+                    &row.venue,
+                    &row.from_key,
+                    row.new_ts_us,
+                    row.terminal_ts_us,
+                ),
                 terminal_ts_us: row.terminal_ts_us,
                 fill_ts_us,
                 source_ts_us: row.last_source_ts_us,
@@ -1166,6 +1193,33 @@ mod tests {
         assert_eq!(fill_update_ts("CANCELED", 2.5, 4_000), Some(4_000));
         assert_eq!(fill_update_ts("CANCELED", 0.0, 4_500), None);
         assert_eq!(fill_update_ts("EXPIRED", 0.0, 5_000), None);
+    }
+
+    #[test]
+    fn uses_direct_terminal_ack_only_for_bybit_taker_hedges() {
+        for reason in [
+            "arb_hedge_force_taker_direct",
+            "arb_hedge_lazy_model_direct",
+            "arb_hedge_lazy_taker_direct",
+        ] {
+            let taker_key = format!("123|{reason}|456");
+            assert_eq!(
+                hedge_new_ts("BybitFutures", &taker_key, None, Some(20)),
+                Some(20)
+            );
+            assert_eq!(
+                hedge_new_ts("BinanceFutures", &taker_key, None, Some(20)),
+                None
+            );
+        }
+        assert_eq!(
+            hedge_new_ts("BybitFutures", "123|leg=0", None, Some(20)),
+            None
+        );
+        assert_eq!(
+            hedge_new_ts("BybitFutures", "123|leg=0", Some(10), Some(20)),
+            Some(10)
+        );
     }
 
     #[test]
