@@ -215,11 +215,26 @@ The default output template is
 `/home/ubuntu/order_data/{strategy_alias}/matched_order/{YYYYMMDD}.parquet`.
 Configured display aliases are normalized for directories, so `binance mt`,
 `bybit mt`, and `bybit cta` become `binance-mt`, `bybit-mt`, and `bybit-cta`.
-Trade dates are derived from `cts` in UTC. Each file contains only the 17
-matched-order business columns from `fkey` through `pnlu`; matching-engine
-bookkeeping fields are not exported. Files are replaced atomically. Export
-checkpoints live below the output root's hidden `.export_state` directory so
-unchanged historical files are not rewritten.
+Trade dates are derived from `cts` in UTC. Each file retains the 18 existing
+matched-order business columns from `fkey` through `pnlu`, then appends these
+microsecond timeline columns:
+
+- `open.mkt_ts`: first positive `mkt_ts` in the opening order lifecycle.
+- `open.create_ts`: first positive local `create_ts` for the opening order.
+- `open.new_ts`: `update_ts` from the first opening-order `NEW` event.
+- `open.terminal_ts`: `update_ts` from the first opening-order terminal event.
+- `open.terminal_ts_local`: `local_ts` paired with that terminal event.
+- `hedge.create_ts`: local `create_ts` of the earliest mapped hedge order.
+- `hedge.new_ts`: first `NEW` event time for that same hedge order.
+- `hedge.terminal_ts`: first terminal event time for that same hedge order.
+
+The five `update_ts`/`mkt_ts` fields use exchange time; the two `create_ts`
+fields and `open.terminal_ts_local` use local time. Existing synthesized rows
+need a `sync_intra_orders --rebuild` run before a forced export can populate
+the new columns. Matching-engine bookkeeping fields are not exported. Files
+are replaced atomically. Export checkpoints live below the output root's
+hidden `.export_state` directory so unchanged historical files are not
+rewritten.
 
 The deploy directory contains `crypto-matched-order-export.service` and its
 five-minute timer. The exporter only reads PostgreSQL and does not call exchange

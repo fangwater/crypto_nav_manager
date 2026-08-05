@@ -57,7 +57,13 @@ pub struct MarginOrder {
     pub side: Side,
     pub cts: i64,
     pub open_uts: i64,
+    pub open_mkt_ts_us: Option<i64>,
+    pub open_new_ts_us: Option<i64>,
+    pub open_terminal_ts_us: Option<i64>,
+    pub open_terminal_ts_local_us: Option<i64>,
     pub hts: Option<i64>,
+    pub hedge_new_ts_us: Option<i64>,
+    pub hedge_terminal_ts_us: Option<i64>,
     pub fts: Option<i64>,
     pub close_count: i64,
     pub price: f64,
@@ -104,11 +110,36 @@ pub struct FuturesOrder {
     pub side: Side,
     pub create_ts_us: i64,
     pub update_ts_us: i64,
+    pub new_ts_us: Option<i64>,
+    pub terminal_ts_us: Option<i64>,
     pub fill_ts_us: Option<i64>,
     pub source_ts_us: i64,
     pub amount: f64,
     pub cprice: Option<f64>,
     pub event_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HedgeTiming {
+    pub client_order_id: i64,
+    pub create_ts_us: i64,
+    pub new_ts_us: Option<i64>,
+    pub terminal_ts_us: Option<i64>,
+    pub source_ts_us: i64,
+}
+
+impl HedgeTiming {
+    fn sort_key(self) -> (i64, i64, i64) {
+        (self.create_ts_us, self.source_ts_us, self.client_order_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HedgeHistory {
+    pub main_fkey: i64,
+    pub first_order: HedgeTiming,
+    pub last_fill_ts_us: Option<i64>,
+    pub order_count: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -144,7 +175,7 @@ pub struct MatchEngine {
     epsilon: f64,
     orders: BTreeMap<i64, MarginOrder>,
     queues: BTreeMap<(String, Side), VecDeque<i64>>,
-    first_hedge_create_ts_us: BTreeMap<i64, i64>,
+    first_hedge_timing: BTreeMap<i64, HedgeTiming>,
     last_hedge_fill_ts_us: BTreeMap<i64, i64>,
     hedge_order_counts: BTreeMap<i64, i64>,
     seen_hedge_orders: BTreeSet<(i64, i64)>,
@@ -160,7 +191,7 @@ impl MatchEngine {
             epsilon,
             orders: BTreeMap::new(),
             queues: BTreeMap::new(),
-            first_hedge_create_ts_us: BTreeMap::new(),
+            first_hedge_timing: BTreeMap::new(),
             last_hedge_fill_ts_us: BTreeMap::new(),
             hedge_order_counts: BTreeMap::new(),
             seen_hedge_orders: BTreeSet::new(),
@@ -176,7 +207,16 @@ impl MatchEngine {
             let key = (order.symbol.clone(), order.side);
             let fkey = order.fkey;
             if let Some(hts) = order.hts {
-                engine.first_hedge_create_ts_us.insert(fkey, hts);
+                engine.first_hedge_timing.insert(
+                    fkey,
+                    HedgeTiming {
+                        client_order_id: 0,
+                        create_ts_us: hts,
+                        new_ts_us: order.hedge_new_ts_us,
+                        terminal_ts_us: order.hedge_terminal_ts_us,
+                        source_ts_us: i64::MIN,
+                    },
+                );
             }
             if let Some(fts) = order.fts {
                 engine.last_hedge_fill_ts_us.insert(fkey, fts);
@@ -202,28 +242,23 @@ impl MatchEngine {
         Ok(hedges)
     }
 
-    pub fn seed_hedge_history(
-        &mut self,
-        history: impl IntoIterator<Item = (i64, i64, Option<i64>, i64)>,
-    ) {
-        for (main_fkey, create_ts_us, fill_ts_us, order_count) in history {
-            let hts = self
-                .first_hedge_create_ts_us
-                .entry(main_fkey)
-                .or_insert(create_ts_us);
-            *hts = (*hts).min(create_ts_us);
-            let count = self.hedge_order_counts.entry(main_fkey).or_default();
-            *count = (*count).max(order_count);
-            if let Some(fill_ts_us) = fill_ts_us {
+    pub fn seed_hedge_history(&mut self, history: impl IntoIterator<Item = HedgeHistory>) {
+        for history in history {
+            self.record_first_hedge_timing(history.main_fkey, history.first_order);
+            let count = self
+                .hedge_order_counts
+                .entry(history.main_fkey)
+                .or_default();
+            *count = (*count).max(history.order_count);
+            if let Some(fill_ts_us) = history.last_fill_ts_us {
                 let fts = self
                     .last_hedge_fill_ts_us
-                    .entry(main_fkey)
+                    .entry(history.main_fkey)
                     .or_insert(fill_ts_us);
                 *fts = (*fts).max(fill_ts_us);
             }
-            if let Some(margin) = self.orders.get_mut(&main_fkey) {
-                margin.hts = Some(margin.hts.map_or(*hts, |current| current.min(*hts)));
-                margin.fts = self.last_hedge_fill_ts_us.get(&main_fkey).copied();
+            if let Some(margin) = self.orders.get_mut(&history.main_fkey) {
+                margin.fts = self.last_hedge_fill_ts_us.get(&history.main_fkey).copied();
                 margin.close_count = margin.close_count.max(*count);
             }
         }
@@ -237,22 +272,24 @@ impl MatchEngine {
         self.orders.into_values().collect()
     }
 
-    fn record_hedge_order(
-        &mut self,
-        main_fkey: i64,
-        client_order_id: i64,
-        create_ts_us: i64,
-        fill_ts_us: Option<i64>,
-    ) {
-        let hts = *self
-            .first_hedge_create_ts_us
-            .entry(main_fkey)
-            .and_modify(|current| *current = (*current).min(create_ts_us))
-            .or_insert(create_ts_us);
-        if self.seen_hedge_orders.insert((main_fkey, client_order_id)) {
+    fn record_hedge_order(&mut self, main_fkey: i64, order: &FuturesOrder) {
+        self.record_first_hedge_timing(
+            main_fkey,
+            HedgeTiming {
+                client_order_id: order.client_order_id,
+                create_ts_us: order.create_ts_us,
+                new_ts_us: order.new_ts_us,
+                terminal_ts_us: order.terminal_ts_us,
+                source_ts_us: order.source_ts_us,
+            },
+        );
+        if self
+            .seen_hedge_orders
+            .insert((main_fkey, order.client_order_id))
+        {
             *self.hedge_order_counts.entry(main_fkey).or_default() += 1;
         }
-        if let Some(fill_ts_us) = fill_ts_us {
+        if let Some(fill_ts_us) = order.fill_ts_us {
             let fts = self
                 .last_hedge_fill_ts_us
                 .entry(main_fkey)
@@ -260,9 +297,26 @@ impl MatchEngine {
             *fts = (*fts).max(fill_ts_us);
         }
         if let Some(margin) = self.orders.get_mut(&main_fkey) {
-            margin.hts = Some(margin.hts.map_or(hts, |current| current.min(hts)));
             margin.fts = self.last_hedge_fill_ts_us.get(&main_fkey).copied();
             margin.close_count = self.hedge_order_counts[&main_fkey];
+        }
+    }
+
+    fn record_first_hedge_timing(&mut self, main_fkey: i64, incoming: HedgeTiming) {
+        let replace = self
+            .first_hedge_timing
+            .get(&main_fkey)
+            .map_or(true, |current| incoming.sort_key() < current.sort_key());
+        if replace {
+            self.first_hedge_timing.insert(main_fkey, incoming);
+        }
+        if let (Some(margin), Some(timing)) = (
+            self.orders.get_mut(&main_fkey),
+            self.first_hedge_timing.get(&main_fkey),
+        ) {
+            margin.hts = Some(timing.create_ts_us);
+            margin.hedge_new_ts_us = timing.new_ts_us;
+            margin.hedge_terminal_ts_us = timing.terminal_ts_us;
         }
     }
 
@@ -276,8 +330,10 @@ impl MatchEngine {
         order.remaining_amount = order.open_fill_amount;
         order.matching_state = MatchingState::Pending;
         let fkey = order.fkey;
-        if let Some(&hts) = self.first_hedge_create_ts_us.get(&fkey) {
-            order.hts = Some(order.hts.map_or(hts, |current| current.min(hts)));
+        if let Some(timing) = self.first_hedge_timing.get(&fkey) {
+            order.hts = Some(timing.create_ts_us);
+            order.hedge_new_ts_us = timing.new_ts_us;
+            order.hedge_terminal_ts_us = timing.terminal_ts_us;
         }
         if let Some(&fts) = self.last_hedge_fill_ts_us.get(&fkey) {
             order.fts = Some(order.fts.map_or(fts, |current| current.max(fts)));
@@ -346,12 +402,7 @@ impl MatchEngine {
             );
         }
         if let Some(main_fkey) = order.main_fkey {
-            self.record_hedge_order(
-                main_fkey,
-                order.client_order_id,
-                order.create_ts_us,
-                order.fill_ts_us,
-            );
+            self.record_hedge_order(main_fkey, &order);
         }
         let queue_key = (order.symbol.clone(), order.side.opposite());
         let mut remaining = order.amount.max(0.0);
@@ -415,7 +466,13 @@ mod tests {
             side,
             cts: timestamp - 10,
             open_uts: timestamp,
+            open_mkt_ts_us: Some(timestamp - 20),
+            open_new_ts_us: Some(timestamp - 5),
+            open_terminal_ts_us: Some(timestamp),
+            open_terminal_ts_local_us: Some(timestamp + 1),
             hts: None,
+            hedge_new_ts_us: None,
+            hedge_terminal_ts_us: None,
             fts: None,
             close_count: 0,
             price: 100.0,
@@ -440,6 +497,8 @@ mod tests {
             side,
             create_ts_us: timestamp,
             update_ts_us: timestamp + 5,
+            new_ts_us: Some(timestamp + 1),
+            terminal_ts_us: Some(timestamp + 5),
             fill_ts_us: Some(timestamp + 5),
             source_ts_us: timestamp + 10,
             amount,
@@ -456,6 +515,8 @@ mod tests {
             side,
             create_ts_us: timestamp,
             update_ts_us: timestamp + 5,
+            new_ts_us: Some(timestamp + 1),
+            terminal_ts_us: Some(timestamp + 5),
             fill_ts_us: None,
             source_ts_us: timestamp + 10,
             amount: 0.0,
@@ -552,6 +613,8 @@ mod tests {
             .unwrap();
         let order = engine.orders().next().unwrap();
         assert_eq!(order.hts, Some(20));
+        assert_eq!(order.hedge_new_ts_us, Some(21));
+        assert_eq!(order.hedge_terminal_ts_us, Some(25));
         assert_eq!(order.fts, Some(45));
         assert_eq!(order.holding_close(), Some(35));
         assert_eq!(order.close_count, 3);
@@ -560,7 +623,18 @@ mod tests {
     #[test]
     fn restores_first_hedge_time_from_an_earlier_sync_batch() {
         let mut engine = MatchEngine::new(Vec::new(), 1e-8).unwrap();
-        engine.seed_hedge_history([(1, 20, None, 1)]);
+        engine.seed_hedge_history([HedgeHistory {
+            main_fkey: 1,
+            first_order: HedgeTiming {
+                client_order_id: 19,
+                create_ts_us: 20,
+                new_ts_us: Some(21),
+                terminal_ts_us: Some(25),
+                source_ts_us: 30,
+            },
+            last_fill_ts_us: None,
+            order_count: 1,
+        }]);
         engine
             .apply(vec![
                 margin(1, Side::Buy, 10, 1.0),
@@ -569,6 +643,8 @@ mod tests {
             .unwrap();
         let order = engine.orders().next().unwrap();
         assert_eq!(order.hts, Some(20));
+        assert_eq!(order.hedge_new_ts_us, Some(21));
+        assert_eq!(order.hedge_terminal_ts_us, Some(25));
         assert_eq!(order.fts, Some(35));
         assert_eq!(order.close_count, 2);
     }

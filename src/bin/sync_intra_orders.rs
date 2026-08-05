@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crypto_nav_manager::intra_order_match::{
-    FuturesOrder, HedgeResult, MarginOrder, MatchEngine, MatchEvent, MatchingState, Side,
+    FuturesOrder, HedgeHistory, HedgeResult, HedgeTiming, MarginOrder, MatchEngine, MatchEvent,
+    MatchingState, Side,
 };
 use polars::prelude::*;
 use serde::Serialize;
@@ -54,8 +55,15 @@ struct Lifecycle {
     client_order_id: i64,
     first_source_ts_us: i64,
     last_source_ts_us: i64,
+    mkt_ts_us: Option<i64>,
+    mkt_source_ts_us: Option<i64>,
     create_ts_us: i64,
+    new_ts_us: Option<i64>,
+    new_source_ts_us: Option<i64>,
     update_ts_us: i64,
+    terminal_ts_us: Option<i64>,
+    terminal_ts_local_us: Option<i64>,
+    terminal_source_ts_us: Option<i64>,
     last_fill_update_ts_us: Option<i64>,
     symbol: String,
     side: String,
@@ -439,8 +447,10 @@ fn fold_frame(
     let source_ts = frame.column("ts_us")?.i64()?;
     let client_id = frame.column("client_order_id")?.i64()?;
     let venue = frame.column("trading_venue")?.str()?;
+    let mkt_ts = frame.column("mkt_ts")?.i64()?;
     let create_ts = frame.column("create_ts")?.i64()?;
     let update_ts = frame.column("update_ts")?.i64()?;
+    let local_ts = frame.column("local_ts")?.i64()?;
     let symbol = frame.column("symbol")?.str()?;
     let side = frame.column("side")?.str()?;
     let price = frame.column("price")?.f64()?;
@@ -459,7 +469,10 @@ fn fold_frame(
         }
         let id = client_id.get(row).context("null client_order_id")?;
         let source = source_ts.get(row).context("null ts_us")?;
+        let market = positive_timestamp(mkt_ts.get(row).context("null mkt_ts")?);
+        let create = create_ts.get(row).context("null create_ts")?;
         let update = update_ts.get(row).context("null update_ts")?;
+        let local = local_ts.get(row).context("null local_ts")?;
         let row_status = status.get(row).context("null status")?;
         let fill = amount_update.get(row).context("null amount_update")?;
         if !fill.is_finite() || fill < 0.0 {
@@ -468,6 +481,12 @@ fn fold_frame(
         let row_price = price.get(row).context("null price")?;
         let key = (venue.to_string(), id);
         let terminal = is_terminal(row_status);
+        let new_event = row_status
+            .eq_ignore_ascii_case("NEW")
+            .then_some(update)
+            .and_then(positive_timestamp);
+        let terminal_event = terminal.then_some(update).and_then(positive_timestamp);
+        let terminal_local = terminal_event.and_then(|_| positive_timestamp(local));
         let fill_update = fill_update_ts(row_status, fill, update);
         match lifecycle.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -476,8 +495,15 @@ fn fold_frame(
                     client_order_id: id,
                     first_source_ts_us: source,
                     last_source_ts_us: source,
-                    create_ts_us: create_ts.get(row).context("null create_ts")?,
+                    mkt_ts_us: market,
+                    mkt_source_ts_us: market.map(|_| source),
+                    create_ts_us: create,
+                    new_ts_us: new_event,
+                    new_source_ts_us: new_event.map(|_| source),
                     update_ts_us: update,
+                    terminal_ts_us: terminal_event,
+                    terminal_ts_local_us: terminal_local,
+                    terminal_source_ts_us: terminal_event.map(|_| source),
                     last_fill_update_ts_us: fill_update,
                     symbol: symbol.get(row).context("null symbol")?.to_string(),
                     side: side.get(row).context("null side")?.to_ascii_lowercase(),
@@ -494,11 +520,34 @@ fn fold_frame(
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let aggregate = entry.get_mut();
+                let previous_latest = (aggregate.update_ts_us, aggregate.last_source_ts_us);
                 aggregate.first_source_ts_us = aggregate.first_source_ts_us.min(source);
                 aggregate.last_source_ts_us = aggregate.last_source_ts_us.max(source);
-                aggregate.create_ts_us = aggregate
-                    .create_ts_us
-                    .min(create_ts.get(row).context("null create_ts")?);
+                aggregate.create_ts_us = first_positive_timestamp(aggregate.create_ts_us, create);
+                if market.is_some()
+                    && should_replace_first_event(aggregate.mkt_source_ts_us, source)
+                {
+                    aggregate.mkt_ts_us = market;
+                    aggregate.mkt_source_ts_us = Some(source);
+                }
+                if new_event.is_some()
+                    && should_replace_first_event(aggregate.new_source_ts_us, source)
+                {
+                    aggregate.new_ts_us = new_event;
+                    aggregate.new_source_ts_us = Some(source);
+                }
+                if let Some(incoming_terminal_ts) = terminal_event {
+                    if should_replace_first_event(aggregate.terminal_source_ts_us, source) {
+                        aggregate.terminal_ts_us = Some(incoming_terminal_ts);
+                        aggregate.terminal_ts_local_us = terminal_local;
+                        aggregate.terminal_source_ts_us = Some(source);
+                    } else if aggregate.terminal_ts_us == Some(incoming_terminal_ts) {
+                        aggregate.terminal_ts_local_us = earliest_optional_timestamp(
+                            aggregate.terminal_ts_local_us,
+                            terminal_local,
+                        );
+                    }
+                }
                 aggregate.filled_amount += fill;
                 aggregate.fill_notional += fill * row_price;
                 aggregate.event_count += 1;
@@ -508,7 +557,7 @@ fn fold_frame(
                         (Some(current), Some(incoming)) => Some(current.max(incoming)),
                         (current, incoming) => current.or(incoming),
                     };
-                if (update, source) >= (aggregate.update_ts_us, aggregate.last_source_ts_us) {
+                if (update, source) >= previous_latest {
                     aggregate.update_ts_us = update;
                     aggregate.symbol = symbol.get(row).context("null symbol")?.to_string();
                     aggregate.side = side.get(row).context("null side")?.to_ascii_lowercase();
@@ -522,6 +571,29 @@ fn fold_frame(
         }
     }
     Ok(frame.height())
+}
+
+fn positive_timestamp(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+fn first_positive_timestamp(current: i64, incoming: i64) -> i64 {
+    match (current > 0, incoming > 0) {
+        (true, true) => current.min(incoming),
+        (false, true) => incoming,
+        _ => current,
+    }
+}
+
+fn earliest_optional_timestamp(current: Option<i64>, incoming: Option<i64>) -> Option<i64> {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => Some(current.min(incoming)),
+        (current, incoming) => current.or(incoming),
+    }
+}
+
+fn should_replace_first_event(current_source: Option<i64>, incoming_source: i64) -> bool {
+    current_source.map_or(true, |current| incoming_source < current)
 }
 
 fn fill_update_ts(status: &str, amount_update: f64, update_ts: i64) -> Option<i64> {
@@ -547,9 +619,10 @@ async fn upsert_lifecycles(
     for chunk in rows.chunks(2_000) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.intra_order_lifecycle (trading_venue,client_order_id,\
-             first_source_ts_us,last_source_ts_us,create_ts_us,update_ts_us,last_fill_update_ts_us,\
-             symbol,side,price,\
-             price_offset,amount_init,filled_amount,fill_notional,status,from_key,event_count,terminal) "
+             first_source_ts_us,last_source_ts_us,mkt_ts_us,mkt_source_ts_us,create_ts_us,\
+             new_ts_us,new_source_ts_us,update_ts_us,terminal_ts_us,terminal_ts_local_us,\
+             terminal_source_ts_us,last_fill_update_ts_us,symbol,side,price,price_offset,\
+             amount_init,filled_amount,fill_notional,status,from_key,event_count,terminal) "
         ));
         query.push_values(chunk, |mut values, row| {
             values
@@ -557,8 +630,15 @@ async fn upsert_lifecycles(
                 .push_bind(row.client_order_id)
                 .push_bind(row.first_source_ts_us)
                 .push_bind(row.last_source_ts_us)
+                .push_bind(row.mkt_ts_us)
+                .push_bind(row.mkt_source_ts_us)
                 .push_bind(row.create_ts_us)
+                .push_bind(row.new_ts_us)
+                .push_bind(row.new_source_ts_us)
                 .push_bind(row.update_ts_us)
+                .push_bind(row.terminal_ts_us)
+                .push_bind(row.terminal_ts_local_us)
+                .push_bind(row.terminal_source_ts_us)
                 .push_bind(row.last_fill_update_ts_us)
                 .push_bind(&row.symbol)
                 .push_bind(&row.side)
@@ -576,8 +656,50 @@ async fn upsert_lifecycles(
             " ON CONFLICT (trading_venue,client_order_id) DO UPDATE SET \
              first_source_ts_us=LEAST({schema}.intra_order_lifecycle.first_source_ts_us,EXCLUDED.first_source_ts_us),\
              last_source_ts_us=GREATEST({schema}.intra_order_lifecycle.last_source_ts_us,EXCLUDED.last_source_ts_us),\
-             create_ts_us=LEAST({schema}.intra_order_lifecycle.create_ts_us,EXCLUDED.create_ts_us),\
+             mkt_ts_us=CASE WHEN EXCLUDED.mkt_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.mkt_source_ts_us IS NULL OR \
+                EXCLUDED.mkt_source_ts_us<{schema}.intra_order_lifecycle.mkt_source_ts_us) \
+               THEN EXCLUDED.mkt_ts_us ELSE {schema}.intra_order_lifecycle.mkt_ts_us END,\
+             mkt_source_ts_us=CASE WHEN EXCLUDED.mkt_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.mkt_source_ts_us IS NULL OR \
+                EXCLUDED.mkt_source_ts_us<{schema}.intra_order_lifecycle.mkt_source_ts_us) \
+               THEN EXCLUDED.mkt_source_ts_us ELSE {schema}.intra_order_lifecycle.mkt_source_ts_us END,\
+             create_ts_us=CASE \
+               WHEN {schema}.intra_order_lifecycle.create_ts_us<=0 AND EXCLUDED.create_ts_us>0 \
+                 THEN EXCLUDED.create_ts_us \
+               WHEN EXCLUDED.create_ts_us<=0 THEN {schema}.intra_order_lifecycle.create_ts_us \
+               ELSE LEAST({schema}.intra_order_lifecycle.create_ts_us,EXCLUDED.create_ts_us) END,\
+             new_ts_us=CASE WHEN EXCLUDED.new_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.new_source_ts_us IS NULL OR \
+                EXCLUDED.new_source_ts_us<{schema}.intra_order_lifecycle.new_source_ts_us) \
+               THEN EXCLUDED.new_ts_us ELSE {schema}.intra_order_lifecycle.new_ts_us END,\
+             new_source_ts_us=CASE WHEN EXCLUDED.new_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.new_source_ts_us IS NULL OR \
+                EXCLUDED.new_source_ts_us<{schema}.intra_order_lifecycle.new_source_ts_us) \
+               THEN EXCLUDED.new_source_ts_us ELSE {schema}.intra_order_lifecycle.new_source_ts_us END,\
              update_ts_us=GREATEST({schema}.intra_order_lifecycle.update_ts_us,EXCLUDED.update_ts_us),\
+             terminal_ts_us=CASE WHEN EXCLUDED.terminal_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.terminal_source_ts_us IS NULL OR \
+                EXCLUDED.terminal_source_ts_us<{schema}.intra_order_lifecycle.terminal_source_ts_us) \
+               THEN EXCLUDED.terminal_ts_us ELSE {schema}.intra_order_lifecycle.terminal_ts_us END,\
+             terminal_ts_local_us=CASE \
+               WHEN EXCLUDED.terminal_source_ts_us IS NOT NULL AND \
+                 ({schema}.intra_order_lifecycle.terminal_source_ts_us IS NULL OR \
+                  EXCLUDED.terminal_source_ts_us<{schema}.intra_order_lifecycle.terminal_source_ts_us) \
+                 THEN EXCLUDED.terminal_ts_local_us \
+               WHEN {schema}.intra_order_lifecycle.terminal_ts_us=EXCLUDED.terminal_ts_us THEN CASE \
+                 WHEN {schema}.intra_order_lifecycle.terminal_ts_local_us IS NULL \
+                   THEN EXCLUDED.terminal_ts_local_us \
+                 WHEN EXCLUDED.terminal_ts_local_us IS NULL \
+                   THEN {schema}.intra_order_lifecycle.terminal_ts_local_us \
+                 ELSE LEAST({schema}.intra_order_lifecycle.terminal_ts_local_us,\
+                            EXCLUDED.terminal_ts_local_us) END \
+               ELSE {schema}.intra_order_lifecycle.terminal_ts_local_us END,\
+             terminal_source_ts_us=CASE WHEN EXCLUDED.terminal_source_ts_us IS NOT NULL AND \
+               ({schema}.intra_order_lifecycle.terminal_source_ts_us IS NULL OR \
+                EXCLUDED.terminal_source_ts_us<{schema}.intra_order_lifecycle.terminal_source_ts_us) \
+               THEN EXCLUDED.terminal_source_ts_us \
+               ELSE {schema}.intra_order_lifecycle.terminal_source_ts_us END,\
              last_fill_update_ts_us=GREATEST(\
                {schema}.intra_order_lifecycle.last_fill_update_ts_us,\
                EXCLUDED.last_fill_update_ts_us),\
@@ -605,10 +727,10 @@ async fn load_ready_lifecycles(
 ) -> Result<Vec<Lifecycle>> {
     let sql = format!(
         "SELECT trading_venue,client_order_id,first_source_ts_us,last_source_ts_us,\
-         create_ts_us,update_ts_us,last_fill_update_ts_us,symbol,side,price,price_offset,\
-         amount_init,filled_amount,\
-         fill_notional,status,from_key,event_count,terminal \
-         FROM {schema}.intra_order_lifecycle \
+         mkt_ts_us,mkt_source_ts_us,create_ts_us,new_ts_us,new_source_ts_us,update_ts_us,\
+         terminal_ts_us,terminal_ts_local_us,terminal_source_ts_us,last_fill_update_ts_us,\
+         symbol,side,price,price_offset,amount_init,filled_amount,fill_notional,status,from_key,\
+         event_count,terminal FROM {schema}.intra_order_lifecycle \
          WHERE terminal AND last_source_ts_us <= $1"
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
@@ -623,8 +745,15 @@ async fn load_ready_lifecycles(
                 client_order_id: row.try_get("client_order_id")?,
                 first_source_ts_us: row.try_get("first_source_ts_us")?,
                 last_source_ts_us: row.try_get("last_source_ts_us")?,
+                mkt_ts_us: row.try_get("mkt_ts_us")?,
+                mkt_source_ts_us: row.try_get("mkt_source_ts_us")?,
                 create_ts_us: row.try_get("create_ts_us")?,
+                new_ts_us: row.try_get("new_ts_us")?,
+                new_source_ts_us: row.try_get("new_source_ts_us")?,
                 update_ts_us: row.try_get("update_ts_us")?,
+                terminal_ts_us: row.try_get("terminal_ts_us")?,
+                terminal_ts_local_us: row.try_get("terminal_ts_local_us")?,
+                terminal_source_ts_us: row.try_get("terminal_source_ts_us")?,
                 last_fill_update_ts_us: row.try_get("last_fill_update_ts_us")?,
                 symbol: row.try_get("symbol")?,
                 side: row.try_get("side")?,
@@ -647,9 +776,11 @@ async fn load_pending_orders(
     schema: &str,
 ) -> Result<Vec<MarginOrder>> {
     let sql = format!(
-        "SELECT fkey,symbol,side,cts,open_uts,hts,fts,close_count,price,amount,range,tlen,\
-         open_fill_amount,remaining_amount,camount,netted_amount,close_notional,\
-         open_source_ts_us FROM {schema}.intra_orders WHERE matching_state='pending' \
+        "SELECT fkey,symbol,side,cts,open_uts,open_mkt_ts_us,open_new_ts_us,\
+         open_terminal_ts_us,open_terminal_ts_local_us,hts,hedge_new_ts_us,\
+         hedge_terminal_ts_us,fts,close_count,price,amount,range,tlen,open_fill_amount,\
+         remaining_amount,camount,netted_amount,close_notional,open_source_ts_us \
+         FROM {schema}.intra_orders WHERE matching_state='pending' \
          ORDER BY open_uts,open_source_ts_us,fkey"
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
@@ -664,7 +795,13 @@ async fn load_pending_orders(
                 side: Side::parse(row.try_get::<&str, _>("side")?)?,
                 cts: row.try_get("cts")?,
                 open_uts: row.try_get("open_uts")?,
+                open_mkt_ts_us: row.try_get("open_mkt_ts_us")?,
+                open_new_ts_us: row.try_get("open_new_ts_us")?,
+                open_terminal_ts_us: row.try_get("open_terminal_ts_us")?,
+                open_terminal_ts_local_us: row.try_get("open_terminal_ts_local_us")?,
                 hts: row.try_get("hts")?,
+                hedge_new_ts_us: row.try_get("hedge_new_ts_us")?,
+                hedge_terminal_ts_us: row.try_get("hedge_terminal_ts_us")?,
                 fts: row.try_get("fts")?,
                 close_count: row.try_get("close_count")?,
                 price: row.try_get("price")?,
@@ -688,7 +825,7 @@ async fn load_hedge_history(
     schema: &str,
     ready: &[Lifecycle],
     epsilon: f64,
-) -> Result<Vec<(i64, i64, Option<i64>, i64)>> {
+) -> Result<Vec<HedgeHistory>> {
     let mut fkeys = ready
         .iter()
         .filter(|row| row.venue.ends_with("Margin") && row.filled_amount > epsilon)
@@ -700,10 +837,16 @@ async fn load_hedge_history(
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT main_fkey,MIN(create_ts_us) AS hts,MAX(fill_ts_us) AS fts,\
-         COUNT(*)::bigint AS close_count \
-         FROM {schema}.intra_hedges \
-         WHERE main_fkey=ANY($1) GROUP BY main_fkey"
+        "WITH hedge_ranked AS (\
+           SELECT main_fkey,client_order_id,create_ts_us,new_ts_us,terminal_ts_us,\
+                  source_ts_us,MAX(fill_ts_us) OVER (PARTITION BY main_fkey) AS fts,\
+                  COUNT(*) OVER (PARTITION BY main_fkey) AS close_count,\
+                  ROW_NUMBER() OVER (PARTITION BY main_fkey \
+                    ORDER BY create_ts_us,source_ts_us,client_order_id) AS hedge_rank \
+           FROM {schema}.intra_hedges WHERE main_fkey=ANY($1)\
+         ) SELECT main_fkey,client_order_id,create_ts_us,new_ts_us,terminal_ts_us,\
+                  source_ts_us,fts,close_count \
+           FROM hedge_ranked WHERE hedge_rank=1"
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
         .bind(&fkeys)
@@ -712,12 +855,18 @@ async fn load_hedge_history(
         .context("load historical Futures hedge summaries")?;
     rows.into_iter()
         .map(|row| {
-            Ok((
-                row.try_get("main_fkey")?,
-                row.try_get("hts")?,
-                row.try_get("fts")?,
-                row.try_get("close_count")?,
-            ))
+            Ok(HedgeHistory {
+                main_fkey: row.try_get("main_fkey")?,
+                first_order: HedgeTiming {
+                    client_order_id: row.try_get("client_order_id")?,
+                    create_ts_us: row.try_get("create_ts_us")?,
+                    new_ts_us: row.try_get("new_ts_us")?,
+                    terminal_ts_us: row.try_get("terminal_ts_us")?,
+                    source_ts_us: row.try_get("source_ts_us")?,
+                },
+                last_fill_ts_us: row.try_get("fts")?,
+                order_count: row.try_get("close_count")?,
+            })
         })
         .collect()
 }
@@ -745,7 +894,13 @@ fn lifecycle_events(rows: &[Lifecycle], epsilon: f64) -> Result<(Vec<MatchEvent>
                 side,
                 cts: row.create_ts_us,
                 open_uts,
+                open_mkt_ts_us: row.mkt_ts_us,
+                open_new_ts_us: row.new_ts_us,
+                open_terminal_ts_us: row.terminal_ts_us,
+                open_terminal_ts_local_us: row.terminal_ts_local_us,
                 hts: None,
+                hedge_new_ts_us: None,
+                hedge_terminal_ts_us: None,
                 fts: None,
                 close_count: 0,
                 price: row.price,
@@ -779,6 +934,8 @@ fn lifecycle_events(rows: &[Lifecycle], epsilon: f64) -> Result<(Vec<MatchEvent>
                 side,
                 create_ts_us: row.create_ts_us,
                 update_ts_us: row.update_ts_us,
+                new_ts_us: row.new_ts_us,
+                terminal_ts_us: row.terminal_ts_us,
                 fill_ts_us,
                 source_ts_us: row.last_source_ts_us,
                 amount: row.filled_amount,
@@ -808,10 +965,11 @@ async fn upsert_orders(
 ) -> Result<()> {
     for chunk in rows.chunks(1_500) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.intra_orders (fkey,symbol,side,cts,open_uts,hts,fts,holding,\
-             holding_close,close_count,price,amount,cprice,camount,range,crange,tlen,pnlu,\
-             open_fill_amount,remaining_amount,netted_amount,close_notional,matching_state,\
-             open_source_ts_us,updated_at) "
+            "INSERT INTO {schema}.intra_orders (fkey,symbol,side,cts,open_uts,open_mkt_ts_us,\
+             open_new_ts_us,open_terminal_ts_us,open_terminal_ts_local_us,hts,hedge_new_ts_us,\
+             hedge_terminal_ts_us,fts,holding,holding_close,close_count,price,amount,cprice,\
+             camount,range,crange,tlen,pnlu,open_fill_amount,remaining_amount,netted_amount,\
+             close_notional,matching_state,open_source_ts_us,updated_at) "
         ));
         query.push_values(chunk, |mut values, row| {
             values
@@ -820,7 +978,13 @@ async fn upsert_orders(
                 .push_bind(row.side.as_str())
                 .push_bind(row.cts)
                 .push_bind(row.open_uts)
+                .push_bind(row.open_mkt_ts_us)
+                .push_bind(row.open_new_ts_us)
+                .push_bind(row.open_terminal_ts_us)
+                .push_bind(row.open_terminal_ts_local_us)
                 .push_bind(row.hts)
+                .push_bind(row.hedge_new_ts_us)
+                .push_bind(row.hedge_terminal_ts_us)
                 .push_bind(row.fts)
                 .push_bind(row.holding())
                 .push_bind(row.holding_close())
@@ -842,7 +1006,12 @@ async fn upsert_orders(
                 .push("CURRENT_TIMESTAMP");
         });
         query.push(
-            " ON CONFLICT (fkey) DO UPDATE SET hts=EXCLUDED.hts,fts=EXCLUDED.fts,\
+            " ON CONFLICT (fkey) DO UPDATE SET \
+             open_mkt_ts_us=EXCLUDED.open_mkt_ts_us,open_new_ts_us=EXCLUDED.open_new_ts_us,\
+             open_terminal_ts_us=EXCLUDED.open_terminal_ts_us,\
+             open_terminal_ts_local_us=EXCLUDED.open_terminal_ts_local_us,\
+             hts=EXCLUDED.hts,hedge_new_ts_us=EXCLUDED.hedge_new_ts_us,\
+             hedge_terminal_ts_us=EXCLUDED.hedge_terminal_ts_us,fts=EXCLUDED.fts,\
              holding_close=EXCLUDED.holding_close,close_count=EXCLUDED.close_count,\
              cprice=EXCLUDED.cprice,camount=EXCLUDED.camount,pnlu=EXCLUDED.pnlu,\
              remaining_amount=EXCLUDED.remaining_amount,netted_amount=EXCLUDED.netted_amount,\
@@ -866,8 +1035,8 @@ async fn insert_hedges(
     for chunk in rows.chunks(2_000) {
         let mut query = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.intra_hedges (client_order_id,main_fkey,symbol,side,\
-             create_ts_us,update_ts_us,fill_ts_us,source_ts_us,amount,cprice,event_count,allocated_amount,\
-             unallocated_amount,anchor_matched) "
+             create_ts_us,new_ts_us,terminal_ts_us,update_ts_us,fill_ts_us,source_ts_us,\
+             amount,cprice,event_count,allocated_amount,unallocated_amount,anchor_matched) "
         ));
         query.push_values(chunk, |mut values, row| {
             values
@@ -876,6 +1045,8 @@ async fn insert_hedges(
                 .push_bind(&row.order.symbol)
                 .push_bind(row.order.side.as_str())
                 .push_bind(row.order.create_ts_us)
+                .push_bind(row.order.new_ts_us)
+                .push_bind(row.order.terminal_ts_us)
                 .push_bind(row.order.update_ts_us)
                 .push_bind(row.order.fill_ts_us)
                 .push_bind(row.order.source_ts_us)
@@ -995,5 +1166,36 @@ mod tests {
         assert_eq!(fill_update_ts("CANCELED", 2.5, 4_000), Some(4_000));
         assert_eq!(fill_update_ts("CANCELED", 0.0, 4_500), None);
         assert_eq!(fill_update_ts("EXPIRED", 0.0, 5_000), None);
+    }
+
+    #[test]
+    fn folds_named_timestamps_from_order_lifecycle_events() {
+        let frame = df!(
+            "ts_us" => [300_i64, 100, 400, 200, 500],
+            "client_order_id" => [7_i64; 5],
+            "trading_venue" => ["BinanceMargin"; 5],
+            "mkt_ts" => [0_i64, 10, 0, 0, 0],
+            "create_ts" => [20_i64; 5],
+            "update_ts" => [40_i64, 30, 40, 35, 40],
+            "local_ts" => [45_i64, 32, 44, 37, 43],
+            "symbol" => ["BTCUSDT"; 5],
+            "side" => ["buy"; 5],
+            "price" => [100.0_f64; 5],
+            "price_offset" => [0.0002_f64; 5],
+            "amount_init" => [1.0_f64; 5],
+            "amount_update" => [0.0_f64, 0.0, 1.0, 0.0, 0.0],
+            "status" => ["FILLED", "NEW", "FILLED", "PARTIALLY_FILLED", "FILLED"],
+            "from_key" => [""; 5],
+        )
+        .unwrap();
+        let mut lifecycles = BTreeMap::new();
+
+        assert_eq!(fold_frame(&frame, &mut lifecycles).unwrap(), 5);
+        let order = lifecycles.values().next().unwrap();
+        assert_eq!(order.mkt_ts_us, Some(10));
+        assert_eq!(order.create_ts_us, 20);
+        assert_eq!(order.new_ts_us, Some(30));
+        assert_eq!(order.terminal_ts_us, Some(40));
+        assert_eq!(order.terminal_ts_local_us, Some(43));
     }
 }

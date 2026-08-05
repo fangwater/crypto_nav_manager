@@ -79,6 +79,12 @@ struct OrderRow {
     crange: f64,
     tlen: Option<f64>,
     pnlu: Option<f64>,
+    open_mkt_ts: Option<i64>,
+    open_new_ts: Option<i64>,
+    open_terminal_ts: Option<i64>,
+    open_terminal_ts_local: Option<i64>,
+    hedge_new_ts: Option<i64>,
+    hedge_terminal_ts: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -332,7 +338,8 @@ async fn load_day_snapshot(
         .with_context(|| format!("no matched orders in {schema} on {date}"))?;
     let sql = format!(
         "SELECT fkey,symbol,side,cts,open_uts,hts,fts,holding,holding_close,close_count,price,\
-         amount,cprice,camount,range,crange,tlen,pnlu \
+         amount,cprice,camount,range,crange,tlen,pnlu,open_mkt_ts_us,open_new_ts_us,\
+         open_terminal_ts_us,open_terminal_ts_local_us,hedge_new_ts_us,hedge_terminal_ts_us \
          FROM {schema}.intra_orders WHERE cts >= $1 AND cts < $2 ORDER BY cts,fkey"
     );
     let query_rows = sqlx::query(AssertSqlSafe(sql))
@@ -371,6 +378,12 @@ async fn load_day_snapshot(
                 crange: row.try_get("crange")?,
                 tlen: row.try_get("tlen")?,
                 pnlu: row.try_get("pnlu")?,
+                open_mkt_ts: row.try_get("open_mkt_ts_us")?,
+                open_new_ts: row.try_get("open_new_ts_us")?,
+                open_terminal_ts: row.try_get("open_terminal_ts_us")?,
+                open_terminal_ts_local: row.try_get("open_terminal_ts_local_us")?,
+                hedge_new_ts: row.try_get("hedge_new_ts_us")?,
+                hedge_terminal_ts: row.try_get("hedge_terminal_ts_us")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -447,6 +460,14 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
     let mut crange = Vec::with_capacity(rows.len());
     let mut tlen = Vec::with_capacity(rows.len());
     let mut pnlu = Vec::with_capacity(rows.len());
+    let mut open_mkt_ts = Vec::with_capacity(rows.len());
+    let mut open_create_ts = Vec::with_capacity(rows.len());
+    let mut open_new_ts = Vec::with_capacity(rows.len());
+    let mut open_terminal_ts = Vec::with_capacity(rows.len());
+    let mut open_terminal_ts_local = Vec::with_capacity(rows.len());
+    let mut hedge_create_ts = Vec::with_capacity(rows.len());
+    let mut hedge_new_ts = Vec::with_capacity(rows.len());
+    let mut hedge_terminal_ts = Vec::with_capacity(rows.len());
 
     for row in rows {
         fkey.push(row.fkey);
@@ -467,6 +488,14 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         crange.push(row.crange);
         tlen.push(row.tlen);
         pnlu.push(row.pnlu);
+        open_mkt_ts.push(row.open_mkt_ts);
+        open_create_ts.push(row.cts);
+        open_new_ts.push(row.open_new_ts);
+        open_terminal_ts.push(row.open_terminal_ts);
+        open_terminal_ts_local.push(row.open_terminal_ts_local);
+        hedge_create_ts.push(row.hts);
+        hedge_new_ts.push(row.hedge_new_ts);
+        hedge_terminal_ts.push(row.hedge_terminal_ts);
     }
 
     DataFrame::new(vec![
@@ -488,6 +517,14 @@ fn rows_to_frame(rows: Vec<OrderRow>) -> Result<DataFrame> {
         Series::new("crange".into(), crange),
         Series::new("tlen".into(), tlen),
         Series::new("pnlu".into(), pnlu),
+        Series::new("open.mkt_ts".into(), open_mkt_ts),
+        Series::new("open.create_ts".into(), open_create_ts),
+        Series::new("open.new_ts".into(), open_new_ts),
+        Series::new("open.terminal_ts".into(), open_terminal_ts),
+        Series::new("open.terminal_ts_local".into(), open_terminal_ts_local),
+        Series::new("hedge.create_ts".into(), hedge_create_ts),
+        Series::new("hedge.new_ts".into(), hedge_new_ts),
+        Series::new("hedge.terminal_ts".into(), hedge_terminal_ts),
     ])
     .context("build matched-order DataFrame")
 }
@@ -628,5 +665,68 @@ mod tests {
         let date = parse_trade_date("20260731").unwrap();
         let (start, _) = day_bounds(date).unwrap();
         assert_eq!(date_from_utc_day(start / MICROS_PER_DAY).unwrap(), date);
+    }
+
+    #[test]
+    fn appends_named_order_timeline_columns() {
+        let frame = rows_to_frame(vec![OrderRow {
+            fkey: 1,
+            symbol: "BTCUSDT".to_string(),
+            side: "buy".to_string(),
+            cts: 20,
+            open_uts: 40,
+            hts: Some(60),
+            fts: Some(90),
+            holding: 20,
+            holding_close: Some(30),
+            close_count: 1,
+            price: 100.0,
+            amount: 1.0,
+            cprice: Some(101.0),
+            camount: 1.0,
+            range: 2.0,
+            crange: -1.0,
+            tlen: Some(1_000.0),
+            pnlu: Some(1.0),
+            open_mkt_ts: Some(10),
+            open_new_ts: Some(30),
+            open_terminal_ts: Some(40),
+            open_terminal_ts_local: Some(50),
+            hedge_new_ts: Some(70),
+            hedge_terminal_ts: Some(80),
+        }])
+        .unwrap();
+
+        assert_eq!(frame.width(), 26);
+        for name in [
+            "open.mkt_ts",
+            "open.create_ts",
+            "open.new_ts",
+            "open.terminal_ts",
+            "open.terminal_ts_local",
+            "hedge.create_ts",
+            "hedge.new_ts",
+            "hedge.terminal_ts",
+        ] {
+            assert!(frame.column(name).is_ok(), "missing {name}");
+        }
+        assert_eq!(
+            frame
+                .column("open.create_ts")
+                .unwrap()
+                .i64()
+                .unwrap()
+                .get(0),
+            Some(20)
+        );
+        assert_eq!(
+            frame
+                .column("hedge.create_ts")
+                .unwrap()
+                .i64()
+                .unwrap()
+                .get(0),
+            Some(60)
+        );
     }
 }
