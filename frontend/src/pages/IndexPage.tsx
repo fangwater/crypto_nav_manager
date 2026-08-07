@@ -10,6 +10,7 @@ import {
   GitCompareArrows,
   Percent,
   RadioTower,
+  ShieldAlert,
   ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -278,6 +279,15 @@ export function IndexPage() {
             >
               <RadioTower size={16} />
               <span>行情网络</span>
+            </Link>
+            <Link
+              className="header-nav-link"
+              to="/monitor"
+              aria-label="安全监控"
+              title="安全监控"
+            >
+              <ShieldAlert size={16} />
+              <span>安全监控</span>
             </Link>
             <Link
               className="header-nav-link"

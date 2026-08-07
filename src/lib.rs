@@ -8,6 +8,7 @@ pub mod intra_order_match;
 pub mod live_history;
 pub mod mark_prices;
 pub mod models;
+pub mod ops_monitor;
 pub mod pnl;
 pub mod postgres;
 mod quantity_fifo_pnl;

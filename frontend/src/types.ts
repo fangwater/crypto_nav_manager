@@ -4,6 +4,93 @@ export interface Health {
   readOnly: boolean
 }
 
+export type OpsHealth = 'healthy' | 'warning' | 'critical'
+export type OpsComponentHealth =
+  | 'online'
+  | 'warning'
+  | 'offline'
+  | 'duplicate'
+  | 'zombie'
+export type OpsComponentRole =
+  | 'trade_signal'
+  | 'pre_trade'
+  | 'account_monitor'
+  | 'trade_engine'
+  | 'persist_manager'
+  | 'viz_server'
+
+export interface OpsAlertSample {
+  severity: 'warning' | 'error'
+  atMs: number
+  count: number
+  message: string
+}
+
+export interface OpsAlertSummary {
+  warningCount: number
+  errorCount: number
+  lastAlertAtMs: number | null
+  truncated: boolean
+  samples: OpsAlertSample[]
+}
+
+export interface OpsComponent {
+  role: OpsComponentRole
+  critical: boolean
+  status: OpsComponentHealth
+  pid: number | null
+  instances: number
+  linuxState: string | null
+  manager: string
+  managerName: string
+  alerts: OpsAlertSummary
+}
+
+export interface OpsCurrentPosition {
+  marginQty: number
+  futuresQty: number
+  netQty: number
+  marginUsd: number
+  futuresUsd: number
+  netUsd: number
+}
+
+export interface OpsTradingBlock {
+  symbol: string
+  asset: string
+  blockedLeg: 'margin' | 'futures' | 'unknown'
+  venue: string
+  side: string
+  orderQty: number | null
+  orderPrice: number | null
+  httpStatus: number | null
+  errorCode: number | null
+  errorLabel: string
+  errorMessage: string
+  firstSeenAtMs: number
+  lastSeenAtMs: number
+  count: number
+  latestClientOrderId: string
+  positionStatus: 'live' | 'unavailable'
+  positionSnapshotAtMs: number | null
+  positionError: string | null
+  currentPosition: OpsCurrentPosition | null
+}
+
+export interface OpsEnvironment {
+  strategySlug: string
+  host: string
+  profile: 'funding_rate' | 'intra_exchange' | 'market_making'
+  status: OpsHealth
+  components: OpsComponent[]
+  tradingBlocks: OpsTradingBlock[]
+}
+
+export interface OpsOverview {
+  generatedAtMs: number
+  environments: OpsEnvironment[]
+}
+
 export interface Strategy {
   slug: string
   alias: string | null

@@ -6,12 +6,14 @@ import type {
   HistorySyncStatus,
   Health,
   IntraMatchingSummary,
+  OpsOverview,
   Strategy,
   StrategyPnl,
   StrategySnapshotSummary,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_NAV_API_BASE ?? '/nav-api'
+const OPS_API_BASE = '/ops-api'
 
 export function getHealth(signal?: AbortSignal): Promise<Health> {
   return getJson<Health>('/health', signal)
@@ -31,6 +33,21 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   }
 
   return response.json() as Promise<T>
+}
+
+async function getOpsJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(OPS_API_BASE + path, {
+    headers: { Accept: 'application/json' },
+    signal,
+  })
+  if (!response.ok) {
+    throw new Error('HTTP ' + response.status)
+  }
+  return response.json() as Promise<T>
+}
+
+export function getOpsOverview(signal?: AbortSignal): Promise<OpsOverview> {
+  return getOpsJson<OpsOverview>('/api/v1/overview', signal)
 }
 
 export function getStrategies(): Promise<Strategy[]> {

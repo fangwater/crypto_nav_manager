@@ -1,0 +1,71 @@
+{
+  "bind": "127.0.0.1:4210",
+  "scanIntervalSecs": 5,
+  "warningWindowSecs": 900,
+  "maxPositionThresholdWhitelistUsd": [100.0],
+  "environments": [
+    {
+      "slug": "binance_mm_alpha",
+      "host": "local",
+      "root": "/home/ubuntu/binance_mm_alpha",
+      "exchange": "binance",
+      "tag": "alpha",
+      "snapshotUrl": "http://127.0.0.1:4191/mm/binance_mm_alpha/snapshot",
+      "profile": "market_making"
+    },
+    {
+      "slug": "binance-intra-arb01",
+      "host": "local",
+      "root": "/home/ubuntu/binance-intra-arb01",
+      "exchange": "binance",
+      "tag": "arb01",
+      "snapshotUrl": "http://127.0.0.1:4191/intra/binance-intra-arb01/snapshot",
+      "profile": "intra_exchange"
+    },
+    {
+      "slug": "binance_fr_arb04",
+      "host": "local",
+      "root": "/home/ubuntu/binance_fr_arb04",
+      "exchange": "binance",
+      "tag": "arb04",
+      "snapshotUrl": "http://127.0.0.1:4191/fr/binance_fr_arb04/snapshot",
+      "profile": "funding_rate"
+    },
+    {
+      "slug": "binance_fr_arb03",
+      "host": "local",
+      "root": "/home/ubuntu/binance_fr_arb03",
+      "exchange": "binance",
+      "tag": "arb03",
+      "snapshotUrl": "http://127.0.0.1:4191/fr/binance_fr_arb03/snapshot",
+      "profile": "funding_rate"
+    },
+    {
+      "slug": "gate_fr_arb02",
+      "host": "local",
+      "root": "/home/ubuntu/gate_fr_arb02",
+      "exchange": "gate",
+      "tag": "arb02",
+      "snapshotUrl": "http://127.0.0.1:4191/fr/gate_fr_arb02/snapshot",
+      "profile": "funding_rate"
+    },
+    {
+      "slug": "bitget_fr_arb02",
+      "host": "local",
+      "root": "/home/ubuntu/bitget_fr_arb02",
+      "exchange": "bitget",
+      "tag": "arb02",
+      "snapshotUrl": "http://127.0.0.1:4191/fr/bitget_fr_arb02/snapshot",
+      "profile": "funding_rate"
+    },
+    {
+      "slug": "gate_fr_arb01",
+      "host": "local",
+      "root": "/home/ubuntu/gate_fr_arb01",
+      "exchange": "gate",
+      "tag": "arb01",
+      "snapshotUrl": "http://127.0.0.1:4191/fr/gate_fr_arb01/snapshot",
+      "profile": "funding_rate"
+    }
+  ]
+}
