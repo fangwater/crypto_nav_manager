@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the read-only matched-order export every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=crypto-matched-order-export-read-only.service
+
+[Install]
+WantedBy=timers.target

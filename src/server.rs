@@ -3,6 +3,7 @@ use crate::{
     contract_multipliers, live_history,
     mark_prices::MarkPriceCache,
     pnl::{self, InitialPosition, PnlCalculation, PnlSourceKind},
+    postgres, runtime,
     strategy_env::read_env_file,
 };
 use anyhow::{Context, Result, bail};
@@ -10,27 +11,26 @@ use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{
-    FromRow, PgPool,
-    migrate::Migrator,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
+use sqlx::{FromRow, PgPool, migrate::Migrator, postgres::PgConnectOptions};
 use std::{
     collections::{HashMap, HashSet},
     env,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     str::FromStr,
     sync::Arc,
 };
 use tokio::{sync::Mutex, task::JoinSet};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -38,11 +38,13 @@ const DEFAULT_BIND: &str = "127.0.0.1:4200";
 const DEFAULT_DB_HOST: &str = "/var/run/postgresql";
 const DEFAULT_DB_NAME: &str = "crypto_nav_manager";
 const DEFAULT_DB_USER: &str = "ubuntu";
+const FRONTEND_DIR_ENV: &str = "CRYPTO_NAV_FRONTEND_DIR";
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
+    read_only: bool,
     account_risks: AccountRiskCache,
     mark_prices: MarkPriceCache,
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
@@ -95,9 +97,11 @@ struct StrategyResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
     strategies: usize,
+    read_only: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -397,52 +401,52 @@ pub async fn run() -> Result<()> {
 
     let bind = env::var("CRYPTO_NAV_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let bind: SocketAddr = bind.parse().context("invalid CRYPTO_NAV_BIND")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
+    let read_only = runtime::read_only()?;
+    let pool = postgres::pool_options(5, read_only)
         .connect_with(postgres_options()?)
         .await
         .context("connect PostgreSQL")?;
 
-    MIGRATOR
-        .run(&pool)
+    let (account_risks, mark_prices) = if read_only {
+        info!("read-only mode enabled; migrations and background data sources disabled");
+        (AccountRiskCache::default(), MarkPriceCache::default())
+    } else {
+        MIGRATOR
+            .run(&pool)
+            .await
+            .context("run PostgreSQL migrations")?;
+        let account_risk_feeds = sqlx::query_as::<_, AccountRiskFeedRecord>(
+            r#"SELECT slug,exchange,sort_order
+               FROM strategy_envs
+               WHERE enabled
+                 AND host = 'local'
+                 AND account_mode IN ('portfolio_margin','unified')
+                 AND strategy_kind <> 'market_making'
+               ORDER BY sort_order,slug"#,
+        )
+        .fetch_all(&pool)
         .await
-        .context("run PostgreSQL migrations")?;
-    let account_risk_feeds = sqlx::query_as::<_, AccountRiskFeedRecord>(
-        r#"SELECT slug,exchange,sort_order
-           FROM strategy_envs
-           WHERE enabled
-             AND host = 'local'
-             AND account_mode IN ('portfolio_margin','unified')
-             AND strategy_kind <> 'market_making'
-           ORDER BY sort_order,slug"#,
-    )
-    .fetch_all(&pool)
-    .await
-    .context("load local account risk feeds")?
-    .into_iter()
-    .filter_map(|row| AccountRiskFeed::new(row.slug, row.exchange, row.sort_order))
-    .collect();
-    let account_risks = AccountRiskCache::start(account_risk_feeds);
-    contract_multipliers::spawn(pool.clone());
-    live_history::spawn(pool.clone())?;
-    let mark_prices = MarkPriceCache::start().await;
+        .context("load local account risk feeds")?
+        .into_iter()
+        .filter_map(|row| AccountRiskFeed::new(row.slug, row.exchange, row.sort_order))
+        .collect();
+        let account_risks = AccountRiskCache::start(account_risk_feeds);
+        contract_multipliers::spawn(pool.clone());
+        live_history::spawn(pool.clone())?;
+        let mark_prices = MarkPriceCache::start().await;
+        (account_risks, mark_prices)
+    };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
         .route("/api/account-risks", get(list_account_risks))
         .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/alignment-status", get(list_alignment_status))
-        .route(
-            "/api/alignment-status/{slug}",
-            axum::routing::put(set_alignment_automatic),
-        )
         .route("/api/intra-matching", get(list_intra_matching))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
-        .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
         .route("/api/snapshots", get(list_latest_snapshots))
-        .route("/api/snapshots/sync", post(sync_snapshots))
         .route(
             "/api/snapshots/{slug}/history",
             get(list_strategy_snapshots),
@@ -451,13 +455,36 @@ pub async fn run() -> Result<()> {
         .route("/api/strategies/{slug}", get(get_strategy))
         .route(
             "/api/strategies/{slug}/initial-snapshot",
-            get(get_initial_snapshot)
-                .put(set_initial_snapshot)
-                .delete(clear_initial_snapshot),
+            get(get_initial_snapshot),
         )
-        .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl))
+        .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl));
+    if !read_only {
+        app = app
+            .route(
+                "/api/alignment-status/{slug}",
+                axum::routing::put(set_alignment_automatic),
+            )
+            .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
+            .route("/api/snapshots/sync", post(sync_snapshots))
+            .route(
+                "/api/strategies/{slug}/initial-snapshot",
+                axum::routing::put(set_initial_snapshot).delete(clear_initial_snapshot),
+            );
+    }
+    if let Some(frontend_dir) = frontend_dir()? {
+        let index = frontend_dir.join("index.html");
+        info!(path = %frontend_dir.display(), "serving NAV frontend");
+        app = app
+            .route("/", get(|| async { Redirect::temporary("/nav/") }))
+            .nest_service(
+                "/nav",
+                ServeDir::new(frontend_dir).not_found_service(ServeFile::new(index)),
+            );
+    }
+    let app = app
         .with_state(AppState {
             pool,
+            read_only,
             account_risks,
             mark_prices,
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
@@ -468,13 +495,30 @@ pub async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    info!(%bind, "crypto NAV API started with PostgreSQL");
+    info!(%bind, read_only, "crypto NAV API started with PostgreSQL");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP")?;
     Ok(())
+}
+
+fn frontend_dir() -> Result<Option<PathBuf>> {
+    let Some(value) = env::var_os(FRONTEND_DIR_ENV) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        bail!("{FRONTEND_DIR_ENV} must not be empty");
+    }
+    let directory = PathBuf::from(value);
+    if !directory.join("index.html").is_file() {
+        bail!(
+            "{FRONTEND_DIR_ENV} does not contain index.html: {}",
+            directory.display()
+        );
+    }
+    Ok(Some(directory))
 }
 
 async fn list_account_risks(State(state): State<AppState>) -> Json<Vec<AccountRiskSnapshot>> {
@@ -1141,6 +1185,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
     Ok(Json(HealthResponse {
         status: "ok",
         strategies: count as usize,
+        read_only: state.read_only,
     }))
 }
 

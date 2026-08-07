@@ -1,6 +1,7 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import './App.css'
+import { getHealth } from './api'
 import { IndexPage } from './pages/IndexPage'
 
 const StrategyPage = lazy(() =>
@@ -28,6 +29,16 @@ const MarketDataNetworkPage = lazy(() =>
 )
 
 export default function App() {
+  const [readOnly, setReadOnly] = useState(true)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    getHealth(controller.signal)
+      .then((health) => setReadOnly(health.readOnly))
+      .catch(() => setReadOnly(true))
+    return () => controller.abort()
+  }, [])
+
   return (
     <Suspense
       fallback={
@@ -39,11 +50,13 @@ export default function App() {
       <Routes>
         <Route path="/" element={<IndexPage />} />
         <Route path="/market-data" element={<MarketDataNetworkPage />} />
-        <Route path="/fee-rates" element={<FeeRatesPage />} />
+        <Route path="/fee-rates" element={<FeeRatesPage readOnly={readOnly} />} />
         <Route path="/intra-matching" element={<IntraMatchingPage />} />
-        <Route path="/strategies/:slug" element={<StrategyPage />} />
+        <Route
+          path="/strategies/:slug"
+          element={<StrategyPage readOnly={readOnly} />}
+        />
       </Routes>
     </Suspense>
   )
 }
-

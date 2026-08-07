@@ -1,3 +1,9 @@
+export interface Health {
+  status: string
+  strategies: number
+  readOnly: boolean
+}
+
 export interface Strategy {
   slug: string
   alias: string | null

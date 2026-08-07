@@ -2,10 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, TimeDelta};
 use clap::Parser;
 use polars::prelude::*;
-use sqlx::{
-    AssertSqlSafe, PgPool, Row,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
+use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgConnectOptions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -34,8 +31,8 @@ struct Args {
     #[arg(long, value_parser = parse_trade_date)]
     trade_date: Vec<NaiveDate>,
 
-    #[arg(long, default_value = "/home/ubuntu/order_data")]
-    output_root: PathBuf,
+    #[arg(long)]
+    output_root: Option<PathBuf>,
 
     /// Rebuild selected files even when their exported database state is current.
     #[arg(long)]
@@ -98,8 +95,10 @@ struct ExportSummary {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    fs::create_dir_all(&args.output_root)
-        .with_context(|| format!("create output root {}", args.output_root.display()))?;
+    let output_root =
+        crypto_nav_manager::runtime::matched_output_root(args.output_root.as_deref())?;
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create output root {}", output_root.display()))?;
 
     let pool = connect_postgres(args.database_url.as_deref()).await?;
     let strategies = load_strategies(&pool, &args.strategy).await?;
@@ -119,12 +118,10 @@ async fn main() -> Result<()> {
             selected_dates.iter().copied().collect::<Vec<_>>()
         };
 
-        let output_dir = args
-            .output_root
+        let output_dir = output_root
             .join(&strategy.directory_alias)
             .join("matched_order");
-        let state_dir = args
-            .output_root
+        let state_dir = output_root
             .join(".export_state")
             .join(&strategy.directory_alias)
             .join("matched_order");
@@ -187,8 +184,7 @@ async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
             .database("crypto_nav_manager")
             .username("ubuntu"),
     };
-    PgPoolOptions::new()
-        .max_connections(2)
+    crypto_nav_manager::postgres::pool_options(2, true)
         .connect_with(options)
         .await
         .context("connect PostgreSQL")

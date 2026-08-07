@@ -1,0 +1,24 @@
+[Unit]
+Description=Crypto NAV Manager read-only API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/fanghaizhou/crypto_nav_manager
+ExecStart=%h/fanghaizhou/crypto_nav_manager/target/release/crypto_nav_manager
+Environment=CRYPTO_NAV_BIND=0.0.0.0:4200
+Environment=CRYPTO_NAV_READ_ONLY=1
+Environment=CRYPTO_NAV_LIVE_SYNC_SECS=0
+Environment=CRYPTO_NAV_EXPORT_ROOT=/mnt/hdd-raid5-72t/liang_torch/raw_data/crypto_data/order_data
+Environment=CRYPTO_NAV_FRONTEND_DIR=frontend/dist
+Environment=RUST_LOG=crypto_nav_manager=info,tower_http=info
+EnvironmentFile=-%h/.config/crypto-nav-manager/env
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+UMask=0022
+
+[Install]
+WantedBy=default.target

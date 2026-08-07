@@ -3,10 +3,7 @@ use super::model::{
     valid_identifier,
 };
 use anyhow::{Context, Result, bail};
-use sqlx::{
-    PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
+use sqlx::{PgPool, postgres::PgConnectOptions};
 use std::env;
 
 pub(crate) async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
@@ -22,8 +19,7 @@ pub(crate) async fn connect_postgres(database_url: Option<&str>) -> Result<PgPoo
             .database("crypto_nav_manager")
             .username("ubuntu"),
     };
-    PgPoolOptions::new()
-        .max_connections(2)
+    crypto_nav_manager::postgres::pool_options(2, true)
         .connect_with(options)
         .await
         .context("connect PostgreSQL")

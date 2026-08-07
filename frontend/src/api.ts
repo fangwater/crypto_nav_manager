@@ -3,13 +3,18 @@ import type {
   AccountRisk,
   AlignmentStatus,
   HistorySyncStatus,
+  Health,
   IntraMatchingSummary,
   Strategy,
   StrategyPnl,
   StrategySnapshotSummary,
 } from './types'
 
-const API_BASE = '/nav-api'
+const API_BASE = import.meta.env.VITE_NAV_API_BASE ?? '/nav-api'
+
+export function getHealth(signal?: AbortSignal): Promise<Health> {
+  return getJson<Health>('/health', signal)
+}
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(API_BASE + path, {

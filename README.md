@@ -197,6 +197,33 @@ Funding and interest files use the existing 12-column cash format. The CSV
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
 
+### Read-only replica deployment
+
+Set `CRYPTO_NAV_READ_ONLY=1` when the API runs against a local PostgreSQL
+standby or another display-only database. Read-only mode makes every pooled
+database connection default to read-only transactions, skips migrations,
+disables exchange REST, Redis, and IPC background sources, and does not
+register mutating API routes. The health response reports `readOnly: true` so
+the frontend can hide write controls.
+
+Use one export root for both exporters:
+
+```bash
+export CRYPTO_NAV_EXPORT_ROOT=/mnt/hdd-raid5-72t/liang_torch/raw_data/crypto_data/order_data
+```
+
+`export_history` writes below `$CRYPTO_NAV_EXPORT_ROOT/history/<strategy>/`.
+`export_matched_orders` preserves the existing
+`$CRYPTO_NAV_EXPORT_ROOT/<alias>/matched_order/` layout. Explicit
+`--output-dir` and `--output-root` arguments take precedence over the
+environment variable. Both exporters use read-only PostgreSQL sessions, and
+`export_history` never runs migrations.
+
+For a single-process user deployment, build the frontend with
+`VITE_NAV_API_BASE=/api` and set `CRYPTO_NAV_FRONTEND_DIR=frontend/dist`. The
+Rust service then serves the dashboard below `/nav/` on the same bind address,
+without requiring nginx or a separate Node process.
+
 ### Matched intra-order Parquet export
 
 Export synthesized intra orders from PostgreSQL into daily UTC Parquet files:
@@ -242,6 +269,35 @@ rewritten.
 The deploy directory contains `crypto-matched-order-export.service` and its
 five-minute timer. The exporter only reads PostgreSQL and does not call exchange
 APIs or modify the matching tables. `raw_order` is not exported.
+
+### Order-aligned factor Parquet export
+
+Generate an independent factor file for every matched-order file:
+
+```bash
+cargo run --release --bin export_matched_order_factors -- \
+  --alias binance-mt \
+  --trade-date 20260731 \
+  --force
+```
+
+The output path is
+`$CRYPTO_NAV_EXPORT_ROOT/{alias}/matched_order_factor/{YYYYMMDD}.parquet`.
+Rows remain in the same order as `matched_order/{YYYYMMDD}.parquet` and retain
+`fkey`, `symbol`, and `cts`. The exporter rounds each microsecond `cts` down
+to the previous five-second boundary and performs an exact
+`(symbol, factor_ts)` lookup in
+`fusion.fusion_factor_binance_futures_5s`. This guarantees that a future
+factor is never selected. Missing symbols or missing five-second factor slots
+remain in the output with null factor values, so the output row count is always
+identical to the matched-order file. A non-null `factor_ts` indicates a
+successful match. The remaining columns contain all factor fields discovered
+from `system.columns`; `factor_age_us` and `replay_version` are not exported.
+Dates after the latest UTC date available in the factor table are skipped.
+
+The factor exporter tracks both source-file metadata and the ClickHouse factor
+table state. Files are replaced atomically. It runs independently from the
+PostgreSQL order exporter so a ClickHouse outage cannot interrupt order files.
 
 ## CLI example
 

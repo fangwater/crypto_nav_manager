@@ -1,0 +1,16 @@
+[Unit]
+Description=Export order-aligned factors from ClickHouse
+After=crypto-matched-order-export-read-only.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/fanghaizhou/crypto_nav_manager
+EnvironmentFile=%h/.config/crypto-nav-manager/env
+ExecStart=%h/fanghaizhou/crypto_nav_manager/target/release/export_matched_order_factors
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/mnt/hdd-raid5-72t/liang_torch/raw_data/crypto_data/order_data
+UMask=0022
+TimeoutStartSec=10min

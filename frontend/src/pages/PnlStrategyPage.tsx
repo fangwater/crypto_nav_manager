@@ -175,7 +175,7 @@ function SymbolRow({
   )
 }
 
-export function PnlStrategyPage() {
+export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
   const { slug = '' } = useParams()
   const [strategy, setStrategy] = useState<Strategy | null>(null)
   const [pnl, setPnl] = useState<StrategyPnl | null>(null)
@@ -534,7 +534,7 @@ export function PnlStrategyPage() {
             <select
               id="initial-snapshot-select"
               value={selectedSnapshotTs ?? ''}
-              disabled={snapshotBusy || snapshotHistory.length === 0}
+              disabled={readOnly || snapshotBusy || snapshotHistory.length === 0}
               onChange={(event) => setSelectedSnapshotTs(Number(event.target.value))}
             >
               {snapshotHistory.length === 0 && <option value="">暂无快照</option>}
@@ -544,28 +544,32 @@ export function PnlStrategyPage() {
                 </option>
               ))}
             </select>
-            <button
-              type="button"
-              className="snapshot-apply-button"
-              disabled={
-                snapshotBusy ||
-                selectedSnapshotTs === null ||
-                selectedSnapshotTs === initialSnapshot?.snapshotTsMs
-              }
-              onClick={applyInitialSnapshot}
-            >
-              设为初始
-            </button>
-            <button
-              type="button"
-              className="icon-button snapshot-clear-button"
-              disabled={snapshotBusy || initialSnapshot === null}
-              onClick={removeInitialSnapshot}
-              title="清除初始快照"
-              aria-label="清除初始快照"
-            >
-              <Trash2 size={15} />
-            </button>
+            {!readOnly && (
+              <>
+                <button
+                  type="button"
+                  className="snapshot-apply-button"
+                  disabled={
+                    snapshotBusy ||
+                    selectedSnapshotTs === null ||
+                    selectedSnapshotTs === initialSnapshot?.snapshotTsMs
+                  }
+                  onClick={applyInitialSnapshot}
+                >
+                  设为初始
+                </button>
+                <button
+                  type="button"
+                  className="icon-button snapshot-clear-button"
+                  disabled={snapshotBusy || initialSnapshot === null}
+                  onClick={removeInitialSnapshot}
+                  title="清除初始快照"
+                  aria-label="清除初始快照"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </>
+            )}
           </div>
           <span>
             {initialSnapshot

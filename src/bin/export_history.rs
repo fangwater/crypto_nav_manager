@@ -32,8 +32,8 @@ struct Args {
     dataset: Dataset,
 
     /// Root directory. Each strategy is written to its own child directory.
-    #[arg(long, default_value = "data")]
-    output_dir: PathBuf,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
 
     /// Inclusive minimum event timestamp.
     #[arg(long)]
@@ -52,20 +52,17 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_time_range(args.start_ms, args.end_ms)?;
-    fs::create_dir_all(&args.output_dir)
-        .with_context(|| format!("create output directory {}", args.output_dir.display()))?;
+    let output_dir = crypto_nav_manager::runtime::history_output_dir(args.output_dir.as_deref())?;
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("create output directory {}", output_dir.display()))?;
 
     let pool = connect_postgres(args.database_url.as_deref()).await?;
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("run PostgreSQL migrations")?;
 
     let mut slugs = BTreeSet::new();
     slugs.extend(args.strategy);
     for slug in slugs {
         let strategy = load_strategy(&pool, &slug).await?;
-        let strategy_dir = strategy_output_dir(&args.output_dir, &strategy.slug)?;
+        let strategy_dir = strategy_output_dir(&output_dir, &strategy.slug)?;
         fs::create_dir_all(&strategy_dir)
             .with_context(|| format!("create strategy directory {}", strategy_dir.display()))?;
 

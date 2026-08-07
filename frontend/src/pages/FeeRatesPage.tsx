@@ -122,6 +122,7 @@ function FeeValue({ value }: { value: string }) {
 
 interface AccountRatesProps {
   account: AccountFeeRates
+  readOnly: boolean
   syncing: boolean
   syncError?: string
   onSync: (slug: string) => void
@@ -129,6 +130,7 @@ interface AccountRatesProps {
 
 function AccountRates({
   account,
+  readOnly,
   syncing,
   syncError,
   onSync,
@@ -214,16 +216,18 @@ function AccountRates({
             <Clock3 size={14} />
             {updatedAt ? formatTime(updatedAt) : '待同步'}
           </div>
-          <button
-            className="fee-account-sync"
-            type="button"
-            aria-label={'同步 ' + account.displayName}
-            title="同步此账户"
-            disabled={syncing}
-            onClick={() => onSync(account.slug)}
-          >
-            <RefreshCw size={15} className={syncing ? 'is-spinning' : ''} />
-          </button>
+          {!readOnly && (
+            <button
+              className="fee-account-sync"
+              type="button"
+              aria-label={'同步 ' + account.displayName}
+              title="同步此账户"
+              disabled={syncing}
+              onClick={() => onSync(account.slug)}
+            >
+              <RefreshCw size={15} className={syncing ? 'is-spinning' : ''} />
+            </button>
+          )}
         </div>
       </header>
 
@@ -334,7 +338,7 @@ function AccountRates({
   )
 }
 
-export function FeeRatesPage() {
+export function FeeRatesPage({ readOnly }: { readOnly: boolean }) {
   const [accounts, setAccounts] = useState<AccountFeeRates[]>([])
   const [filter, setFilter] = useState<ExchangeFilter>('all')
   const [loading, setLoading] = useState(true)
@@ -506,6 +510,7 @@ export function FeeRatesPage() {
               <AccountRates
                 account={account}
                 key={account.slug}
+                readOnly={readOnly}
                 syncing={syncingSlugs.has(account.slug)}
                 syncError={syncErrors[account.slug]}
                 onSync={syncAccount}

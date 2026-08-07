@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the order-aligned factor export every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=crypto-matched-order-factor-export-read-only.service
+
+[Install]
+WantedBy=timers.target
