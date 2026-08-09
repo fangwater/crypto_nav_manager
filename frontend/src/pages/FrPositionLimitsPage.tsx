@@ -71,181 +71,177 @@ function sideLabel(side: FrLimitRow['side']) {
 
 function environmentStatus(environment: FrLimitEnvironment) {
   if (environment.status === 'error') return '数据异常'
-  if (environment.sourceCounts.nearLimitRows > 0) return '接近限仓'
+  if (!environment.paramsLive) return '参数降级'
   if (environment.warnings.length > 0) return '数据降级'
+  if (environment.sourceCounts.nearLimitRows > 0) return '接近限仓'
   return '正常'
 }
 
-function EnvironmentTable({
-  environment,
-  onlyAlerts,
-}: {
+interface FrLimitTrigger {
   environment: FrLimitEnvironment
-  onlyAlerts: boolean
+  row: FrLimitRow
+}
+
+interface FrSymbolAlert {
+  exchange: FrLimitExchange
+  symbol: string
+  asset: string
+  maxUsageRatio: number
+  triggers: FrLimitTrigger[]
+}
+
+function strategyLabel(slug: string) {
+  const match = slug.match(/_fr_arb(\d+)$/)
+  return match ? `FR${match[1]}` : slug
+}
+
+function ExchangeSourceIssues({
+  environments,
+}: {
+  environments: FrLimitEnvironment[]
 }) {
-  const rows = onlyAlerts
-    ? environment.rows.filter((row) => row.nearLimit)
-    : environment.rows
+  const issues = environments.filter(
+    (environment) =>
+      environment.error !== null ||
+      environment.warnings.length > 0 ||
+      !environment.paramsLive,
+  )
+
+  if (issues.length === 0) return null
 
   return (
-    <article className="fr-environment">
-      <header className="fr-environment__header">
-        <div className="fr-environment__identity">
-          <span
-            className={
-              'status-dot status-dot--' +
-              (environment.status === 'error'
-                ? 'danger'
-                : environment.sourceCounts.nearLimitRows > 0
-                  ? 'warning'
-                  : 'ready')
-            }
-          />
+    <details className="fr-exchange-issues">
+      <summary>
+        <CircleAlert size={15} />
+        <span>数据源提示 {issues.length} 盘</span>
+      </summary>
+      <div className="fr-exchange-issues__list">
+        {issues.map((environment) => (
+          <div key={environment.strategySlug}>
+            <strong>{environment.strategySlug}</strong>
+            <span>{environmentStatus(environment)}</span>
+            {environment.error && <p>{environment.error}</p>}
+            {environment.warnings.map((warning) => (
+              <p key={warning}>{warning}</p>
+            ))}
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function SymbolAlert({ alert }: { alert: FrSymbolAlert }) {
+  const strategyNames = alert.triggers.map(({ environment }) =>
+    strategyLabel(environment.strategySlug),
+  )
+
+  return (
+    <article className="fr-symbol-alert">
+      <header className="fr-symbol-alert__header">
+        <div className="fr-symbol-alert__identity">
+          <span className="fr-alert-indicator" aria-hidden="true">
+            <AlertTriangle size={15} />
+          </span>
           <div>
-            <h3>{environment.strategySlug}</h3>
+            <h3>{alert.symbol}</h3>
             <p>
-              Snapshot{' '}
-              {environment.snapshotTsMs
-                ? timeFormatter.format(environment.snapshotTsMs)
-                : '不可用'}
+              {alert.asset} · {alert.triggers.length} 个盘触发
             </p>
           </div>
         </div>
-        <div className="fr-environment__states">
-          <span
-            className={
-              'fr-state-badge fr-state-badge--' + environment.status
-            }
-          >
-            {environmentStatus(environment)}
-          </span>
-          <span
-            className={
-              'fr-param-state ' +
-              (environment.paramsLive ? 'is-live' : 'is-fallback')
-            }
-          >
-            {environment.paramsLive ? 'Pre-Trade 实时参数' : '原始限仓口径'}
-          </span>
-          <span>
-            {environment.sourceCounts.displayedRows} symbols
-          </span>
+        <div className="fr-symbol-alert__summary">
+          <div className="fr-trigger-strategies" aria-label="触发盘子">
+            {strategyNames.map((name) => (
+              <span key={name}>{name}</span>
+            ))}
+          </div>
+          <div className="fr-max-usage">
+            <span>最高占用率</span>
+            <strong>{formatRatio(alert.maxUsageRatio)}</strong>
+          </div>
         </div>
       </header>
 
-      {environment.error && (
-        <div className="fr-source-error">
-          <CircleAlert size={15} />
-          <span>{environment.error}</span>
-        </div>
-      )}
-
-      {environment.warnings.length > 0 && (
-        <details className="fr-source-warnings">
-          <summary>数据提示 {environment.warnings.length}</summary>
-          <ul>
-            {environment.warnings.map((warning) => (
-              <li key={warning}>{warning}</li>
-            ))}
-          </ul>
-        </details>
-      )}
-
-      {!environment.error && rows.length === 0 && (
-        <div className="fr-empty">
-          <CheckCircle2 size={17} />
-          <span>{onlyAlerts ? '当前没有接近限仓的币种' : '当前没有有效合约仓位'}</span>
-        </div>
-      )}
-
-      {rows.length > 0 && (
-        <div className="fr-limit-table-wrap">
-          <table className="fr-limit-table">
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>方向</th>
-                <th>占用率</th>
-                <th>REST 合约仓位</th>
-                <th>Guard Cap</th>
-                <th>交易所限仓</th>
-                <th>剩余额度</th>
-                <th>Snapshot Futures</th>
-                <th>REST - Snapshot</th>
-                <th>Buffer</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr
-                  className={row.nearLimit ? 'is-near-limit' : ''}
-                  key={row.symbol}
-                >
-                  <th>
-                    <strong>{row.symbol}</strong>
-                    <small>
-                      {row.error ??
-                        (row.trackedInSnapshot ? row.asset : '仅 REST')}
-                    </small>
-                  </th>
-                  <td>
-                    <span className={'fr-side fr-side--' + row.side}>
-                      {sideLabel(row.side)}
+      <div className="fr-limit-table-wrap">
+        <table className="fr-limit-table fr-trigger-table">
+          <thead>
+            <tr>
+              <th>触发盘</th>
+              <th>方向</th>
+              <th>占用率</th>
+              <th>REST 合约仓位</th>
+              <th>Guard Cap</th>
+              <th>交易所限仓</th>
+              <th>剩余额度</th>
+              <th>Buffer</th>
+              <th>Snapshot Futures</th>
+              <th>REST - Snapshot</th>
+            </tr>
+          </thead>
+          <tbody>
+            {alert.triggers.map(({ environment, row }) => (
+              <tr className="is-near-limit" key={environment.strategySlug}>
+                <th>
+                  <strong>{strategyLabel(environment.strategySlug)}</strong>
+                  <small title={environment.strategySlug}>
+                    {environment.strategySlug}
+                  </small>
+                </th>
+                <td>
+                  <span className={'fr-side fr-side--' + row.side}>
+                    {sideLabel(row.side)}
+                  </span>
+                </td>
+                <td>
+                  <div className="fr-usage">
+                    <strong>{formatRatio(row.usageRatio)}</strong>
+                    <span aria-hidden="true">
+                      <i
+                        style={{
+                          width:
+                            Math.min(
+                              100,
+                              Math.max(0, (row.usageRatio ?? 0) * 100),
+                            ) + '%',
+                        }}
+                      />
                     </span>
-                  </td>
-                  <td>
-                    <div className="fr-usage">
-                      <strong>{formatRatio(row.usageRatio)}</strong>
-                      <span aria-hidden="true">
-                        <i
-                          style={{
-                            width:
-                              Math.min(
-                                100,
-                                Math.max(0, (row.usageRatio ?? 0) * 100),
-                              ) + '%',
-                          }}
-                        />
-                      </span>
-                    </div>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.positionNotionalUsdt)}</strong>
-                    <small>{row.positionSource}</small>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.guardCapUsdt)}</strong>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.exchangeLimitUsdt)}</strong>
-                    {row.leverage !== null && (
-                      <small>{row.leverage}x</small>
-                    )}
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.remainingUsdt)}</strong>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.snapshotFuturesUsdt)}</strong>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.snapshotRestDeltaUsdt)}</strong>
-                  </td>
-                  <td className="fr-number">
-                    <strong>{formatUsd(row.guardBufferUsdt)}</strong>
-                    {row.pendingLimitOrders !== null &&
-                      row.amountU !== null && (
-                        <small>
-                          {row.pendingLimitOrders} × {formatUsd(row.amountU)}
-                        </small>
-                      )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+                  </div>
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.positionNotionalUsdt)}</strong>
+                  <small>{row.positionSource}</small>
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.guardCapUsdt)}</strong>
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.exchangeLimitUsdt)}</strong>
+                  {row.leverage !== null && <small>{row.leverage}x</small>}
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.remainingUsdt)}</strong>
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.guardBufferUsdt)}</strong>
+                  {row.pendingLimitOrders !== null && row.amountU !== null && (
+                    <small>
+                      {row.pendingLimitOrders} × {formatUsd(row.amountU)}
+                    </small>
+                  )}
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.snapshotFuturesUsdt)}</strong>
+                </td>
+                <td className="fr-number">
+                  <strong>{formatUsd(row.snapshotRestDeltaUsdt)}</strong>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </article>
   )
 }
@@ -253,7 +249,6 @@ function EnvironmentTable({
 export function FrPositionLimitsPage() {
   const [overview, setOverview] = useState<FrPositionLimitOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [onlyAlerts, setOnlyAlerts] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -268,7 +263,10 @@ export function FrPositionLimitsPage() {
           setError(null)
         })
         .catch((reason: unknown) => {
-          if (!active || (reason instanceof DOMException && reason.name === 'AbortError')) {
+          if (
+            !active ||
+            (reason instanceof DOMException && reason.name === 'AbortError')
+          ) {
             return
           }
           setError(reason instanceof Error ? reason.message : String(reason))
@@ -296,18 +294,87 @@ export function FrPositionLimitsPage() {
     [overview],
   )
 
-  const allRows =
-    overview?.environments.flatMap((environment) => environment.rows) ?? []
-  const nearLimitRows = allRows.filter((row) => row.nearLimit).length
+  const alertsByExchange = useMemo(() => {
+    const next = new Map<FrLimitExchange, FrSymbolAlert[]>()
+
+    for (const exchange of exchangeOrder) {
+      const bySymbol = new Map<string, FrSymbolAlert>()
+      const environments =
+        overview?.environments.filter(
+          (environment) => environment.exchange === exchange,
+        ) ?? []
+
+      for (const environment of environments) {
+        for (const row of environment.rows) {
+          if (!row.nearLimit) continue
+
+          const existing = bySymbol.get(row.symbol)
+          if (existing) {
+            existing.triggers.push({ environment, row })
+            existing.maxUsageRatio = Math.max(
+              existing.maxUsageRatio,
+              row.usageRatio ?? 0,
+            )
+          } else {
+            bySymbol.set(row.symbol, {
+              exchange,
+              symbol: row.symbol,
+              asset: row.asset,
+              maxUsageRatio: row.usageRatio ?? 0,
+              triggers: [{ environment, row }],
+            })
+          }
+        }
+      }
+
+      const alerts = [...bySymbol.values()]
+      for (const alert of alerts) {
+        alert.triggers.sort((left, right) => {
+          const usageDifference =
+            (right.row.usageRatio ?? 0) - (left.row.usageRatio ?? 0)
+          return (
+            usageDifference ||
+            left.environment.strategySlug.localeCompare(
+              right.environment.strategySlug,
+            )
+          )
+        })
+      }
+      alerts.sort(
+        (left, right) =>
+          right.maxUsageRatio - left.maxUsageRatio ||
+          left.symbol.localeCompare(right.symbol),
+      )
+      next.set(exchange, alerts)
+    }
+
+    return next
+  }, [overview])
+
+  const symbolAlertCount = exchangeOrder.reduce(
+    (total, exchange) => total + (alertsByExchange.get(exchange)?.length ?? 0),
+    0,
+  )
+  const triggerCount = exchangeOrder.reduce(
+    (total, exchange) =>
+      total +
+      (alertsByExchange.get(exchange)?.reduce(
+        (exchangeTotal, alert) => exchangeTotal + alert.triggers.length,
+        0,
+      ) ?? 0),
+    0,
+  )
   const sourceIssueCount =
     overview?.environments.filter(
       (environment) =>
-        environment.error !== null || environment.warnings.length > 0,
+        environment.error !== null ||
+        environment.warnings.length > 0 ||
+        !environment.paramsLive,
     ).length ?? 0
   const headerTone =
     error && !overview
       ? 'danger'
-      : nearLimitRows > 0 || sourceIssueCount > 0
+      : symbolAlertCount > 0 || sourceIssueCount > 0
         ? 'warning'
         : 'ready'
 
@@ -357,18 +424,9 @@ export function FrPositionLimitsPage() {
         <section className="fr-limit-overview">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">ACCOUNT-WIDE LIMITS</p>
-              <h2>实时限仓状态</h2>
+              <p className="eyebrow">EXCHANGE + SYMBOL ALERTS</p>
+              <h2>当前限仓告警</h2>
             </div>
-            <label className="fr-alert-toggle">
-              <input
-                type="checkbox"
-                checked={onlyAlerts}
-                onChange={(event) => setOnlyAlerts(event.target.checked)}
-              />
-              <span aria-hidden="true" />
-              只看告警
-            </label>
           </div>
           <div className="summary-strip fr-limit-summary">
             <div className="summary-item">
@@ -378,18 +436,18 @@ export function FrPositionLimitsPage() {
                 <strong>{overview?.environments.length ?? '--'}</strong>
               </div>
             </div>
-            <div className="summary-item">
+            <div className="summary-item summary-item--danger">
               <Gauge size={17} />
               <div>
-                <span>有效仓位</span>
-                <strong>{overview ? allRows.length : '--'}</strong>
+                <span>告警币种</span>
+                <strong>{overview ? symbolAlertCount : '--'}</strong>
               </div>
             </div>
             <div className="summary-item summary-item--danger">
               <AlertTriangle size={17} />
               <div>
-                <span>接近限仓</span>
-                <strong>{overview ? nearLimitRows : '--'}</strong>
+                <span>触发盘次</span>
+                <strong>{overview ? triggerCount : '--'}</strong>
               </div>
             </div>
             <div className="summary-item">
@@ -411,12 +469,12 @@ export function FrPositionLimitsPage() {
         {exchangeOrder.map((exchange) => {
           const meta = exchangeLabels[exchange]
           const environments = environmentsByExchange.get(exchange) ?? []
-          const exchangeRows = environments.flatMap(
-            (environment) => environment.rows,
+          const alerts = alertsByExchange.get(exchange) ?? []
+          const exchangeTriggers = alerts.reduce(
+            (total, alert) => total + alert.triggers.length,
+            0,
           )
-          const exchangeAlerts = exchangeRows.filter(
-            (row) => row.nearLimit,
-          ).length
+
           return (
             <section
               className={'fr-exchange-section fr-exchange-section--' + exchange}
@@ -431,23 +489,39 @@ export function FrPositionLimitsPage() {
                   <h2>{meta.name}</h2>
                 </div>
                 <div className="fr-exchange-counts">
-                  <span>{environments.length} 盘</span>
-                  <strong className={exchangeAlerts > 0 ? 'has-alerts' : ''}>
-                    {exchangeAlerts} 告警
+                  <span>{alerts.length} 告警币种</span>
+                  <strong className={alerts.length > 0 ? 'has-alerts' : ''}>
+                    {exchangeTriggers} 盘触发
                   </strong>
                 </div>
               </header>
-              {environments.map((environment) => (
-                <EnvironmentTable
-                  environment={environment}
-                  onlyAlerts={onlyAlerts}
-                  key={environment.strategySlug}
-                />
-              ))}
+
+              <ExchangeSourceIssues environments={environments} />
+
               {overview && environments.length === 0 && (
-                <div className="fr-source-error">
+                <div className="fr-source-error fr-exchange-message">
                   <CircleAlert size={15} />
                   <span>{meta.name} 监控配置缺失</span>
+                </div>
+              )}
+
+              {overview &&
+                environments.length > 0 &&
+                alerts.length === 0 && (
+                  <div className="fr-empty fr-exchange-message">
+                    <CheckCircle2 size={17} />
+                    <span>当前没有限仓告警</span>
+                  </div>
+                )}
+
+              {alerts.length > 0 && (
+                <div className="fr-symbol-alerts">
+                  {alerts.map((alert) => (
+                    <SymbolAlert
+                      alert={alert}
+                      key={exchange + ':' + alert.symbol}
+                    />
+                  ))}
                 </div>
               )}
             </section>
