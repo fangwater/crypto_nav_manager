@@ -2,6 +2,7 @@ import type {
   AccountFeeRates,
   AccountRisk,
   AlignmentStatus,
+  FrPositionLimitOverview,
   HistorySyncStatus,
   Health,
   IntraMatchingSummary,
@@ -142,6 +143,12 @@ export async function syncFeeRates(slug: string): Promise<void> {
       | null
     throw new Error(payload?.error ?? 'HTTP ' + response.status)
   }
+}
+
+export function getFrPositionLimits(
+  signal?: AbortSignal,
+): Promise<FrPositionLimitOverview> {
+  return getJson<FrPositionLimitOverview>('/fr-position-limits', signal)
 }
 
 export interface StrategyPnlQuery {

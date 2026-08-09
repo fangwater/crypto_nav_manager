@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Clock3,
   Database,
+  Gauge,
   GitCompareArrows,
   Percent,
   RadioTower,
@@ -269,17 +270,41 @@ export function IndexPage() {
             </div>
           </div>
           <div className="header-actions">
-            <Link className="header-nav-link" to="/market-data">
+            <Link
+              className="header-nav-link"
+              to="/market-data"
+              aria-label="行情网络"
+              title="行情网络"
+            >
               <RadioTower size={16} />
-              行情网络
+              <span>行情网络</span>
             </Link>
-            <Link className="header-nav-link" to="/intra-matching">
+            <Link
+              className="header-nav-link"
+              to="/intra-matching"
+              aria-label="订单匹配"
+              title="订单匹配"
+            >
               <GitCompareArrows size={16} />
-              订单匹配
+              <span>订单匹配</span>
             </Link>
-            <Link className="header-nav-link" to="/fee-rates">
+            <Link
+              className="header-nav-link"
+              to="/fee-rates"
+              aria-label="手续费"
+              title="手续费"
+            >
               <Percent size={16} />
-              手续费
+              <span>手续费</span>
+            </Link>
+            <Link
+              className="header-nav-link"
+              to="/fr-position-limits"
+              aria-label="FR 限仓"
+              title="FR 限仓"
+            >
+              <Gauge size={16} />
+              <span>FR 限仓</span>
             </Link>
             <div className="system-state">
               <span className="status-dot status-dot--ready" />

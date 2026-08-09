@@ -1,6 +1,8 @@
 use crate::{
     account_risk::{AccountRiskCache, AccountRiskFeed, AccountRiskSnapshot},
-    contract_multipliers, live_history,
+    contract_multipliers,
+    fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
+    live_history,
     mark_prices::MarkPriceCache,
     pnl::{self, InitialPosition, PnlCalculation, PnlSourceKind},
     postgres, runtime,
@@ -49,6 +51,16 @@ struct AppState {
     mark_prices: MarkPriceCache,
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
     snapshot_sync: Arc<Mutex<()>>,
+    fr_position_limits: FrPositionLimitMonitor,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct FrLimitStrategyRecord {
+    slug: String,
+    host: String,
+    env_path: String,
+    config_url: String,
+    exchange: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -436,11 +448,13 @@ pub async fn run() -> Result<()> {
         let mark_prices = MarkPriceCache::start().await;
         (account_risks, mark_prices)
     };
+    let fr_position_limits = FrPositionLimitMonitor::new()?;
 
     let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/strategies", get(list_strategies))
         .route("/api/account-risks", get(list_account_risks))
+        .route("/api/fr-position-limits", get(list_fr_position_limits))
         .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/alignment-status", get(list_alignment_status))
         .route("/api/intra-matching", get(list_intra_matching))
@@ -489,6 +503,7 @@ pub async fn run() -> Result<()> {
             mark_prices,
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
             snapshot_sync: Arc::new(Mutex::new(())),
+            fr_position_limits,
         })
         .layer(TraceLayer::new_for_http());
 
@@ -523,6 +538,45 @@ fn frontend_dir() -> Result<Option<PathBuf>> {
 
 async fn list_account_risks(State(state): State<AppState>) -> Json<Vec<AccountRiskSnapshot>> {
     Json(state.account_risks.snapshots())
+}
+
+async fn list_fr_position_limits(
+    State(state): State<AppState>,
+) -> Result<Json<FrPositionLimitOverview>, ApiError> {
+    let strategies = sqlx::query_as::<_, FrLimitStrategyRecord>(
+        r#"SELECT slug,host,env_path,config_url,exchange
+           FROM strategy_envs
+           WHERE enabled
+             AND slug IN (
+               'binance_fr_arb03',
+               'binance_fr_arb04',
+               'gate_fr_arb01',
+               'gate_fr_arb02'
+             )
+           ORDER BY CASE slug
+             WHEN 'binance_fr_arb03' THEN 1
+             WHEN 'binance_fr_arb04' THEN 2
+             WHEN 'gate_fr_arb01' THEN 3
+             WHEN 'gate_fr_arb02' THEN 4
+             ELSE 99
+           END"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut sources = Vec::with_capacity(strategies.len());
+    for (sort_order, strategy) in strategies.into_iter().enumerate() {
+        sources.push(FrLimitSource {
+            strategy_slug: strategy.slug,
+            host: strategy.host.clone(),
+            env_path: strategy.env_path,
+            exchange: strategy.exchange,
+            snapshot_url: snapshot_source_url(&strategy.host, &strategy.config_url)?,
+            sort_order,
+        });
+    }
+
+    Ok(Json(state.fr_position_limits.overview(sources).await))
 }
 
 async fn list_history_sync_status(

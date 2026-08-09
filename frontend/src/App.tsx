@@ -28,6 +28,12 @@ const MarketDataNetworkPage = lazy(() =>
   })),
 )
 
+const FrPositionLimitsPage = lazy(() =>
+  import('./pages/FrPositionLimitsPage').then((module) => ({
+    default: module.FrPositionLimitsPage,
+  })),
+)
+
 export default function App() {
   const [readOnly, setReadOnly] = useState(true)
 
@@ -52,6 +58,7 @@ export default function App() {
         <Route path="/market-data" element={<MarketDataNetworkPage />} />
         <Route path="/fee-rates" element={<FeeRatesPage readOnly={readOnly} />} />
         <Route path="/intra-matching" element={<IntraMatchingPage />} />
+        <Route path="/fr-position-limits" element={<FrPositionLimitsPage />} />
         <Route
           path="/strategies/:slug"
           element={<StrategyPage readOnly={readOnly} />}

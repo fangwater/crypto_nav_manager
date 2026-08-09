@@ -210,3 +210,62 @@ export type PositionSeriesKey =
   | 'exposureUsdt'
 
 export type PositionUnit = 'usdt' | 'qty'
+
+export type FrLimitExchange = 'binance' | 'gate'
+export type FrLimitStatus = 'healthy' | 'warning' | 'error'
+
+export interface FrLimitSourceCounts {
+  snapshotRows: number
+  exchangeLimitRows: number
+  exchangePositionRows: number
+  displayedRows: number
+  nearLimitRows: number
+  symbolConfigRows: number | null
+  positionRiskRows: number | null
+  leverageBracketRows: number | null
+}
+
+export interface FrLimitRow {
+  symbol: string
+  asset: string
+  status: 'healthy' | 'warning' | 'unavailable'
+  side: 'long' | 'short' | 'flat'
+  trackedInSnapshot: boolean
+  positionSource: 'exchange' | 'snapshot'
+  positionNotionalUsdt: number
+  snapshotOpenUsdt: number | null
+  snapshotFuturesUsdt: number | null
+  snapshotRestDeltaUsdt: number | null
+  exchangeLimitUsdt: number | null
+  guardBufferUsdt: number | null
+  guardCapUsdt: number | null
+  remainingUsdt: number | null
+  usageRatio: number | null
+  nearLimit: boolean
+  amountU: number | null
+  pendingLimitOrders: number | null
+  leverage: number | null
+  symbolConfigLimitUsdt: number | null
+  positionRiskLimitUsdt: number | null
+  bracketLimitUsdt: number | null
+  error: string | null
+}
+
+export interface FrLimitEnvironment {
+  strategySlug: string
+  exchange: FrLimitExchange
+  status: FrLimitStatus
+  snapshotTsMs: number | null
+  exchangeFetchedAtMs: number | null
+  paramsLive: boolean
+  sourceCounts: FrLimitSourceCounts
+  rows: FrLimitRow[]
+  warnings: string[]
+  error: string | null
+}
+
+export interface FrPositionLimitOverview {
+  generatedAtMs: number
+  alertThresholdRatio: number
+  environments: FrLimitEnvironment[]
+}
