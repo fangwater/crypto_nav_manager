@@ -10,6 +10,7 @@ pub mod mark_prices;
 pub mod models;
 pub mod pnl;
 pub mod postgres;
+mod quantity_fifo_pnl;
 pub mod rest_dispatcher;
 pub mod rest_ip_pool;
 pub mod runtime;

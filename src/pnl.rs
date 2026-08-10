@@ -2,6 +2,7 @@ use crate::{
     contract_multipliers::ContractMultiplierBook,
     fifo_pnl::{FifoPnl, PnlSnapshot, Side},
     mark_prices::{MarkPriceCache, MarkPriceExchange},
+    quantity_fifo_pnl::{QuantityFifoPnl, QuantityPnlSnapshot},
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -86,6 +87,7 @@ pub struct FundingEvent {
 pub struct InterestEvent {
     pub symbol: String,
     pub cost_usdt: Option<f64>,
+    pub conversion_price: Option<f64>,
     pub spot_quantity_delta: f64,
     pub ts: i64,
 }
@@ -253,10 +255,94 @@ impl Metrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VenuePnlSnapshot {
+    gross_realized_pnl: f64,
+    cumulative_fees: f64,
+    realized_pnl: f64,
+    floating_pnl: f64,
+    total_pnl: f64,
+}
+
+impl From<PnlSnapshot> for VenuePnlSnapshot {
+    fn from(snapshot: PnlSnapshot) -> Self {
+        Self {
+            gross_realized_pnl: snapshot.gross_realized_pnl,
+            cumulative_fees: snapshot.cumulative_fees,
+            realized_pnl: snapshot.realized_pnl,
+            floating_pnl: snapshot.floating_pnl,
+            total_pnl: snapshot.total_pnl,
+        }
+    }
+}
+
+impl From<QuantityPnlSnapshot> for VenuePnlSnapshot {
+    fn from(snapshot: QuantityPnlSnapshot) -> Self {
+        Self {
+            gross_realized_pnl: snapshot.gross_realized_pnl,
+            cumulative_fees: snapshot.cumulative_fees,
+            realized_pnl: snapshot.realized_pnl,
+            floating_pnl: snapshot.floating_pnl,
+            total_pnl: snapshot.total_pnl,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum VenueFifo {
+    AmountU(FifoPnl),
+    Quantity(QuantityFifoPnl),
+}
+
+impl Default for VenueFifo {
+    fn default() -> Self {
+        Self::AmountU(FifoPnl::default())
+    }
+}
+
+impl VenueFifo {
+    fn for_source(source: PnlSourceKind) -> Self {
+        match source {
+            PnlSourceKind::Intra => Self::Quantity(QuantityFifoPnl::default()),
+            PnlSourceKind::FundingRate | PnlSourceKind::MarketMaking => Self::default(),
+        }
+    }
+
+    fn apply_fill(
+        &mut self,
+        side: Side,
+        price: f64,
+        amount_u: f64,
+        quantity: f64,
+        fee: f64,
+    ) -> Result<()> {
+        match self {
+            Self::AmountU(fifo) => {
+                fifo.apply_fill(side, price, amount_u, fee)?;
+            }
+            Self::Quantity(fifo) => {
+                fifo.apply_fill(side, price, quantity, fee)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self, bid: f64, ask: f64) -> Result<VenuePnlSnapshot> {
+        match self {
+            Self::AmountU(fifo) => Ok(fifo.snapshot(bid, ask)?.into()),
+            Self::Quantity(fifo) => Ok(fifo.snapshot(bid, ask)?.into()),
+        }
+    }
+
+    fn uses_quantity(&self) -> bool {
+        matches!(self, Self::Quantity(_))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SymbolState {
-    spot_fifo: FifoPnl,
-    futures_fifo: FifoPnl,
+    spot_fifo: VenueFifo,
+    futures_fifo: VenueFifo,
     funding_pnl_usdt: f64,
     interest_cost_usdt: f64,
     trade_count: u64,
@@ -266,11 +352,19 @@ struct SymbolState {
     mark_price: Option<f64>,
     unconverted_fee_count: u64,
     unconverted_interest_count: u64,
-    spot_snapshot: Option<PnlSnapshot>,
-    futures_snapshot: Option<PnlSnapshot>,
+    spot_snapshot: Option<VenuePnlSnapshot>,
+    futures_snapshot: Option<VenuePnlSnapshot>,
 }
 
 impl SymbolState {
+    fn for_source(source: PnlSourceKind) -> Self {
+        Self {
+            spot_fifo: VenueFifo::for_source(source),
+            futures_fifo: VenueFifo::for_source(source),
+            ..Self::default()
+        }
+    }
+
     fn seed_position(&mut self, position: &InitialPosition) -> Result<()> {
         if !position.mark_price.is_finite() || position.mark_price <= 0.0 {
             bail!("invalid initial mark price for {}", position.symbol);
@@ -308,7 +402,7 @@ impl SymbolState {
             PositionLeg::Spot => &mut self.spot_fifo,
             PositionLeg::Futures => &mut self.futures_fifo,
         };
-        fifo.apply_fill(trade.side, trade.price, trade.amount_u, fee)
+        fifo.apply_fill(trade.side, trade.price, trade.amount_u, trade.quantity, fee)
             .context("apply normalized trade to venue FIFO")?;
         self.trade_count += 1;
         self.volume_usdt += trade.amount_u;
@@ -331,6 +425,55 @@ impl SymbolState {
                 .snapshot(trade.price, trade.price)
                 .context("mark futures FIFO at the latest symbol trade price")?,
         );
+        Ok(())
+    }
+
+    fn apply_interest(&mut self, interest: &InterestEvent) -> Result<()> {
+        let quantity_delta = interest.spot_quantity_delta;
+        if quantity_delta != 0.0 && self.spot_fifo.uses_quantity() {
+            let conversion_price = interest
+                .conversion_price
+                .or_else(|| {
+                    interest
+                        .cost_usdt
+                        .filter(|cost| cost.is_finite() && *cost > 0.0)
+                        .map(|cost| cost / quantity_delta.abs())
+                })
+                .or(self.mark_price)
+                .context("missing conversion price for intra spot quantity adjustment")?;
+            let side = if quantity_delta > 0.0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            self.spot_fifo
+                .apply_fill(
+                    side,
+                    conversion_price,
+                    quantity_delta.abs() * conversion_price,
+                    quantity_delta.abs(),
+                    0.0,
+                )
+                .context("apply intra spot quantity adjustment to venue FIFO")?;
+            self.mark_price = Some(conversion_price);
+            self.spot_snapshot = Some(
+                self.spot_fifo
+                    .snapshot(conversion_price, conversion_price)
+                    .context("mark spot FIFO at the interest conversion price")?,
+            );
+            self.futures_snapshot = Some(
+                self.futures_fifo
+                    .snapshot(conversion_price, conversion_price)
+                    .context("mark futures FIFO at the interest conversion price")?,
+            );
+        }
+
+        self.spot_position_qty += quantity_delta;
+        if let Some(cost) = interest.cost_usdt {
+            self.interest_cost_usdt += cost;
+        } else {
+            self.unconverted_interest_count += 1;
+        }
         Ok(())
     }
 
@@ -362,7 +505,7 @@ impl SymbolState {
     }
 }
 
-fn seed_fifo(fifo: &mut FifoPnl, quantity: f64, mark_price: f64) -> Result<()> {
+fn seed_fifo(fifo: &mut VenueFifo, quantity: f64, mark_price: f64) -> Result<()> {
     if !quantity.is_finite() {
         bail!("initial quantity must be finite");
     }
@@ -374,8 +517,14 @@ fn seed_fifo(fifo: &mut FifoPnl, quantity: f64, mark_price: f64) -> Result<()> {
     } else {
         Side::Sell
     };
-    fifo.apply_fill(side, mark_price, quantity.abs() * mark_price, 0.0)
-        .context("seed venue FIFO from initial snapshot")?;
+    fifo.apply_fill(
+        side,
+        mark_price,
+        quantity.abs() * mark_price,
+        quantity.abs(),
+        0.0,
+    )
+    .context("seed venue FIFO from initial snapshot")?;
     Ok(())
 }
 
@@ -506,7 +655,7 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
     let mut states = available_symbols
         .iter()
         .cloned()
-        .map(|symbol| (symbol, SymbolState::default()))
+        .map(|symbol| (symbol, SymbolState::for_source(request.source)))
         .collect::<HashMap<_, _>>();
 
     for position in &inputs.initial_positions {
@@ -692,15 +841,7 @@ fn apply_event(states: &mut HashMap<String, SymbolState>, event: &PnlEvent) -> R
             state.funding_pnl_usdt += funding.amount_usdt;
             Ok(())
         }
-        PnlEvent::Interest(interest) => {
-            state.spot_position_qty += interest.spot_quantity_delta;
-            if let Some(cost) = interest.cost_usdt {
-                state.interest_cost_usdt += cost;
-            } else {
-                state.unconverted_interest_count += 1;
-            }
-            Ok(())
-        }
+        PnlEvent::Interest(interest) => state.apply_interest(interest),
     }
 }
 
@@ -1446,6 +1587,7 @@ async fn load_spot_swap_inputs(
             InterestEvent {
                 symbol,
                 cost_usdt,
+                conversion_price,
                 spot_quantity_delta: if exchange == "bybit"
                     && !STABLECOINS.contains(&currency.as_str())
                 {
@@ -1613,6 +1755,108 @@ mod tests {
     }
 
     #[test]
+    fn intra_uses_quantity_fifo_without_changing_funding_rate_matching() {
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    1.0,
+                    100.0,
+                    100.0,
+                    0.0,
+                    1_100,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    2.0,
+                    200.0,
+                    100.0,
+                    0.0,
+                    1_200,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Futures,
+                    Side::Buy,
+                    3.0,
+                    3.0,
+                    1.0,
+                    0.0,
+                    1_300,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+
+        let intra = calculate(inputs.clone(), request(1_000, 1_400)).unwrap();
+        let mut funding_rate_request = request(1_000, 1_400);
+        funding_rate_request.source = PnlSourceKind::FundingRate;
+        let funding_rate = calculate(inputs, funding_rate_request).unwrap();
+
+        assert!((intra.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
+        assert_eq!(intra.summary.floating_pnl_usdt, 0.0);
+        assert!((intra.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
+
+        assert!((funding_rate.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
+        assert!((funding_rate.summary.floating_pnl_usdt + 50.0).abs() < 1e-9);
+        assert!((funding_rate.summary.total_pnl_usdt - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn binance_intra_mana_flat_inventory_uses_the_executed_spread() {
+        const START_QUANTITY: f64 = 45_502.0;
+        const TRADED_QUANTITY: f64 = 5_943.0;
+        const SPOT_QUOTE: f64 = 399.5895;
+        const FUTURES_QUOTE: f64 = 398.51397;
+
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "MANAUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    SPOT_QUOTE / TRADED_QUANTITY,
+                    SPOT_QUOTE,
+                    TRADED_QUANTITY,
+                    0.0,
+                    1_100,
+                ),
+                trade(
+                    "MANAUSDT",
+                    PositionLeg::Futures,
+                    Side::Buy,
+                    FUTURES_QUOTE / TRADED_QUANTITY,
+                    FUTURES_QUOTE,
+                    TRADED_QUANTITY,
+                    0.0,
+                    1_200,
+                ),
+            ],
+            initial_positions: vec![InitialPosition {
+                symbol: "MANAUSDT".to_string(),
+                spot_quantity: START_QUANTITY,
+                futures_quantity: -START_QUANTITY,
+                mark_price: 0.06678,
+            }],
+            ..PnlInputs::default()
+        };
+
+        let response = calculate(inputs, request(1_000, 1_300)).unwrap();
+        let final_point = response.points.last().unwrap();
+
+        assert!((response.summary.fee_before_pnl_usdt - 1.07553).abs() < 1e-9);
+        assert_eq!(response.summary.floating_pnl_usdt, 0.0);
+        assert!((response.summary.total_pnl_usdt - 1.07553).abs() < 1e-9);
+        assert_eq!(final_point.spot_position_qty, 39_559.0);
+        assert_eq!(final_point.futures_position_qty, -39_559.0);
+        assert_eq!(final_point.exposure_qty, 0.0);
+    }
+
+    #[test]
     fn keeps_venue_fifo_independent_and_combines_fees_funding_and_interest() {
         let inputs = PnlInputs {
             trades: vec![
@@ -1645,6 +1889,7 @@ mod tests {
             interest: vec![InterestEvent {
                 symbol: "BTCUSDT".to_string(),
                 cost_usdt: Some(2.0),
+                conversion_price: Some(100.0),
                 spot_quantity_delta: 0.0,
                 ts: 1_350,
             }],
@@ -1725,7 +1970,8 @@ mod tests {
         assert_eq!(initial.spot_position_qty, 10.0);
         assert_eq!(initial.futures_position_qty, -10.0);
         assert!((response.summary.fee_before_pnl_usdt - 20.0).abs() < 1e-9);
-        assert!((response.summary.total_pnl_usdt - 22.0).abs() < 1e-9);
+        assert_eq!(response.summary.floating_pnl_usdt, 0.0);
+        assert!((response.summary.total_pnl_usdt - 20.0).abs() < 1e-9);
         assert_eq!(final_point.spot_position_qty, 9.0);
         assert_eq!(final_point.futures_position_qty, -9.0);
         assert_eq!(final_point.exposure_qty, 0.0);
@@ -1749,6 +1995,7 @@ mod tests {
             interest: vec![InterestEvent {
                 symbol: "BTCUSDT".to_string(),
                 cost_usdt: Some(100.0),
+                conversion_price: Some(100.0),
                 spot_quantity_delta: -1.0,
                 ts: 1_200,
             }],
@@ -1762,6 +2009,40 @@ mod tests {
         assert_eq!(final_point.spot_position_usdt, 900.0);
         assert_eq!(response.summary.interest_cost_usdt, 100.0);
         assert_eq!(response.summary.total_pnl_usdt, -100.0);
+    }
+
+    #[test]
+    fn intra_interest_quantity_adjustment_updates_quantity_fifo_only() {
+        let inputs = PnlInputs {
+            interest: vec![InterestEvent {
+                symbol: "BTCUSDT".to_string(),
+                cost_usdt: Some(110.0),
+                conversion_price: Some(110.0),
+                spot_quantity_delta: -1.0,
+                ts: 1_200,
+            }],
+            initial_positions: vec![InitialPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot_quantity: 10.0,
+                futures_quantity: 0.0,
+                mark_price: 100.0,
+            }],
+            ..PnlInputs::default()
+        };
+
+        let intra = calculate(inputs.clone(), request(1_000, 1_300)).unwrap();
+        let mut funding_rate_request = request(1_000, 1_300);
+        funding_rate_request.source = PnlSourceKind::FundingRate;
+        let funding_rate = calculate(inputs, funding_rate_request).unwrap();
+
+        assert_eq!(intra.points.last().unwrap().spot_position_qty, 9.0);
+        assert_eq!(intra.summary.fee_before_pnl_usdt, 10.0);
+        assert_eq!(intra.summary.floating_pnl_usdt, 90.0);
+        assert_eq!(intra.summary.total_pnl_usdt, -10.0);
+
+        assert_eq!(funding_rate.summary.fee_before_pnl_usdt, 0.0);
+        assert_eq!(funding_rate.summary.floating_pnl_usdt, 0.0);
+        assert_eq!(funding_rate.summary.total_pnl_usdt, -110.0);
     }
 
     #[test]
@@ -1873,8 +2154,8 @@ mod tests {
 
         let response = calculate(inputs, request(1_000, 1_500)).unwrap();
 
-        assert!((response.summary.fee_before_pnl_usdt - 90.0).abs() < 1e-9);
-        assert!((response.summary.total_pnl_usdt - 90.0).abs() < 1e-9);
+        assert!((response.summary.fee_before_pnl_usdt - 94.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 94.0).abs() < 1e-9);
         assert_eq!(response.summary.open_amount_usdt, 0.0);
         let final_point = response.points.last().unwrap();
         assert_eq!(final_point.spot_position_usdt, 0.0);
