@@ -28,6 +28,12 @@ const OpsMonitorPage = lazy(() =>
   })),
 )
 
+const IntraAnalysisPage = lazy(() =>
+  import('./pages/IntraAnalysisPage').then((module) => ({
+    default: module.IntraAnalysisPage,
+  })),
+)
+
 const MarketDataNetworkPage = lazy(() =>
   import('./pages/MarketDataNetworkPage').then((module) => ({
     default: module.MarketDataNetworkPage,
@@ -66,6 +72,7 @@ export default function App() {
         <Route path="/fee-rates" element={<FeeRatesPage readOnly={readOnly} />} />
         <Route path="/intra-matching" element={<IntraMatchingPage />} />
         <Route path="/fr-position-limits" element={<FrPositionLimitsPage />} />
+        <Route path="/analysis/:slug" element={<IntraAnalysisPage />} />
         <Route
           path="/strategies/:slug"
           element={<StrategyPage readOnly={readOnly} />}

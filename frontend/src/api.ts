@@ -5,6 +5,7 @@ import type {
   FrPositionLimitOverview,
   HistorySyncStatus,
   Health,
+  IntraAnalysis,
   IntraMatchingSummary,
   OpsOverview,
   Strategy,
@@ -190,6 +191,34 @@ export function getStrategyPnl(
   }
   return getJson<StrategyPnl>(
     '/strategies/' + encodeURIComponent(slug) + '/pnl?' + params,
+    query.signal,
+  )
+}
+
+export interface IntraAnalysisQuery {
+  startMs: number
+  endMs: number
+  symbols?: string[]
+  maxPoints?: number
+  maxMatches?: number
+  signal?: AbortSignal
+}
+
+export function getIntraAnalysis(
+  slug: string,
+  query: IntraAnalysisQuery,
+): Promise<IntraAnalysis> {
+  const params = new URLSearchParams({
+    startMs: String(query.startMs),
+    endMs: String(query.endMs),
+    maxPoints: String(query.maxPoints ?? 3000),
+    maxMatches: String(query.maxMatches ?? 200),
+  })
+  if (query.symbols?.length) {
+    params.set('symbols', query.symbols.join(','))
+  }
+  return getJson<IntraAnalysis>(
+    '/analysis/' + encodeURIComponent(slug) + '/intra-fifo?' + params,
     query.signal,
   )
 }

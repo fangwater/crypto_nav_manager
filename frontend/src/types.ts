@@ -283,6 +283,129 @@ export interface StrategyPnl {
   source: PnlSourceInfo
 }
 
+export type IntraArbDirection = 'positive' | 'reverse'
+
+export interface IntraAnalysisSummary {
+  mtCount: number
+  positiveMtCount: number
+  reverseMtCount: number
+  closedMatchCount: number
+  winningMatchCount: number
+  winRate: number
+  mtNotionalUsdt: number
+  matchedQuantity: number
+  matchedNotionalUsdt: number
+  realizedPnlUsdt: number
+  returnBps: number
+  decomposedMatchCount: number
+  premiumCoverage: number
+  decomposedNotionalUsdt: number
+  marketPnlUsdt: number
+  executionPnlUsdt: number
+  marketReturnBps: number
+  executionReturnBps: number
+  executionMtCount: number
+  executionMtNotionalUsdt: number
+  executionMtPremiumCoverage: number
+  executionCaptureUsdt: number
+  executionCaptureReturnBps: number
+  positiveExecutionCaptureUsdt: number
+  reverseExecutionCaptureUsdt: number
+  averageHoldingMs: number
+  positiveOpenLotCount: number
+  reverseOpenLotCount: number
+  positiveOpenQuantity: number
+  reverseOpenQuantity: number
+  positiveOpenNotionalUsdt: number
+  reverseOpenNotionalUsdt: number
+  positiveAverageBasisBps: number
+  reverseAverageBasisBps: number
+}
+
+export interface IntraSymbolAnalysis extends IntraAnalysisSummary {
+  symbol: string
+}
+
+export interface IntraAnalysisPoint {
+  ts: number
+  realizedPnlUsdt: number
+  marketPnlUsdt: number
+  executionPnlUsdt: number
+  executionCaptureUsdt: number
+  matchedNotionalUsdt: number
+  closedMatchCount: number
+  decomposedMatchCount: number
+}
+
+export type IntraAnalysisSeriesKey =
+  | 'realizedPnlUsdt'
+  | 'marketPnlUsdt'
+  | 'executionPnlUsdt'
+  | 'executionCaptureUsdt'
+
+export interface IntraSymbolSeries {
+  symbol: string
+  points: IntraAnalysisPoint[]
+}
+
+export interface IntraClosedMatch {
+  symbol: string
+  openDirection: IntraArbDirection
+  openFkey: number
+  closeFkey: number
+  openedAtMs: number
+  closedAtMs: number
+  holdingMs: number
+  quantity: number
+  openSpotPrice: number
+  openFuturesPrice: number
+  closeSpotPrice: number
+  closeFuturesPrice: number
+  entryBasisBps: number
+  exitBasisBps: number
+  entryPremiumBps: number | null
+  exitPremiumBps: number | null
+  entryExecutionEdgeBps: number | null
+  exitExecutionEdgeBps: number | null
+  marketPnlUsdt: number | null
+  entryExecutionPnlUsdt: number | null
+  exitExecutionPnlUsdt: number | null
+  executionPnlUsdt: number | null
+  pnlUsdt: number
+  returnBps: number
+}
+
+export interface IntraAnalysisSource {
+  adapter: string
+  hedgePriceAdapter: string
+  premiumAdapter: string
+  premiumRateField: string
+  loadedMtRows: number
+  windowMtRows: number
+  returnedPoints: number
+  returnedSymbolPoints: number
+  returnedMatches: number
+  sampled: boolean
+  feesIncluded: boolean
+  fundingIncluded: boolean
+}
+
+export interface IntraAnalysis {
+  strategySlug: string
+  displayName: string
+  strategyStartMs: number
+  startMs: number
+  endMs: number
+  selectedSymbols: string[]
+  availableSymbols: string[]
+  summary: IntraAnalysisSummary
+  symbols: IntraSymbolAnalysis[]
+  points: IntraAnalysisPoint[]
+  symbolPoints: IntraSymbolSeries[]
+  matches: IntraClosedMatch[]
+  source: IntraAnalysisSource
+}
+
 export type PnlSeriesKey =
   | 'totalPnlUsdt'
   | 'feeBeforePnlUsdt'

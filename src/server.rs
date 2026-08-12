@@ -1,7 +1,10 @@
 use crate::{
     account_risk::{AccountRiskCache, AccountRiskFeed, AccountRiskSnapshot},
-    contract_multipliers,
+    binance_premium_index, bybit_premium_index, contract_multipliers,
     fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
+    intra_analysis::{
+        self, ArbDirection, IntraAnalysisOrder, IntraAnalysisRequest, PremiumIndexCandle,
+    },
     live_history,
     mark_prices::MarkPriceCache,
     pnl::{self, InitialPosition, PnlCalculation, PnlSourceKind},
@@ -42,6 +45,12 @@ const DEFAULT_DB_NAME: &str = "crypto_nav_manager";
 const DEFAULT_DB_USER: &str = "ubuntu";
 const FRONTEND_DIR_ENV: &str = "CRYPTO_NAV_FRONTEND_DIR";
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+#[derive(Clone, Copy)]
+struct IntraAnalysisAdapter {
+    premium_table: &'static str,
+    premium_adapter: &'static str,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -123,6 +132,31 @@ struct PnlStrategyRecord {
     exchange: String,
     account_mode: String,
     strategy_kind: String,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraAnalysisStrategyRecord {
+    slug: String,
+    alias: Option<String>,
+    db_schema: String,
+    st_ms: i64,
+    exchange: String,
+    strategy_kind: String,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraAnalysisOrderRecord {
+    fkey: i64,
+    symbol: String,
+    side: String,
+    event_ts_us: i64,
+    spot_price: f64,
+    futures_price: f64,
+    quantity: f64,
+    premium_open_rate: Option<f64>,
+    premium_high_rate: Option<f64>,
+    premium_low_rate: Option<f64>,
+    premium_close_rate: Option<f64>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -374,6 +408,16 @@ struct PnlQuery {
     max_points: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IntraAnalysisQuery {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    symbols: Option<String>,
+    max_points: Option<usize>,
+    max_matches: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
@@ -444,6 +488,8 @@ pub async fn run() -> Result<()> {
         .collect();
         let account_risks = AccountRiskCache::start(account_risk_feeds);
         contract_multipliers::spawn(pool.clone());
+        binance_premium_index::spawn(pool.clone());
+        bybit_premium_index::spawn(pool.clone());
         live_history::spawn(pool.clone())?;
         let mark_prices = MarkPriceCache::start().await;
         (account_risks, mark_prices)
@@ -458,6 +504,7 @@ pub async fn run() -> Result<()> {
         .route("/api/history-sync-status", get(list_history_sync_status))
         .route("/api/alignment-status", get(list_alignment_status))
         .route("/api/intra-matching", get(list_intra_matching))
+        .route("/api/analysis/{slug}/intra-fifo", get(get_intra_analysis))
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/snapshots", get(list_latest_snapshots))
@@ -802,6 +849,194 @@ async fn list_intra_matching(
         });
     }
     Ok(Json(summaries))
+}
+
+async fn get_intra_analysis(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Query(query): Query<IntraAnalysisQuery>,
+) -> Result<Response, ApiError> {
+    let strategy = sqlx::query_as::<_, IntraAnalysisStrategyRecord>(
+        r#"SELECT slug,alias,db_schema,st_ms,exchange,strategy_kind
+           FROM strategy_envs
+           WHERE enabled AND slug=$1"#,
+    )
+    .bind(&slug)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(strategy) = strategy else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "strategy not found",
+            }),
+        )
+            .into_response());
+    };
+    let Some(adapter) = intra_analysis_adapter(&strategy) else {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: "combination FIFO analysis is not available for this strategy",
+            }),
+        )
+            .into_response());
+    };
+
+    let start_ms = query.start_ms.unwrap_or(strategy.st_ms);
+    let end_ms = query
+        .end_ms
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    if start_ms < strategy.st_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "startMs must not be earlier than the strategy start",
+            }),
+        )
+            .into_response());
+    }
+    if end_ms < start_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "endMs must be greater than or equal to startMs",
+            }),
+        )
+            .into_response());
+    }
+    if !valid_schema(&strategy.db_schema) {
+        return Err(anyhow::anyhow!("invalid strategy schema: {}", strategy.db_schema).into());
+    }
+
+    let order_sql = format!(
+        r#"WITH hedge_legs AS (
+               SELECT h.main_fkey,
+                      COALESCE(h.fill_ts_us,h.update_ts_us) AS event_ts_us,
+                      h.amount,h.cprice,
+                      p.open_rate,p.high_rate,p.low_rate,p.close_rate
+               FROM {0}.intra_hedges h
+               JOIN {0}.intra_orders anchor
+                 ON anchor.fkey=h.main_fkey
+                AND anchor.symbol=h.symbol
+                AND anchor.side<>h.side
+               LEFT JOIN {1} p
+                 ON p.symbol=upper(h.symbol)
+                AND p.interval='1m'
+                AND p.open_time_ms=(COALESCE(h.fill_ts_us,h.update_ts_us) / 60000000) * 60000
+               WHERE h.cprice IS NOT NULL AND h.amount>1e-10
+           ), hedge_prices AS (
+               SELECT main_fkey,
+                      max(event_ts_us) AS event_ts_us,
+                      sum(amount * cprice) / NULLIF(sum(amount),0) AS futures_price,
+                      sum(amount) AS hedge_quantity,
+                      CASE WHEN count(open_rate)=count(*)
+                           THEN sum(amount * open_rate) / NULLIF(sum(amount),0) END AS premium_open_rate,
+                      CASE WHEN count(high_rate)=count(*)
+                           THEN sum(amount * high_rate) / NULLIF(sum(amount),0) END AS premium_high_rate,
+                      CASE WHEN count(low_rate)=count(*)
+                           THEN sum(amount * low_rate) / NULLIF(sum(amount),0) END AS premium_low_rate,
+                      CASE WHEN count(close_rate)=count(*)
+                           THEN sum(amount * close_rate) / NULLIF(sum(amount),0) END AS premium_close_rate
+               FROM hedge_legs
+               GROUP BY main_fkey
+           )
+           SELECT o.fkey,o.symbol,o.side,h.event_ts_us,
+                  o.price::float8 AS spot_price,h.futures_price::float8,
+                  LEAST(o.open_fill_amount,h.hedge_quantity)::float8 AS quantity,
+                  h.premium_open_rate,h.premium_high_rate,
+                  h.premium_low_rate,h.premium_close_rate
+           FROM {0}.intra_orders o
+           JOIN hedge_prices h ON h.main_fkey=o.fkey
+           WHERE LEAST(o.open_fill_amount,h.hedge_quantity)>1e-10
+             AND h.event_ts_us >= $1
+             AND h.event_ts_us < $2
+           ORDER BY event_ts_us,fkey"#,
+        strategy.db_schema, adapter.premium_table
+    );
+    let load_start_us = strategy.st_ms.saturating_mul(1_000);
+    let load_end_us = end_ms.saturating_add(1).saturating_mul(1_000);
+    let rows = sqlx::query_as::<_, IntraAnalysisOrderRecord>(sqlx::AssertSqlSafe(order_sql))
+        .bind(load_start_us)
+        .bind(load_end_us)
+        .fetch_all(&state.pool)
+        .await?;
+    let orders = rows
+        .into_iter()
+        .map(|row| {
+            Ok(IntraAnalysisOrder {
+                fkey: row.fkey,
+                symbol: row.symbol,
+                direction: ArbDirection::from_margin_side(&row.side)?,
+                completed_at_ms: row.event_ts_us / 1_000,
+                spot_price: row.spot_price,
+                futures_price: row.futures_price,
+                quantity: row.quantity,
+                premium: match (
+                    row.premium_open_rate,
+                    row.premium_high_rate,
+                    row.premium_low_rate,
+                    row.premium_close_rate,
+                ) {
+                    (Some(open_rate), Some(high_rate), Some(low_rate), Some(close_rate)) => {
+                        Some(PremiumIndexCandle {
+                            open_rate,
+                            high_rate,
+                            low_rate,
+                            close_rate,
+                        })
+                    }
+                    _ => None,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected_symbols = query
+        .symbols
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    let display_name = strategy
+        .alias
+        .filter(|alias| !alias.trim().is_empty())
+        .unwrap_or_else(|| strategy.slug.clone());
+    let calculation = IntraAnalysisRequest {
+        strategy_slug: strategy.slug,
+        display_name,
+        premium_adapter: adapter.premium_adapter,
+        strategy_start_ms: strategy.st_ms,
+        start_ms,
+        end_ms,
+        selected_symbols,
+        max_points: query.max_points.unwrap_or(3_000).clamp(200, 10_000),
+        max_matches: query.max_matches.unwrap_or(200).clamp(20, 500),
+    };
+    let response =
+        tokio::task::spawn_blocking(move || intra_analysis::calculate(orders, calculation))
+            .await
+            .context("join intra combination FIFO calculation")??;
+    Ok(Json(response).into_response())
+}
+
+fn intra_analysis_adapter(strategy: &IntraAnalysisStrategyRecord) -> Option<IntraAnalysisAdapter> {
+    match (
+        strategy.slug.as_str(),
+        strategy.exchange.as_str(),
+        strategy.strategy_kind.as_str(),
+    ) {
+        ("binance-intra-arb01", "binance", "intra_exchange") => Some(IntraAnalysisAdapter {
+            premium_table: "binance_premium_index_klines",
+            premium_adapter: "binance_premium_index_klines_1m",
+        }),
+        ("bybit-intra-arb01", "bybit", "intra_exchange") => Some(IntraAnalysisAdapter {
+            premium_table: "bybit_premium_index_klines",
+            premium_adapter: "bybit_premium_index_klines_1m",
+        }),
+        _ => None,
+    }
 }
 
 fn expected_history_datasets(
@@ -1727,8 +1962,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assigned_env_keys, expected_history_datasets, is_default_bybit_instrument,
-        parse_initial_positions, snapshot_source_url, valid_schema,
+        IntraAnalysisStrategyRecord, assigned_env_keys, expected_history_datasets,
+        intra_analysis_adapter, is_default_bybit_instrument, parse_initial_positions,
+        snapshot_source_url, valid_schema,
     };
 
     #[test]
@@ -1756,6 +1992,36 @@ mod tests {
         assert!(!valid_schema(""));
         assert!(!valid_schema("public.trading_fee_rates"));
         assert!(!valid_schema("fee-rates"));
+    }
+
+    #[test]
+    fn exposes_fifo_analysis_only_for_intra_arb01_strategies() {
+        let strategy = |slug: &str, exchange: &str| IntraAnalysisStrategyRecord {
+            slug: slug.to_string(),
+            alias: None,
+            db_schema: slug.replace('-', "_"),
+            st_ms: 1,
+            exchange: exchange.to_string(),
+            strategy_kind: "intra_exchange".to_string(),
+        };
+
+        let binance = strategy("binance-intra-arb01", "binance");
+        let bybit = strategy("bybit-intra-arb01", "bybit");
+        let bybit_arb02 = strategy("bybit-intra-arb02", "bybit");
+
+        assert_eq!(
+            intra_analysis_adapter(&binance)
+                .expect("Binance arb01 must support FIFO analysis")
+                .premium_table,
+            "binance_premium_index_klines"
+        );
+        assert_eq!(
+            intra_analysis_adapter(&bybit)
+                .expect("Bybit arb01 must support FIFO analysis")
+                .premium_table,
+            "bybit_premium_index_klines"
+        );
+        assert!(intra_analysis_adapter(&bybit_arb02).is_none());
     }
 
     #[test]
