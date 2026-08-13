@@ -1,13 +1,19 @@
-import type { IntraAnalysisSeriesKey } from './types'
+import type { IntraFeeMode, IntraPnlSeriesKey } from './types'
 
-export const intraAnalysisMetricOptions: ReadonlyArray<{
-  key: IntraAnalysisSeriesKey
+export const intraFeeModeOptions: ReadonlyArray<{
+  key: IntraFeeMode
   label: string
+  metric: IntraPnlSeriesKey
+  color: string
 }> = [
-  { key: 'realizedPnlUsdt', label: 'Fee 前收益' },
-  { key: 'marketPnlUsdt', label: '选币基差' },
-  { key: 'executionPnlUsdt', label: '闭环执行' },
-  { key: 'executionCaptureUsdt', label: '窗口 MT 执行' },
+  { key: 'gross', label: 'Fee 前', metric: 'realizedPnlUsdt', color: '#176b5b' },
+  { key: 'actual', label: '实际 Fee 后', metric: 'feeAfterPnlUsdt', color: '#087f8c' },
+  {
+    key: 'reference',
+    label: '参考 Fee 后',
+    metric: 'referenceFeeAfterPnlUsdt',
+    color: '#6c6f2d',
+  },
 ]
 
 const intraSymbolColors = [
@@ -33,8 +39,8 @@ const intraSymbolColors = [
   '#765f3d',
 ]
 
-export function intraAnalysisMetricLabel(metric: IntraAnalysisSeriesKey) {
-  return intraAnalysisMetricOptions.find((option) => option.key === metric)?.label ?? metric
+export function intraFeeModeConfig(mode: IntraFeeMode) {
+  return intraFeeModeOptions.find((option) => option.key === mode) ?? intraFeeModeOptions[0]
 }
 
 export function intraSymbolColor(index: number) {

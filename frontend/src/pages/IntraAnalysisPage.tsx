@@ -18,13 +18,15 @@ import {
   type IntraFifoChartMode,
 } from '../components/IntraFifoChart'
 import {
-  intraAnalysisMetricOptions,
+  intraFeeModeConfig,
+  intraFeeModeOptions,
   intraSymbolColor,
 } from '../intraAnalysisSeries'
 import type {
   IntraAnalysis,
-  IntraAnalysisSeriesKey,
   IntraArbDirection,
+  IntraClosedMatch,
+  IntraFeeMode,
   IntraSymbolAnalysis,
   Strategy,
 } from '../types'
@@ -114,6 +116,58 @@ function valueClass(value: number) {
   return ''
 }
 
+interface FeeResult {
+  realizedPnlUsdt: number
+  returnBps: number
+  tradingFeeUsdt: number
+  feeAfterPnlUsdt: number
+  feeAfterReturnBps: number
+  referenceTradingFeeUsdt: number
+  referenceFeeAfterPnlUsdt: number
+  referenceFeeAfterReturnBps: number
+}
+
+function feeModePnl(row: FeeResult, mode: IntraFeeMode) {
+  if (mode === 'actual') return row.feeAfterPnlUsdt
+  if (mode === 'reference') return row.referenceFeeAfterPnlUsdt
+  return row.realizedPnlUsdt
+}
+
+function feeModeReturnBps(row: FeeResult, mode: IntraFeeMode) {
+  if (mode === 'actual') return row.feeAfterReturnBps
+  if (mode === 'reference') return row.referenceFeeAfterReturnBps
+  return row.returnBps
+}
+
+function feeModeImpact(row: FeeResult, mode: IntraFeeMode) {
+  if (mode === 'actual') return -row.tradingFeeUsdt
+  if (mode === 'reference') return -row.referenceTradingFeeUsdt
+  return 0
+}
+
+function feeModeImpactLabel(mode: IntraFeeMode) {
+  if (mode === 'actual') return '实际 Fee 影响'
+  if (mode === 'reference') return '参考 Fee 影响'
+  return 'Fee 影响'
+}
+
+function matchFeeModePnl(row: IntraClosedMatch, mode: IntraFeeMode) {
+  if (mode === 'actual') return row.feeAfterPnlUsdt
+  if (mode === 'reference') return row.referenceFeeAfterPnlUsdt
+  return row.pnlUsdt
+}
+
+function matchFeeModeImpact(row: IntraClosedMatch, mode: IntraFeeMode) {
+  if (mode === 'actual') return -row.tradingFeeUsdt
+  if (mode === 'reference') return -row.referenceTradingFeeUsdt
+  return 0
+}
+
+function matchFeeModeReturnBps(row: IntraClosedMatch, mode: IntraFeeMode) {
+  const matchedNotional = row.quantity * (row.openSpotPrice + row.closeSpotPrice) / 2
+  return matchedNotional === 0 ? 0 : matchFeeModePnl(row, mode) / matchedNotional * 10_000
+}
+
 function directionLabel(direction: IntraArbDirection) {
   return direction === 'positive' ? '正套' : '反套'
 }
@@ -183,34 +237,30 @@ function SymbolPool({
   )
 }
 
-function SymbolRow({ row }: { row: IntraSymbolAnalysis }) {
+function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraFeeMode }) {
+  const pnl = feeModePnl(row, feeMode)
+  const feeImpact = feeModeImpact(row, feeMode)
   return (
     <tr>
       <td><strong>{row.symbol}</strong></td>
-      <td>
-        <strong>{compactNumber(row.mtCount)}</strong>
-        <small>{row.positiveMtCount} / {row.reverseMtCount}</small>
-      </td>
       <td>
         <strong>{compactNumber(row.closedMatchCount)}</strong>
         <small>{percentage(row.winRate)} win</small>
       </td>
       <td>{money(row.matchedNotionalUsdt)}</td>
-      <td className={valueClass(row.realizedPnlUsdt)}>
-        <strong>{money(row.realizedPnlUsdt, true)}</strong>
-        <small>{bps(row.returnBps, true)} bps</small>
+      <td className={valueClass(pnl)}>
+        <strong>{money(pnl, true)}</strong>
+        <small>{bps(feeModeReturnBps(row, feeMode), true)} bps</small>
       </td>
-      <td className={valueClass(-row.tradingFeeUsdt)}>
-        <strong>{money(-row.tradingFeeUsdt, true)}</strong>
-        <small>{percentage(row.actualFeeCoverage)} covered</small>
-      </td>
-      <td className={valueClass(row.feeAfterPnlUsdt)}>
-        <strong>{money(row.feeAfterPnlUsdt, true)}</strong>
-        <small>{bps(row.feeAfterReturnBps, true)} bps</small>
-      </td>
-      <td className={valueClass(row.referenceFeeAfterPnlUsdt)}>
-        <strong>{money(row.referenceFeeAfterPnlUsdt, true)}</strong>
-        <small>{bps(row.referenceFeeAfterReturnBps, true)} bps</small>
+      <td className={valueClass(feeImpact)}>
+        <strong>{money(feeImpact, true)}</strong>
+        <small>
+          {feeMode === 'actual'
+            ? `${percentage(row.actualFeeCoverage)} covered`
+            : feeMode === 'reference'
+              ? `${bps(row.referenceFeeBps)} bps`
+              : '未计 Fee'}
+        </small>
       </td>
       <td className={valueClass(row.marketPnlUsdt)}>
         <strong>{money(row.marketPnlUsdt, true)}</strong>
@@ -220,25 +270,9 @@ function SymbolRow({ row }: { row: IntraSymbolAnalysis }) {
         <strong>{money(row.executionPnlUsdt, true)}</strong>
         <small>{bps(row.executionReturnBps, true)} bps</small>
       </td>
-      <td className={valueClass(row.executionCaptureUsdt)}>
-        <strong>{money(row.executionCaptureUsdt, true)}</strong>
-        <small>{bps(row.executionCaptureReturnBps, true)} bps</small>
-      </td>
       <td>
-        <strong>{percentage(row.executionMtPremiumCoverage)}</strong>
-        <small>{compactNumber(row.executionMtCount)} MT legs</small>
-      </td>
-      <td>
-        <strong>{money(row.positiveOpenNotionalUsdt)}</strong>
-        <small>
-          {quantity(row.positiveOpenQuantity)} @ {bps(row.positiveAverageBasisBps, true)} bps
-        </small>
-      </td>
-      <td>
-        <strong>{money(row.reverseOpenNotionalUsdt)}</strong>
-        <small>
-          {quantity(row.reverseOpenQuantity)} @ {bps(row.reverseAverageBasisBps, true)} bps
-        </small>
+        <strong>{percentage(row.premiumCoverage)}</strong>
+        <small>{compactNumber(row.decomposedMatchCount)} closes</small>
       </td>
     </tr>
   )
@@ -255,9 +289,8 @@ export function IntraAnalysisPage() {
   const [referenceFeeInput, setReferenceFeeInput] = useState('1')
   const [referenceFeeBps, setReferenceFeeBps] = useState(1)
   const [symbol, setSymbol] = useState('')
+  const [feeMode, setFeeMode] = useState<IntraFeeMode>('actual')
   const [chartMode, setChartMode] = useState<IntraFifoChartMode>('portfolio')
-  const [chartMetric, setChartMetric] =
-    useState<IntraAnalysisSeriesKey>('realizedPnlUsdt')
   const [chartSymbolSelection, setChartSymbolSelection] =
     useState<ChartSymbolSelection>('all')
   const [selectedChartSymbols, setSelectedChartSymbols] = useState<string[]>([])
@@ -269,6 +302,7 @@ export function IntraAnalysisPage() {
     setStrategy(null)
     setAnalysis(null)
     setSymbol('')
+    setFeeMode('actual')
     setReferenceFeeInput('1')
     setReferenceFeeBps(1)
     setPageError(null)
@@ -318,21 +352,44 @@ export function IntraAnalysisPage() {
     return () => controller.abort()
   }, [strategy, startMs, endMs, symbol, referenceFeeBps])
 
+  const availableClosedSymbols = useMemo(
+    () =>
+      analysis?.symbols
+        .filter((row) => row.closedMatchCount > 0)
+        .map((row) => row.symbol) ?? [],
+    [analysis],
+  )
+
+  const feeModeConfig = intraFeeModeConfig(feeMode)
+
   const visibleSymbols = useMemo(() => {
     if (!analysis) return []
-    return symbol
+    const scoped = symbol
       ? analysis.symbols.filter((row) => row.symbol === symbol)
       : analysis.symbols
-  }, [analysis, symbol])
+    return scoped
+      .filter((row) => row.closedMatchCount > 0)
+      .sort((left, right) =>
+        feeModePnl(right, feeMode) - feeModePnl(left, feeMode) ||
+        left.symbol.localeCompare(right.symbol),
+      )
+  }, [analysis, feeMode, symbol])
 
   const chartSymbolRows = useMemo<ChartSymbolRow[]>(() => {
     if (!analysis) return []
-    return analysis.symbolPoints.map((series, index) => ({
-      symbol: series.symbol,
-      value: series.points.at(-1)?.[chartMetric] ?? 0,
-      color: intraSymbolColor(index),
-    }))
-  }, [analysis, chartMetric])
+    const closedSymbols = new Set(
+      analysis.symbols
+        .filter((row) => row.closedMatchCount > 0)
+        .map((row) => row.symbol),
+    )
+    return analysis.symbolPoints
+      .filter((series) => closedSymbols.has(series.symbol))
+      .map((series, index) => ({
+        symbol: series.symbol,
+        value: series.points.at(-1)?.[feeModeConfig.metric] ?? 0,
+        color: intraSymbolColor(index),
+      }))
+  }, [analysis, feeModeConfig.metric])
 
   const positiveChartSymbols = useMemo(
     () =>
@@ -434,6 +491,7 @@ export function IntraAnalysisPage() {
     }
     setPageError(null)
     setReferenceFeeBps(nextReferenceFeeBps)
+    setFeeMode('reference')
   }
 
   function selectChartSymbols(selection: Exclude<ChartSymbolSelection, 'custom'>) {
@@ -496,9 +554,10 @@ export function IntraAnalysisPage() {
   const summary = analysis?.summary
   const chartTotal = summary
     ? chartMode === 'portfolio'
-      ? summary.feeAfterPnlUsdt
+      ? feeModePnl(summary, feeMode)
       : visibleChartSymbolPoints.reduce(
-          (total, series) => total + (series.points.at(-1)?.[chartMetric] ?? 0),
+          (total, series) =>
+            total + (series.points.at(-1)?.[feeModeConfig.metric] ?? 0),
           0,
         )
     : null
@@ -534,7 +593,7 @@ export function IntraAnalysisPage() {
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
-            <span title="包含实际与参考 Fee；不包含 Funding 和利息">Fee included</span>
+            <span title="只统计 FIFO 已闭环数量；不包含 Funding 和利息">Closed FIFO only</span>
           </div>
         </div>
       </header>
@@ -604,7 +663,7 @@ export function IntraAnalysisPage() {
                 disabled={!analysis}
               >
                 <option value="">全部币种</option>
-                {analysis?.availableSymbols.map((item) => (
+                {availableClosedSymbols.map((item) => (
                   <option key={item} value={item}>{item}</option>
                 ))}
               </select>
@@ -636,6 +695,11 @@ export function IntraAnalysisPage() {
           </div>
           <div>
             <Database size={16} />
+            <span>口径</span>
+            <strong>只计 FIFO 已闭环数量</strong>
+          </div>
+          <div>
+            <Database size={16} />
             <span>基准</span>
             <strong>
               Main FKey Hedge · {strategy.exchange === 'bybit' ? 'Bybit' : 'Binance'} Premium 1m close
@@ -653,42 +717,49 @@ export function IntraAnalysisPage() {
           </div>
         )}
 
+        <section className="analysis-fee-bar" aria-label="收益 Fee 口径">
+          <div>
+            <span>收益口径</span>
+            <strong>{feeModeConfig.label}</strong>
+          </div>
+          <div className="segmented segmented--compact analysis-fee-mode">
+            {intraFeeModeOptions.map((option) => (
+              <button
+                key={option.key}
+                className={feeMode === option.key ? 'is-active' : ''}
+                type="button"
+                aria-pressed={feeMode === option.key}
+                onClick={() => setFeeMode(option.key)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <span>实际 Fee 按币种窗口有效费率分摊至闭环四腿本金</span>
+        </section>
+
         <section className="analysis-metrics" aria-label="组合 FIFO 汇总">
           <div className="analysis-metric analysis-metric--primary">
-            <span>Fee 前收益</span>
-            <strong className={valueClass(summary?.realizedPnlUsdt ?? 0)}>
-              {summary ? money(summary.realizedPnlUsdt, true) : '--'}
-            </strong>
-            <small>{summary ? bps(summary.returnBps, true) : '--'} bps</small>
-          </div>
-          <div className="analysis-metric">
-            <span>累计实际 Fee 影响</span>
-            <strong className={valueClass(-(summary?.tradingFeeUsdt ?? 0))}>
-              {summary ? money(-summary.tradingFeeUsdt, true) : '--'}
+            <span>{feeModeConfig.label}收益</span>
+            <strong className={valueClass(summary ? feeModePnl(summary, feeMode) : 0)}>
+              {summary ? money(feeModePnl(summary, feeMode), true) : '--'}
             </strong>
             <small>
-              {summary
-                ? `${percentage(summary.actualFeeCoverage)} covered · ` +
-                  `${compactNumber(summary.convertedFeeTradeCount)}/${compactNumber(summary.feeTradeCount)} fills`
-                : '--'}
+              {summary ? bps(feeModeReturnBps(summary, feeMode), true) : '--'} bps
             </small>
           </div>
-          <div className="analysis-metric analysis-metric--primary">
-            <span>实际 Fee 后收益</span>
-            <strong className={valueClass(summary?.feeAfterPnlUsdt ?? 0)}>
-              {summary ? money(summary.feeAfterPnlUsdt, true) : '--'}
-            </strong>
-            <small>{summary ? bps(summary.feeAfterReturnBps, true) : '--'} bps</small>
-          </div>
           <div className="analysis-metric">
-            <span>参考 Fee 后收益</span>
-            <strong className={valueClass(summary?.referenceFeeAfterPnlUsdt ?? 0)}>
-              {summary ? money(summary.referenceFeeAfterPnlUsdt, true) : '--'}
+            <span>{feeModeImpactLabel(feeMode)}</span>
+            <strong className={valueClass(summary ? feeModeImpact(summary, feeMode) : 0)}>
+              {summary ? money(feeModeImpact(summary, feeMode), true) : '--'}
             </strong>
             <small>
               {summary
-                ? `${bps(summary.referenceFeeBps, true)} bps · ` +
-                  `${money(-summary.referenceTradingFeeUsdt, true)} fee`
+                ? feeMode === 'actual'
+                  ? `${percentage(summary.actualFeeCoverage)} actual fee coverage`
+                  : feeMode === 'reference'
+                    ? `${bps(summary.referenceFeeBps)} bps reference`
+                    : 'Fee excluded'
                 : '--'}
             </small>
           </div>
@@ -707,21 +778,9 @@ export function IntraAnalysisPage() {
             <small>{summary ? bps(summary.executionReturnBps, true) : '--'} bps</small>
           </div>
           <div className="analysis-metric">
-            <span>窗口 MT 执行捕捉</span>
-            <strong className={valueClass(summary?.executionCaptureUsdt ?? 0)}>
-              {summary ? money(summary.executionCaptureUsdt, true) : '--'}
-            </strong>
-            <small>
-              {summary
-                ? `正 ${money(summary.positiveExecutionCaptureUsdt, true)} / ` +
-                  `反 ${money(summary.reverseExecutionCaptureUsdt, true)}`
-                : '--'}
-            </small>
-          </div>
-          <div className="analysis-metric">
             <span>Premium 覆盖</span>
-            <strong>{summary ? percentage(summary.executionMtPremiumCoverage) : '--'}</strong>
-            <small>{summary ? compactNumber(summary.executionMtCount) : '--'} MT legs</small>
+            <strong>{summary ? percentage(summary.premiumCoverage) : '--'}</strong>
+            <small>{summary ? compactNumber(summary.decomposedMatchCount) : '--'} closes</small>
           </div>
           <div className="analysis-metric">
             <span>FIFO 闭环</span>
@@ -755,23 +814,8 @@ export function IntraAnalysisPage() {
                   分币
                 </button>
               </div>
-              {chartMode === 'symbol' && (
-                <label className="analysis-symbol-select analysis-series-select">
-                  <span>指标</span>
-                  <select
-                    value={chartMetric}
-                    onChange={(event) =>
-                      setChartMetric(event.target.value as IntraAnalysisSeriesKey)
-                    }
-                  >
-                    {intraAnalysisMetricOptions.map((option) => (
-                      <option key={option.key} value={option.key}>{option.label}</option>
-                    ))}
-                  </select>
-                </label>
-              )}
               <span className="analysis-chart-total">
-                {chartMode === 'portfolio' && '实际 Fee 后 '}
+                {feeModeConfig.label}{' '}
                 {chartTotal === null ? '--' : money(chartTotal, true)} USDT
               </span>
             </div>
@@ -793,7 +837,7 @@ export function IntraAnalysisPage() {
                   }
                   symbolColors={chartSymbolColors}
                   mode={chartMode}
-                  metric={chartMetric}
+                  feeMode={feeMode}
                 />
               )}
               {chartMode === 'symbol' &&
@@ -821,7 +865,7 @@ export function IntraAnalysisPage() {
                   </div>
                   <div
                     className="segmented segmented--compact analysis-symbol-filter"
-                    aria-label="按当前指标收益筛选币种"
+                    aria-label={`按${feeModeConfig.label}收益筛选币种`}
                   >
                     <button
                       className={chartSymbolSelection === 'all' ? 'is-active' : ''}
@@ -869,7 +913,7 @@ export function IntraAnalysisPage() {
           </div>
           {analysis && (
             <div className="chart-foot">
-              <span>{compactNumber(analysis.source.windowMtRows)} hedged MT</span>
+              <span>{compactNumber(analysis.summary.closedMatchCount)} FIFO closes</span>
               <span>
                 {compactNumber(
                   chartMode === 'portfolio'
@@ -879,16 +923,17 @@ export function IntraAnalysisPage() {
               </span>
               <span>
                 {chartMode === 'portfolio'
-                  ? analysis.selectedSymbols.length
+                  ? chartSymbolRows.length
                   : selectedChartSymbols.length} symbols
               </span>
-              <span>{percentage(analysis.summary.premiumCoverage)} premium</span>
+              <span>{percentage(analysis.summary.premiumCoverage)} closed premium</span>
               <span>
-                {percentage(analysis.summary.actualFeeCoverage)} actual fee ·{' '}
+                {percentage(analysis.summary.actualFeeCoverage)} actual fee coverage ·{' '}
                 {compactNumber(analysis.source.windowFeeTradeRows)} fills
               </span>
               {analysis.source.sampled && <span>sampled</span>}
-              <span>{bps(analysis.summary.referenceFeeBps, true)} bps reference fee</span>
+              <span>closed four-leg fee allocation</span>
+              <span>{bps(analysis.summary.referenceFeeBps)} bps reference fee</span>
               <span>funding / interest excluded</span>
             </div>
           )}
@@ -903,29 +948,25 @@ export function IntraAnalysisPage() {
             <span>{visibleSymbols.length} symbols</span>
           </div>
           <div className="analysis-table-wrap">
-            <table className="analysis-table">
+            <table className="analysis-table analysis-symbol-table">
               <thead>
                 <tr>
                   <th>Symbol</th>
-                  <th>MT 正 / 反</th>
                   <th>FIFO / 胜率</th>
                   <th>闭环本金</th>
-                  <th>Fee 前收益</th>
-                  <th>累计实际 Fee 影响</th>
-                  <th>实际 Fee 后收益</th>
-                  <th>参考 Fee 后收益</th>
+                  <th>{feeModeConfig.label}收益</th>
+                  <th>Fee 影响</th>
                   <th>选币基差</th>
                   <th>闭环两腿执行</th>
-                  <th>窗口 MT 执行</th>
-                  <th>MT k 覆盖</th>
-                  <th>未闭合正套</th>
-                  <th>未闭合反套</th>
+                  <th>闭环 k 覆盖</th>
                 </tr>
               </thead>
               <tbody>
-                {visibleSymbols.map((row) => <SymbolRow key={row.symbol} row={row} />)}
+                {visibleSymbols.map((row) => (
+                  <SymbolRow key={row.symbol} row={row} feeMode={feeMode} />
+                ))}
                 {!loading && visibleSymbols.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={14}>暂无闭环数据</td></tr>
+                  <tr><td className="analysis-empty" colSpan={8}>暂无闭环数据</td></tr>
                 )}
               </tbody>
             </table>
@@ -955,7 +996,8 @@ export function IntraAnalysisPage() {
                   <th>选币基差</th>
                   <th>开仓腿执行</th>
                   <th>平仓腿执行</th>
-                  <th>Fee 前收益</th>
+                  <th>Fee 影响</th>
+                  <th>{feeModeConfig.label}收益</th>
                 </tr>
               </thead>
               <tbody>
@@ -1007,14 +1049,17 @@ export function IntraAnalysisPage() {
                     <td className={valueClass(row.exitExecutionPnlUsdt ?? 0)}>
                       <strong>{optionalMoney(row.exitExecutionPnlUsdt)}</strong>
                     </td>
-                    <td className={valueClass(row.pnlUsdt)}>
-                      <strong>{money(row.pnlUsdt, true)}</strong>
-                      <small>{bps(row.returnBps, true)} bps</small>
+                    <td className={valueClass(matchFeeModeImpact(row, feeMode))}>
+                      <strong>{money(matchFeeModeImpact(row, feeMode), true)}</strong>
+                    </td>
+                    <td className={valueClass(matchFeeModePnl(row, feeMode))}>
+                      <strong>{money(matchFeeModePnl(row, feeMode), true)}</strong>
+                      <small>{bps(matchFeeModeReturnBps(row, feeMode), true)} bps</small>
                     </td>
                   </tr>
                 ))}
                 {!loading && analysis?.matches.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={12}>当前范围没有 FIFO 闭环</td></tr>
+                  <tr><td className="analysis-empty" colSpan={13}>当前范围没有 FIFO 闭环</td></tr>
                 )}
               </tbody>
             </table>

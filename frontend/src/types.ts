@@ -352,11 +352,12 @@ export interface IntraAnalysisPoint {
   decomposedMatchCount: number
 }
 
-export type IntraAnalysisSeriesKey =
+export type IntraFeeMode = 'gross' | 'actual' | 'reference'
+
+export type IntraPnlSeriesKey =
   | 'realizedPnlUsdt'
-  | 'marketPnlUsdt'
-  | 'executionPnlUsdt'
-  | 'executionCaptureUsdt'
+  | 'feeAfterPnlUsdt'
+  | 'referenceFeeAfterPnlUsdt'
 
 export interface IntraSymbolSeries {
   symbol: string
@@ -386,6 +387,11 @@ export interface IntraClosedMatch {
   entryExecutionPnlUsdt: number | null
   exitExecutionPnlUsdt: number | null
   executionPnlUsdt: number | null
+  feeNotionalUsdt: number
+  tradingFeeUsdt: number
+  referenceTradingFeeUsdt: number
+  feeAfterPnlUsdt: number
+  referenceFeeAfterPnlUsdt: number
   pnlUsdt: number
   returnBps: number
 }
@@ -400,6 +406,7 @@ export interface IntraAnalysisSource {
   loadedFeeTradeRows: number
   windowFeeTradeRows: number
   convertedFeeTradeRows: number
+  feeAllocation: string
   returnedPoints: number
   returnedSymbolPoints: number
   returnedMatches: number

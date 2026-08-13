@@ -8,10 +8,10 @@ import {
 import * as echarts from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { useEffect, useRef } from 'react'
-import { intraAnalysisMetricLabel } from '../intraAnalysisSeries'
+import { intraFeeModeConfig } from '../intraAnalysisSeries'
 import type {
+  IntraFeeMode,
   IntraAnalysisPoint,
-  IntraAnalysisSeriesKey,
   IntraSymbolSeries,
 } from '../types'
 
@@ -47,7 +47,7 @@ interface IntraFifoChartProps {
   symbolPoints: IntraSymbolSeries[]
   symbolColors: Record<string, string>
   mode: IntraFifoChartMode
-  metric: IntraAnalysisSeriesKey
+  feeMode: IntraFeeMode
 }
 
 export function IntraFifoChart({
@@ -55,7 +55,7 @@ export function IntraFifoChart({
   symbolPoints,
   symbolColors,
   mode,
-  metric,
+  feeMode,
 }: IntraFifoChartProps) {
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -66,13 +66,25 @@ export function IntraFifoChart({
       renderer: 'canvas',
     })
     const isSymbolMode = mode === 'symbol'
+    const fee = intraFeeModeConfig(feeMode)
+    const feeImpact =
+      feeMode === 'gross'
+        ? null
+        : {
+            name: feeMode === 'actual' ? '实际 Fee 影响' : '参考 Fee 影响',
+            values: points.map((point) =>
+              feeMode === 'actual'
+                ? -point.tradingFeeUsdt
+                : -point.referenceTradingFeeUsdt,
+            ),
+          }
     const series = isSymbolMode
       ? symbolPoints.map((symbolSeries) => {
           const color = symbolColors[symbolSeries.symbol] ?? '#176b5b'
           return {
             name: symbolSeries.symbol,
             type: 'line' as const,
-            data: symbolSeries.points.map((point) => [point.ts, point[metric]]),
+            data: symbolSeries.points.map((point) => [point.ts, point[fee.metric]]),
             showSymbol: false,
             sampling: 'lttb' as const,
             connectNulls: true,
@@ -83,50 +95,36 @@ export function IntraFifoChart({
         })
       : [
           {
-            name: 'Fee 前收益',
+            name: fee.label,
             type: 'line' as const,
-            data: points.map((point) => [point.ts, point.realizedPnlUsdt]),
+            data: points.map((point) => [point.ts, point[fee.metric]]),
             showSymbol: false,
             sampling: 'lttb' as const,
             connectNulls: true,
-            lineStyle: { width: 2.2, color: '#176b5b' },
-            itemStyle: { color: '#176b5b' },
-            areaStyle: { color: 'rgba(23, 107, 91, 0.06)', origin: 0 },
+            lineStyle: { width: 2.2, color: fee.color },
+            itemStyle: { color: fee.color },
+            areaStyle: { color: `${fee.color}12`, origin: 0 },
             emphasis: { focus: 'series' as const },
           },
-          {
-            name: '累计实际 Fee 影响',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, -point.tradingFeeUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 1.45, color: '#b5473c', type: 'dashed' as const },
-            itemStyle: { color: '#b5473c' },
-            emphasis: { focus: 'series' as const },
-          },
-          {
-            name: '实际 Fee 后收益',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, point.feeAfterPnlUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 2, color: '#087f8c' },
-            itemStyle: { color: '#087f8c' },
-            emphasis: { focus: 'series' as const },
-          },
-          {
-            name: '参考 Fee 后收益',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, point.referenceFeeAfterPnlUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 1.65, color: '#6c6f2d', type: 'dotted' as const },
-            itemStyle: { color: '#6c6f2d' },
-            emphasis: { focus: 'series' as const },
-          },
+          ...(feeImpact
+            ? [
+                {
+                  name: feeImpact.name,
+                  type: 'line' as const,
+                  data: points.map((point, index) => [point.ts, feeImpact.values[index]]),
+                  showSymbol: false,
+                  sampling: 'lttb' as const,
+                  connectNulls: true,
+                  lineStyle: {
+                    width: 1.45,
+                    color: '#b5473c',
+                    type: 'dashed' as const,
+                  },
+                  itemStyle: { color: '#b5473c' },
+                  emphasis: { focus: 'series' as const },
+                },
+              ]
+            : []),
           {
             name: '选币基差',
             type: 'line' as const,
@@ -149,17 +147,6 @@ export function IntraFifoChart({
             itemStyle: { color: '#b45309' },
             emphasis: { focus: 'series' as const },
           },
-          {
-            name: '窗口 MT 执行',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, point.executionCaptureUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 1.5, color: '#7c3a91', type: 'dashed' as const },
-            itemStyle: { color: '#7c3a91' },
-            emphasis: { focus: 'series' as const },
-          },
         ]
 
     chart.setOption(
@@ -176,13 +163,10 @@ export function IntraFifoChart({
           itemHeight: 3,
           textStyle: { color: '#596273', fontSize: 10 },
           data: [
-            'Fee 前收益',
-            '累计实际 Fee 影响',
-            '实际 Fee 后收益',
-            '参考 Fee 后收益',
+            fee.label,
+            ...(feeImpact ? [feeImpact.name] : []),
             '选币基差',
             '闭环执行',
-            '窗口 MT 执行',
           ],
         },
         tooltip: {
@@ -255,7 +239,7 @@ export function IntraFifoChart({
       observer.disconnect()
       chart.dispose()
     }
-  }, [metric, mode, points, symbolColors, symbolPoints])
+  }, [feeMode, mode, points, symbolColors, symbolPoints])
 
   return (
     <div
@@ -263,8 +247,8 @@ export function IntraFifoChart({
       className="analysis-chart"
       aria-label={
         mode === 'portfolio'
-          ? '正反套 FIFO Fee 前、实际 Fee 影响、实际 Fee 后、参考 Fee 后与执行累计曲线'
-          : `各币 ${intraAnalysisMetricLabel(metric)}累计曲线`
+          ? `正反套 FIFO ${intraFeeModeConfig(feeMode).label}及闭环根因累计曲线`
+          : `各币 ${intraFeeModeConfig(feeMode).label}累计曲线`
       }
     />
   )

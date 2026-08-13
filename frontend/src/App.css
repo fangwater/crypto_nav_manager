@@ -4216,7 +4216,7 @@
   min-height: 58px;
   margin-top: -20px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
   background: rgba(247, 248, 249, 0.72);
 }
@@ -4253,6 +4253,44 @@
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.analysis-fee-bar {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #fafbfc;
+}
+
+.analysis-fee-bar > div:first-child {
+  min-width: 112px;
+  display: grid;
+  gap: 2px;
+}
+
+.analysis-fee-bar > div:first-child span,
+.analysis-fee-bar > span {
+  color: var(--subtle);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.analysis-fee-bar > div:first-child strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.analysis-fee-bar > span {
+  margin-left: auto;
+  text-align: right;
+}
+
+.analysis-fee-mode {
+  grid-auto-columns: minmax(82px, auto);
 }
 
 .analysis-metrics {
@@ -4566,6 +4604,10 @@
   font-variant-numeric: tabular-nums;
 }
 
+.analysis-symbol-table {
+  min-width: 980px;
+}
+
 .analysis-table th,
 .analysis-table td {
   height: 48px;
@@ -4695,6 +4737,16 @@
     border-left: 0;
   }
 
+  .analysis-fee-bar {
+    flex-wrap: wrap;
+  }
+
+  .analysis-fee-bar > span {
+    width: 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+
   .analysis-chart-body--symbol {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -4791,6 +4843,27 @@
 
   .analysis-scope {
     margin-top: -14px;
+  }
+
+  .analysis-fee-bar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .analysis-fee-bar > div:first-child {
+    min-width: 0;
+  }
+
+  .analysis-fee-mode {
+    width: 100%;
+    grid-auto-columns: minmax(0, 1fr);
+  }
+
+  .analysis-fee-mode button {
+    min-width: 0;
+    padding: 0 5px;
   }
 
   .analysis-metrics {
