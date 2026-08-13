@@ -6,7 +6,7 @@ export const intraFeeModeOptions: ReadonlyArray<{
   metric: IntraPnlSeriesKey
   color: string
 }> = [
-  { key: 'gross', label: 'Fee 前', metric: 'realizedPnlUsdt', color: '#176b5b' },
+  { key: 'gross', label: 'Fee 前', metric: 'grossPnlUsdt', color: '#176b5b' },
   { key: 'actual', label: '实际 Fee 后', metric: 'feeAfterPnlUsdt', color: '#087f8c' },
   {
     key: 'reference',

@@ -3,8 +3,8 @@ use crate::{
     binance_premium_index, bybit_premium_index, contract_multipliers,
     fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
     intra_analysis::{
-        self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisOrder, IntraAnalysisRequest,
-        PremiumIndexCandle,
+        self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisFundingEvent, IntraAnalysisOrder,
+        IntraAnalysisRequest, PremiumIndexCandle,
     },
     live_history,
     mark_prices::MarkPriceCache,
@@ -166,6 +166,13 @@ struct IntraAnalysisFeeRecord {
     ts: i64,
     notional_usdt: f64,
     fee_usdt: Option<f64>,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraAnalysisFundingRecord {
+    symbol: String,
+    ts: i64,
+    amount_usdt: f64,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -1040,6 +1047,28 @@ async fn get_intra_analysis(
             fee_usdt: row.fee_usdt,
         })
         .collect::<Vec<_>>();
+    let funding_sql = format!(
+        r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
+                  COALESCE(amount_usdt,amount)::float8 AS amount_usdt
+           FROM {}.funding
+           WHERE symbol IS NOT NULL
+             AND event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms,symbol,record_id"#,
+        strategy.db_schema
+    );
+    let funding_events =
+        sqlx::query_as::<_, IntraAnalysisFundingRecord>(sqlx::AssertSqlSafe(funding_sql))
+            .bind(start_ms)
+            .bind(end_ms)
+            .fetch_all(&state.pool)
+            .await?
+            .into_iter()
+            .map(|row| IntraAnalysisFundingEvent {
+                symbol: row.symbol,
+                ts: row.ts,
+                amount_usdt: row.amount_usdt,
+            })
+            .collect::<Vec<_>>();
     let selected_symbols = query
         .symbols
         .unwrap_or_default()
@@ -1065,7 +1094,12 @@ async fn get_intra_analysis(
         max_matches: query.max_matches.unwrap_or(200).clamp(20, 500),
     };
     let response = tokio::task::spawn_blocking(move || {
-        intra_analysis::calculate_with_fees(orders, fee_events, calculation)
+        intra_analysis::calculate_with_fees_and_funding(
+            orders,
+            fee_events,
+            funding_events,
+            calculation,
+        )
     })
     .await
     .context("join intra combination FIFO calculation")??;

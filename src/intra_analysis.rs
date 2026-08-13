@@ -51,6 +51,14 @@ pub struct IntraAnalysisFeeEvent {
     pub fee_usdt: Option<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IntraAnalysisFundingEvent {
+    pub symbol: String,
+    pub ts: i64,
+    /// Account cash flow: positive values are income and negative values are costs.
+    pub amount_usdt: f64,
+}
+
 impl IntraAnalysisOrder {
     fn basis(&self) -> f64 {
         self.futures_price - self.spot_price
@@ -131,6 +139,10 @@ pub struct IntraAnalysisSummary {
     pub matched_notional_usdt: f64,
     pub realized_pnl_usdt: f64,
     pub return_bps: f64,
+    pub funding_pnl_usdt: f64,
+    pub funding_return_bps: f64,
+    pub gross_pnl_usdt: f64,
+    pub gross_return_bps: f64,
     pub trading_fee_usdt: f64,
     pub fee_after_pnl_usdt: f64,
     pub fee_after_return_bps: f64,
@@ -180,6 +192,8 @@ pub struct IntraSymbolAnalysis {
 pub struct IntraAnalysisPoint {
     pub ts: i64,
     pub realized_pnl_usdt: f64,
+    pub funding_pnl_usdt: f64,
+    pub gross_pnl_usdt: f64,
     pub trading_fee_usdt: f64,
     pub fee_after_pnl_usdt: f64,
     pub reference_trading_fee_usdt: f64,
@@ -224,6 +238,8 @@ pub struct IntraClosedMatch {
     pub entry_execution_pnl_usdt: Option<f64>,
     pub exit_execution_pnl_usdt: Option<f64>,
     pub execution_pnl_usdt: Option<f64>,
+    pub funding_pnl_usdt: f64,
+    pub gross_pnl_usdt: f64,
     pub fee_notional_usdt: f64,
     pub trading_fee_usdt: f64,
     pub reference_trading_fee_usdt: f64,
@@ -246,6 +262,10 @@ pub struct IntraAnalysisSource {
     pub window_fee_trade_rows: usize,
     pub converted_fee_trade_rows: usize,
     pub fee_allocation: &'static str,
+    pub loaded_funding_rows: usize,
+    pub window_funding_rows: usize,
+    pub allocated_funding_rows: usize,
+    pub funding_allocation: &'static str,
     pub returned_points: usize,
     pub returned_symbol_points: usize,
     pub returned_matches: usize,
@@ -295,6 +315,7 @@ struct OpenLot {
     spot_price: f64,
     futures_price: f64,
     remaining_quantity: f64,
+    funding_pnl_usdt: f64,
     premium: Option<PremiumIndexCandle>,
 }
 
@@ -341,6 +362,7 @@ struct SummaryAccumulator {
     matched_quantity: f64,
     matched_notional_usdt: f64,
     realized_pnl_usdt: f64,
+    funding_pnl_usdt: f64,
     trading_fee_usdt: f64,
     reference_trading_fee_usdt: f64,
     decomposed_match_count: u64,
@@ -382,6 +404,7 @@ impl SummaryAccumulator {
         self.matched_quantity += row.quantity;
         self.matched_notional_usdt += matched_notional;
         self.realized_pnl_usdt += row.pnl_usdt;
+        self.funding_pnl_usdt += row.funding_pnl_usdt;
         self.trading_fee_usdt += row.trading_fee_usdt;
         self.reference_trading_fee_usdt += row.reference_trading_fee_usdt;
         if let (Some(market_pnl), Some(execution_pnl)) =
@@ -405,6 +428,7 @@ impl SummaryAccumulator {
         self.matched_quantity += other.matched_quantity;
         self.matched_notional_usdt += other.matched_notional_usdt;
         self.realized_pnl_usdt += other.realized_pnl_usdt;
+        self.funding_pnl_usdt += other.funding_pnl_usdt;
         self.trading_fee_usdt += other.trading_fee_usdt;
         self.reference_trading_fee_usdt += other.reference_trading_fee_usdt;
         self.decomposed_match_count += other.decomposed_match_count;
@@ -420,6 +444,7 @@ impl SummaryAccumulator {
     }
 
     fn finish(self, open: OpenSummary) -> IntraAnalysisSummary {
+        let gross_pnl_usdt = self.realized_pnl_usdt + self.funding_pnl_usdt;
         IntraAnalysisSummary {
             mt_count: self.mt_count,
             positive_mt_count: self.positive_mt_count,
@@ -435,18 +460,22 @@ impl SummaryAccumulator {
             matched_notional_usdt: clean_zero(self.matched_notional_usdt),
             realized_pnl_usdt: clean_zero(self.realized_pnl_usdt),
             return_bps: ratio(self.realized_pnl_usdt, self.matched_notional_usdt) * 10_000.0,
+            funding_pnl_usdt: clean_zero(self.funding_pnl_usdt),
+            funding_return_bps: ratio(self.funding_pnl_usdt, self.matched_notional_usdt) * 10_000.0,
+            gross_pnl_usdt: clean_zero(gross_pnl_usdt),
+            gross_return_bps: ratio(gross_pnl_usdt, self.matched_notional_usdt) * 10_000.0,
             trading_fee_usdt: clean_zero(self.trading_fee_usdt),
-            fee_after_pnl_usdt: clean_zero(self.realized_pnl_usdt - self.trading_fee_usdt),
+            fee_after_pnl_usdt: clean_zero(gross_pnl_usdt - self.trading_fee_usdt),
             fee_after_return_bps: ratio(
-                self.realized_pnl_usdt - self.trading_fee_usdt,
+                gross_pnl_usdt - self.trading_fee_usdt,
                 self.matched_notional_usdt,
             ) * 10_000.0,
             reference_trading_fee_usdt: clean_zero(self.reference_trading_fee_usdt),
             reference_fee_after_pnl_usdt: clean_zero(
-                self.realized_pnl_usdt - self.reference_trading_fee_usdt,
+                gross_pnl_usdt - self.reference_trading_fee_usdt,
             ),
             reference_fee_after_return_bps: ratio(
-                self.realized_pnl_usdt - self.reference_trading_fee_usdt,
+                gross_pnl_usdt - self.reference_trading_fee_usdt,
                 self.matched_notional_usdt,
             ) * 10_000.0,
             decomposed_match_count: self.decomposed_match_count,
@@ -542,12 +571,21 @@ pub fn calculate(
     orders: Vec<IntraAnalysisOrder>,
     request: IntraAnalysisRequest,
 ) -> Result<IntraAnalysisResponse> {
-    calculate_with_fees(orders, Vec::new(), request)
+    calculate_with_fees_and_funding(orders, Vec::new(), Vec::new(), request)
 }
 
 pub fn calculate_with_fees(
+    orders: Vec<IntraAnalysisOrder>,
+    fee_events: Vec<IntraAnalysisFeeEvent>,
+    request: IntraAnalysisRequest,
+) -> Result<IntraAnalysisResponse> {
+    calculate_with_fees_and_funding(orders, fee_events, Vec::new(), request)
+}
+
+pub fn calculate_with_fees_and_funding(
     mut orders: Vec<IntraAnalysisOrder>,
     mut fee_events: Vec<IntraAnalysisFeeEvent>,
+    mut funding_events: Vec<IntraAnalysisFundingEvent>,
     request: IntraAnalysisRequest,
 ) -> Result<IntraAnalysisResponse> {
     if request.start_ms < request.strategy_start_ms {
@@ -577,9 +615,19 @@ pub fn calculate_with_fees(
             .cmp(&right.ts)
             .then_with(|| left.symbol.cmp(&right.symbol))
     });
+    for event in &mut funding_events {
+        event.symbol = event.symbol.to_ascii_uppercase();
+        validate_funding_event(event)?;
+    }
+    funding_events.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
 
     let loaded_mt_rows = orders.len();
     let loaded_fee_trade_rows = fee_events.len();
+    let loaded_funding_rows = funding_events.len();
     let available_symbols = orders
         .iter()
         .map(|order| order.symbol.clone())
@@ -610,6 +658,14 @@ pub fn calculate_with_fees(
             aggregate_fees.record(event);
         }
     }
+    let window_funding_events = funding_events
+        .iter()
+        .filter(|event| event.ts >= request.start_ms && event.ts <= request.end_ms)
+        .collect::<Vec<_>>();
+    let window_funding_rows = window_funding_events
+        .iter()
+        .filter(|event| selected.contains(&event.symbol))
+        .count();
     let mut states = available_symbols
         .iter()
         .cloned()
@@ -620,6 +676,7 @@ pub fn calculate_with_fees(
         ..IntraAnalysisPoint::default()
     }];
     let mut point_pnl = 0.0;
+    let mut point_funding_pnl = 0.0;
     let mut point_trading_fee = 0.0;
     let mut point_reference_trading_fee = 0.0;
     let mut point_market_pnl = 0.0;
@@ -647,11 +704,26 @@ pub fn calculate_with_fees(
         .collect::<HashMap<_, _>>();
     let mut recent_matches = VecDeque::with_capacity(request.max_matches.saturating_add(1));
     let mut window_mt_rows = 0_usize;
+    let mut allocated_funding_rows = 0_usize;
+    let mut funding_index = 0_usize;
 
     for order in orders
         .iter()
         .filter(|order| order.completed_at_ms <= request.end_ms)
     {
+        while let Some(event) = window_funding_events.get(funding_index) {
+            if event.ts > order.completed_at_ms {
+                break;
+            }
+            if states
+                .get_mut(&event.symbol)
+                .is_some_and(|state| allocate_funding(state, event.amount_usdt))
+                && selected.contains(&event.symbol)
+            {
+                allocated_funding_rows += 1;
+            }
+            funding_index += 1;
+        }
         let in_window = order.completed_at_ms >= request.start_ms;
         if in_window {
             window_mt_rows += 1;
@@ -676,6 +748,13 @@ pub fn calculate_with_fees(
             let matched_notional = matched_quantity * (open.spot_price + order.spot_price) / 2.0;
             let pnl_usdt =
                 matched_quantity * open.direction.sign() * (open.basis() - order.basis());
+            let funding_pnl_usdt = if matched_quantity + QUANTITY_EPSILON >= open.remaining_quantity
+            {
+                open.funding_pnl_usdt
+            } else {
+                open.funding_pnl_usdt * matched_quantity / open.remaining_quantity
+            };
+            let gross_pnl_usdt = pnl_usdt + funding_pnl_usdt;
             let market_pnl_usdt = match (open.market_basis(), order.market_basis()) {
                 (Some(open_market_basis), Some(close_market_basis)) => Some(
                     matched_quantity
@@ -725,11 +804,15 @@ pub fn calculate_with_fees(
                 entry_execution_pnl_usdt,
                 exit_execution_pnl_usdt,
                 execution_pnl_usdt,
+                funding_pnl_usdt: clean_zero(funding_pnl_usdt),
+                gross_pnl_usdt: clean_zero(gross_pnl_usdt),
                 fee_notional_usdt: clean_zero(fee_notional_usdt),
                 trading_fee_usdt: clean_zero(trading_fee_usdt),
                 reference_trading_fee_usdt: clean_zero(reference_trading_fee_usdt),
-                fee_after_pnl_usdt: clean_zero(pnl_usdt - trading_fee_usdt),
-                reference_fee_after_pnl_usdt: clean_zero(pnl_usdt - reference_trading_fee_usdt),
+                fee_after_pnl_usdt: clean_zero(gross_pnl_usdt - trading_fee_usdt),
+                reference_fee_after_pnl_usdt: clean_zero(
+                    gross_pnl_usdt - reference_trading_fee_usdt,
+                ),
                 pnl_usdt,
                 return_bps: ratio(pnl_usdt, matched_notional) * 10_000.0,
             };
@@ -737,6 +820,7 @@ pub fn calculate_with_fees(
                 state.stats.record_match(&closed, matched_notional);
                 if selected.contains(&order.symbol) {
                     point_pnl += pnl_usdt;
+                    point_funding_pnl += funding_pnl_usdt;
                     point_trading_fee += trading_fee_usdt;
                     point_reference_trading_fee += reference_trading_fee_usdt;
                     if let (Some(market_pnl), Some(execution_pnl)) =
@@ -753,12 +837,15 @@ pub fn calculate_with_fees(
                         .expect("selected symbols have point totals");
                     symbol_total.ts = order.completed_at_ms;
                     symbol_total.realized_pnl_usdt += pnl_usdt;
+                    symbol_total.funding_pnl_usdt += funding_pnl_usdt;
+                    symbol_total.gross_pnl_usdt =
+                        symbol_total.realized_pnl_usdt + symbol_total.funding_pnl_usdt;
                     symbol_total.trading_fee_usdt += trading_fee_usdt;
                     symbol_total.fee_after_pnl_usdt =
-                        symbol_total.realized_pnl_usdt - symbol_total.trading_fee_usdt;
+                        symbol_total.gross_pnl_usdt - symbol_total.trading_fee_usdt;
                     symbol_total.reference_trading_fee_usdt += reference_trading_fee_usdt;
                     symbol_total.reference_fee_after_pnl_usdt =
-                        symbol_total.realized_pnl_usdt - symbol_total.reference_trading_fee_usdt;
+                        symbol_total.gross_pnl_usdt - symbol_total.reference_trading_fee_usdt;
                     if let (Some(market_pnl), Some(execution_pnl)) =
                         (market_pnl_usdt, execution_pnl_usdt)
                     {
@@ -779,11 +866,15 @@ pub fn calculate_with_fees(
                         IntraAnalysisPoint {
                             ts: order.completed_at_ms,
                             realized_pnl_usdt: clean_zero(point_pnl),
+                            funding_pnl_usdt: clean_zero(point_funding_pnl),
+                            gross_pnl_usdt: clean_zero(point_pnl + point_funding_pnl),
                             trading_fee_usdt: clean_zero(point_trading_fee),
-                            fee_after_pnl_usdt: clean_zero(point_pnl - point_trading_fee),
+                            fee_after_pnl_usdt: clean_zero(
+                                point_pnl + point_funding_pnl - point_trading_fee,
+                            ),
                             reference_trading_fee_usdt: clean_zero(point_reference_trading_fee),
                             reference_fee_after_pnl_usdt: clean_zero(
-                                point_pnl - point_reference_trading_fee,
+                                point_pnl + point_funding_pnl - point_reference_trading_fee,
                             ),
                             market_pnl_usdt: clean_zero(point_market_pnl),
                             execution_pnl_usdt: clean_zero(point_execution_pnl),
@@ -802,6 +893,7 @@ pub fn calculate_with_fees(
                 }
             }
             remaining = clean_quantity(remaining - matched_quantity);
+            open.funding_pnl_usdt = clean_zero(open.funding_pnl_usdt - funding_pnl_usdt);
             open.remaining_quantity = clean_quantity(open.remaining_quantity - matched_quantity);
             if open.remaining_quantity <= QUANTITY_EPSILON {
                 opposite.pop_front();
@@ -815,12 +907,23 @@ pub fn calculate_with_fees(
                 spot_price: order.spot_price,
                 futures_price: order.futures_price,
                 remaining_quantity: remaining,
+                funding_pnl_usdt: 0.0,
                 premium: order.premium,
             };
             match order.direction {
                 ArbDirection::Positive => state.positive.push_back(lot),
                 ArbDirection::Reverse => state.reverse.push_back(lot),
             }
+        }
+    }
+
+    for event in &window_funding_events[funding_index..] {
+        if states
+            .get_mut(&event.symbol)
+            .is_some_and(|state| allocate_funding(state, event.amount_usdt))
+            && selected.contains(&event.symbol)
+        {
+            allocated_funding_rows += 1;
         }
     }
 
@@ -862,8 +965,8 @@ pub fn calculate_with_fees(
     symbols.sort_by(|left, right| {
         right
             .summary
-            .realized_pnl_usdt
-            .total_cmp(&left.summary.realized_pnl_usdt)
+            .gross_pnl_usdt
+            .total_cmp(&left.summary.gross_pnl_usdt)
             .then_with(|| left.symbol.cmp(&right.symbol))
     });
 
@@ -899,12 +1002,16 @@ pub fn calculate_with_fees(
         window_fee_trade_rows,
         converted_fee_trade_rows,
         fee_allocation: "symbol_window_effective_rate_on_closed_four_legs",
+        loaded_funding_rows,
+        window_funding_rows,
+        allocated_funding_rows,
+        funding_allocation: "event_time_open_futures_notional_then_fifo_closed_quantity",
         returned_points: points.len(),
         returned_symbol_points,
         returned_matches: matches.len(),
         sampled: points.len() < original_point_count || sampled_symbol_points,
         fees_included: true,
-        funding_included: false,
+        funding_included: true,
     };
 
     let mut summary = aggregate_stats.finish(aggregate_open);
@@ -1008,6 +1115,39 @@ fn validate_fee_event(event: &IntraAnalysisFeeEvent) -> Result<()> {
         bail!("intra analysis fee event has a non-finite fee");
     }
     Ok(())
+}
+
+fn validate_funding_event(event: &IntraAnalysisFundingEvent) -> Result<()> {
+    if event.symbol.trim().is_empty() {
+        bail!("intra analysis funding event has an empty symbol");
+    }
+    if event.ts <= 0 {
+        bail!(
+            "intra analysis funding event has invalid timestamp: {}",
+            event.ts
+        );
+    }
+    if !event.amount_usdt.is_finite() {
+        bail!("intra analysis funding event has a non-finite amount");
+    }
+    Ok(())
+}
+
+fn allocate_funding(state: &mut SymbolState, amount_usdt: f64) -> bool {
+    let total_futures_notional = state
+        .positive
+        .iter()
+        .chain(&state.reverse)
+        .map(|lot| lot.remaining_quantity * lot.futures_price)
+        .sum::<f64>();
+    if total_futures_notional <= f64::EPSILON {
+        return false;
+    }
+    for lot in state.positive.iter_mut().chain(&mut state.reverse) {
+        let notional = lot.remaining_quantity * lot.futures_price;
+        lot.funding_pnl_usdt += amount_usdt * notional / total_futures_notional;
+    }
+    true
 }
 
 fn ensure_final_point(points: &mut Vec<IntraAnalysisPoint>, end_ms: i64) {
@@ -1123,6 +1263,14 @@ mod tests {
         }
     }
 
+    fn funding_event(symbol: &str, ts: i64, amount_usdt: f64) -> IntraAnalysisFundingEvent {
+        IntraAnalysisFundingEvent {
+            symbol: symbol.to_string(),
+            ts,
+            amount_usdt,
+        }
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-9,
@@ -1211,6 +1359,81 @@ mod tests {
         assert_close(response.summary.fee_after_pnl_usdt, 5.25);
         assert_close(response.points.last().unwrap().trading_fee_usdt, -0.25);
         assert_close(response.points.last().unwrap().fee_after_pnl_usdt, 5.25);
+    }
+
+    #[test]
+    fn releases_funding_only_for_the_fifo_closed_quantity() {
+        let response = calculate_with_fees_and_funding(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Positive, 1_150, 200.0, 220.0, 1.0),
+                order(3, ArbDirection::Reverse, 1_300, 100.0, 105.0, 1.5),
+            ],
+            vec![fee_event("BTCUSDT", 1_250, 727.5, Some(3.0))],
+            vec![funding_event("btcusdt", 1_200, 30.0)],
+            request(1_000, 1_400),
+        )
+        .unwrap();
+
+        assert_close(response.summary.realized_pnl_usdt, 12.5);
+        assert_close(response.summary.funding_pnl_usdt, 20.0);
+        assert_close(response.summary.gross_pnl_usdt, 32.5);
+        assert_close(response.summary.trading_fee_usdt, 3.0);
+        assert_close(response.summary.fee_after_pnl_usdt, 29.5);
+        assert_close(response.summary.reference_trading_fee_usdt, 0.07275);
+        assert_close(response.summary.reference_fee_after_pnl_usdt, 32.42725);
+        assert_close(response.matches[0].funding_pnl_usdt, 10.0);
+        assert_close(response.matches[1].funding_pnl_usdt, 10.0);
+        assert_close(response.summary.positive_open_quantity, 0.5);
+        assert_close(response.points.last().unwrap().funding_pnl_usdt, 20.0);
+        assert_close(response.points.last().unwrap().gross_pnl_usdt, 32.5);
+        assert_close(response.points.last().unwrap().fee_after_pnl_usdt, 29.5);
+        assert_eq!(response.source.window_funding_rows, 1);
+        assert_eq!(response.source.allocated_funding_rows, 1);
+        assert!(response.source.funding_included);
+    }
+
+    #[test]
+    fn assigns_window_funding_to_a_pre_window_fifo_seed() {
+        let response = calculate_with_fees_and_funding(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Reverse, 2_100, 100.0, 105.0, 1.0),
+            ],
+            Vec::new(),
+            vec![
+                funding_event("BTCUSDT", 1_900, 9.0),
+                funding_event("BTCUSDT", 2_050, 3.0),
+            ],
+            request(2_000, 2_200),
+        )
+        .unwrap();
+
+        assert_close(response.summary.realized_pnl_usdt, 5.0);
+        assert_close(response.summary.funding_pnl_usdt, 3.0);
+        assert_close(response.summary.gross_pnl_usdt, 8.0);
+        assert_eq!(response.source.loaded_funding_rows, 2);
+        assert_eq!(response.source.window_funding_rows, 1);
+        assert_eq!(response.source.allocated_funding_rows, 1);
+    }
+
+    #[test]
+    fn ignores_funding_without_an_open_fifo_lot() {
+        let response = calculate_with_fees_and_funding(
+            vec![
+                order(1, ArbDirection::Positive, 1_200, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Reverse, 1_300, 100.0, 105.0, 1.0),
+            ],
+            Vec::new(),
+            vec![funding_event("BTCUSDT", 1_100, 7.0)],
+            request(1_000, 1_400),
+        )
+        .unwrap();
+
+        assert_close(response.summary.funding_pnl_usdt, 0.0);
+        assert_close(response.summary.gross_pnl_usdt, 5.0);
+        assert_eq!(response.source.window_funding_rows, 1);
+        assert_eq!(response.source.allocated_funding_rows, 0);
     }
 
     #[test]

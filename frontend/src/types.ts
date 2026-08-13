@@ -297,6 +297,10 @@ export interface IntraAnalysisSummary {
   matchedNotionalUsdt: number
   realizedPnlUsdt: number
   returnBps: number
+  fundingPnlUsdt: number
+  fundingReturnBps: number
+  grossPnlUsdt: number
+  grossReturnBps: number
   tradingFeeUsdt: number
   feeAfterPnlUsdt: number
   feeAfterReturnBps: number
@@ -340,6 +344,8 @@ export interface IntraSymbolAnalysis extends IntraAnalysisSummary {
 export interface IntraAnalysisPoint {
   ts: number
   realizedPnlUsdt: number
+  fundingPnlUsdt: number
+  grossPnlUsdt: number
   tradingFeeUsdt: number
   feeAfterPnlUsdt: number
   referenceTradingFeeUsdt: number
@@ -355,7 +361,7 @@ export interface IntraAnalysisPoint {
 export type IntraFeeMode = 'gross' | 'actual' | 'reference'
 
 export type IntraPnlSeriesKey =
-  | 'realizedPnlUsdt'
+  | 'grossPnlUsdt'
   | 'feeAfterPnlUsdt'
   | 'referenceFeeAfterPnlUsdt'
 
@@ -387,6 +393,8 @@ export interface IntraClosedMatch {
   entryExecutionPnlUsdt: number | null
   exitExecutionPnlUsdt: number | null
   executionPnlUsdt: number | null
+  fundingPnlUsdt: number
+  grossPnlUsdt: number
   feeNotionalUsdt: number
   tradingFeeUsdt: number
   referenceTradingFeeUsdt: number
@@ -407,6 +415,10 @@ export interface IntraAnalysisSource {
   windowFeeTradeRows: number
   convertedFeeTradeRows: number
   feeAllocation: string
+  loadedFundingRows: number
+  windowFundingRows: number
+  allocatedFundingRows: number
+  fundingAllocation: string
   returnedPoints: number
   returnedSymbolPoints: number
   returnedMatches: number

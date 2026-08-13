@@ -264,6 +264,18 @@
   transform: translateY(-1px);
 }
 
+.strategy-card__main {
+  min-width: 0;
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.strategy-card__main:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 4px;
+}
+
 .strategy-card__top,
 .strategy-card__footer {
   display: flex;
@@ -461,6 +473,34 @@
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.strategy-card__actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.strategy-card__analysis {
+  min-height: 32px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #b9d5ce;
+  border-radius: 5px;
+  color: var(--teal);
+  background: #f3faf8;
+  font-size: 11px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.strategy-card__analysis:hover,
+.strategy-card__analysis:focus-visible {
+  border-color: #76ad9f;
+  background: #eaf6f3;
 }
 
 .retired-notice {

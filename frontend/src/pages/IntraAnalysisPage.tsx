@@ -117,8 +117,8 @@ function valueClass(value: number) {
 }
 
 interface FeeResult {
-  realizedPnlUsdt: number
-  returnBps: number
+  grossPnlUsdt: number
+  grossReturnBps: number
   tradingFeeUsdt: number
   feeAfterPnlUsdt: number
   feeAfterReturnBps: number
@@ -130,13 +130,13 @@ interface FeeResult {
 function feeModePnl(row: FeeResult, mode: IntraFeeMode) {
   if (mode === 'actual') return row.feeAfterPnlUsdt
   if (mode === 'reference') return row.referenceFeeAfterPnlUsdt
-  return row.realizedPnlUsdt
+  return row.grossPnlUsdt
 }
 
 function feeModeReturnBps(row: FeeResult, mode: IntraFeeMode) {
   if (mode === 'actual') return row.feeAfterReturnBps
   if (mode === 'reference') return row.referenceFeeAfterReturnBps
-  return row.returnBps
+  return row.grossReturnBps
 }
 
 function feeModeImpact(row: FeeResult, mode: IntraFeeMode) {
@@ -154,7 +154,7 @@ function feeModeImpactLabel(mode: IntraFeeMode) {
 function matchFeeModePnl(row: IntraClosedMatch, mode: IntraFeeMode) {
   if (mode === 'actual') return row.feeAfterPnlUsdt
   if (mode === 'reference') return row.referenceFeeAfterPnlUsdt
-  return row.pnlUsdt
+  return row.grossPnlUsdt
 }
 
 function matchFeeModeImpact(row: IntraClosedMatch, mode: IntraFeeMode) {
@@ -261,6 +261,10 @@ function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraF
               ? `${bps(row.referenceFeeBps)} bps`
               : '未计 Fee'}
         </small>
+      </td>
+      <td className={valueClass(row.fundingPnlUsdt)}>
+        <strong>{money(row.fundingPnlUsdt, true)}</strong>
+        <small>{bps(row.fundingReturnBps, true)} bps</small>
       </td>
       <td className={valueClass(row.marketPnlUsdt)}>
         <strong>{money(row.marketPnlUsdt, true)}</strong>
@@ -593,7 +597,9 @@ export function IntraAnalysisPage() {
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
-            <span title="只统计 FIFO 已闭环数量；不包含 Funding 和利息">Closed FIFO only</span>
+            <span title="只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding，不包含利息">
+              Closed FIFO only
+            </span>
           </div>
         </div>
       </header>
@@ -696,7 +702,7 @@ export function IntraAnalysisPage() {
           <div>
             <Database size={16} />
             <span>口径</span>
-            <strong>只计 FIFO 已闭环数量</strong>
+            <strong>只计 FIFO 已闭环数量 · Funding 随闭环归属</strong>
           </div>
           <div>
             <Database size={16} />
@@ -735,7 +741,7 @@ export function IntraAnalysisPage() {
               </button>
             ))}
           </div>
-          <span>实际 Fee 按币种窗口有效费率分摊至闭环四腿本金</span>
+          <span>实际 Fee 按闭环四腿本金分摊；Funding 按事件时开放期货本金分配后，只释放闭环数量</span>
         </section>
 
         <section className="analysis-metrics" aria-label="组合 FIFO 汇总">
@@ -762,6 +768,13 @@ export function IntraAnalysisPage() {
                     : 'Fee excluded'
                 : '--'}
             </small>
+          </div>
+          <div className="analysis-metric">
+            <span>闭环 Funding</span>
+            <strong className={valueClass(summary?.fundingPnlUsdt ?? 0)}>
+              {summary ? money(summary.fundingPnlUsdt, true) : '--'}
+            </strong>
+            <small>{summary ? bps(summary.fundingReturnBps, true) : '--'} bps</small>
           </div>
           <div className="analysis-metric">
             <span>选币基差收益</span>
@@ -934,7 +947,12 @@ export function IntraAnalysisPage() {
               {analysis.source.sampled && <span>sampled</span>}
               <span>closed four-leg fee allocation</span>
               <span>{bps(analysis.summary.referenceFeeBps)} bps reference fee</span>
-              <span>funding / interest excluded</span>
+              <span>
+                {compactNumber(analysis.source.allocatedFundingRows)} /{' '}
+                {compactNumber(analysis.source.windowFundingRows)} funding events allocated
+              </span>
+              <span>funding on open lots, released by FIFO closed quantity</span>
+              <span>interest excluded</span>
             </div>
           )}
         </section>
@@ -956,6 +974,7 @@ export function IntraAnalysisPage() {
                   <th>闭环本金</th>
                   <th>{feeModeConfig.label}收益</th>
                   <th>Fee 影响</th>
+                  <th>闭环 Funding</th>
                   <th>选币基差</th>
                   <th>闭环两腿执行</th>
                   <th>闭环 k 覆盖</th>
@@ -966,7 +985,7 @@ export function IntraAnalysisPage() {
                   <SymbolRow key={row.symbol} row={row} feeMode={feeMode} />
                 ))}
                 {!loading && visibleSymbols.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={8}>暂无闭环数据</td></tr>
+                  <tr><td className="analysis-empty" colSpan={9}>暂无闭环数据</td></tr>
                 )}
               </tbody>
             </table>
@@ -996,6 +1015,7 @@ export function IntraAnalysisPage() {
                   <th>选币基差</th>
                   <th>开仓腿执行</th>
                   <th>平仓腿执行</th>
+                  <th>闭环 Funding</th>
                   <th>Fee 影响</th>
                   <th>{feeModeConfig.label}收益</th>
                 </tr>
@@ -1049,6 +1069,9 @@ export function IntraAnalysisPage() {
                     <td className={valueClass(row.exitExecutionPnlUsdt ?? 0)}>
                       <strong>{optionalMoney(row.exitExecutionPnlUsdt)}</strong>
                     </td>
+                    <td className={valueClass(row.fundingPnlUsdt)}>
+                      <strong>{money(row.fundingPnlUsdt, true)}</strong>
+                    </td>
                     <td className={valueClass(matchFeeModeImpact(row, feeMode))}>
                       <strong>{money(matchFeeModeImpact(row, feeMode), true)}</strong>
                     </td>
@@ -1059,7 +1082,7 @@ export function IntraAnalysisPage() {
                   </tr>
                 ))}
                 {!loading && analysis?.matches.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={13}>当前范围没有 FIFO 闭环</td></tr>
+                  <tr><td className="analysis-empty" colSpan={14}>当前范围没有 FIFO 闭环</td></tr>
                 )}
               </tbody>
             </table>

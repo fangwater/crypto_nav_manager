@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Clock3,
   Database,
+  FlaskConical,
   Gauge,
   GitCompareArrows,
   Percent,
@@ -44,6 +45,10 @@ const filters: Array<{ value: Filter; label: string }> = [
 ]
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1_000
+const analysisStrategySlugs = new Set([
+  'binance-intra-arb01',
+  'bybit-intra-arb01',
+])
 const syncTimeFormatter = new Intl.DateTimeFormat(undefined, {
   month: '2-digit',
   day: '2-digit',
@@ -415,98 +420,116 @@ export function IndexPage() {
                   ? (risk.riskLevel ?? 'live')
                   : (risk?.status ?? 'missing')
               return (
-                <Link
+                <article
                   className={
                     'strategy-card strategy-card--' + strategy.exchange
                   }
-                  to={'/strategies/' + strategy.slug}
                   key={strategy.slug}
                 >
-                  <div className="strategy-card__top">
-                    <span className="exchange-mark" aria-hidden="true">
-                      {exchangeMark(strategy.exchange)}
-                    </span>
-                    <span
-                      className={
-                        strategy.credentialsReady
-                          ? 'credential-state credential-state--ready'
-                          : 'credential-state credential-state--warning'
-                      }
-                    >
-                      <span className="status-dot" />
-                      {strategy.credentialsReady ? '凭证就绪' : '检查 env'}
-                    </span>
-                  </div>
-                  <div className="strategy-card__body">
-                    <span className="strategy-kind">
-                      {kindLabel(strategy.strategyKind)}
-                    </span>
-                    <h3>{strategy.displayName}</h3>
-                    <p>{modeLabel(strategy.accountMode)}</p>
-                    {usesUniMmr(strategy) && (
-                      <div className={'account-risk account-risk--' + riskTone}>
-                        <div>
-                          <span>UniMMR</span>
-                          <strong>{formatUniMmr(risk)}</strong>
-                        </div>
-                        <small>{riskStatusLabel(risk, strategy.host)}</small>
-                      </div>
-                    )}
-                    <div
-                      className={
-                        'history-sync history-sync--' +
-                        syncTone(syncStatus, nowMs)
-                      }
-                      title={syncStatusTitle(syncStatus)}
-                    >
-                      <div>
-                        <span>最近完整拉取</span>
-                        <strong>{syncTime(syncStatus)}</strong>
-                      </div>
-                      <small>
+                  <Link
+                    className="strategy-card__main"
+                    to={'/strategies/' + strategy.slug}
+                    aria-label={`查看 ${strategy.displayName} 策略净值`}
+                  >
+                    <div className="strategy-card__top">
+                      <span className="exchange-mark" aria-hidden="true">
+                        {exchangeMark(strategy.exchange)}
+                      </span>
+                      <span
+                        className={
+                          strategy.credentialsReady
+                            ? 'credential-state credential-state--ready'
+                            : 'credential-state credential-state--warning'
+                        }
+                      >
                         <span className="status-dot" />
-                        {syncStatusLabel(syncStatus, nowMs)}
-                      </small>
+                        {strategy.credentialsReady ? '凭证就绪' : '检查 env'}
+                      </span>
                     </div>
-                    {alignmentStatus && (
+                    <div className="strategy-card__body">
+                      <span className="strategy-kind">
+                        {kindLabel(strategy.strategyKind)}
+                      </span>
+                      <h3>{strategy.displayName}</h3>
+                      <p>{modeLabel(strategy.accountMode)}</p>
+                      {usesUniMmr(strategy) && (
+                        <div className={'account-risk account-risk--' + riskTone}>
+                          <div>
+                            <span>UniMMR</span>
+                            <strong>{formatUniMmr(risk)}</strong>
+                          </div>
+                          <small>{riskStatusLabel(risk, strategy.host)}</small>
+                        </div>
+                      )}
                       <div
                         className={
-                          'alignment-check alignment-check--' +
-                          alignmentTone(alignmentStatus)
+                          'history-sync history-sync--' +
+                          syncTone(syncStatus, nowMs)
                         }
-                        title={alignmentTitle(alignmentStatus)}
+                        title={syncStatusTitle(syncStatus)}
                       >
-                        <GitCompareArrows size={15} />
                         <div>
-                          <span>订单校对</span>
-                          <strong>{alignmentTime(alignmentStatus)}</strong>
-                          {alignmentStatus.state === 'running' && (
-                            <i
-                              aria-hidden="true"
-                              style={{
-                                width: alignmentStatus.progressPercent + '%',
-                              }}
-                            />
-                          )}
+                          <span>最近完整拉取</span>
+                          <strong>{syncTime(syncStatus)}</strong>
                         </div>
                         <small>
                           <span className="status-dot" />
-                          {alignmentLabel(alignmentStatus)}
+                          {syncStatusLabel(syncStatus, nowMs)}
                         </small>
                       </div>
-                    )}
-                  </div>
+                      {alignmentStatus && (
+                        <div
+                          className={
+                            'alignment-check alignment-check--' +
+                            alignmentTone(alignmentStatus)
+                          }
+                          title={alignmentTitle(alignmentStatus)}
+                        >
+                          <GitCompareArrows size={15} />
+                          <div>
+                            <span>订单校对</span>
+                            <strong>{alignmentTime(alignmentStatus)}</strong>
+                            {alignmentStatus.state === 'running' && (
+                              <i
+                                aria-hidden="true"
+                                style={{
+                                  width: alignmentStatus.progressPercent + '%',
+                                }}
+                              />
+                            )}
+                          </div>
+                          <small>
+                            <span className="status-dot" />
+                            {alignmentLabel(alignmentStatus)}
+                          </small>
+                        </div>
+                      )}
+                    </div>
+                  </Link>
                   <div className="strategy-card__footer">
                     <code title={strategy.envPath}>{strategy.envPath}</code>
-                    <span
-                      className="icon-button"
-                      title="进入盘子"
-                      aria-label="进入盘子"
-                    >
-                      <ArrowRight size={17} />
-                    </span>
+                    <div className="strategy-card__actions">
+                      {analysisStrategySlugs.has(strategy.slug) && (
+                        <Link
+                          className="strategy-card__analysis"
+                          to={'/analysis/' + strategy.slug}
+                          title="查看组合 FIFO 分析"
+                        >
+                          <FlaskConical size={14} />
+                          <span>组合分析</span>
+                        </Link>
+                      )}
+                      <Link
+                        className="icon-button"
+                        to={'/strategies/' + strategy.slug}
+                        title="进入策略净值"
+                        aria-label={`进入 ${strategy.displayName} 策略净值`}
+                      >
+                        <ArrowRight size={17} />
+                      </Link>
+                    </div>
                   </div>
-                </Link>
+                </article>
               )
             })}
           </div>
