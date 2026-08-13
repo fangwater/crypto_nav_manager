@@ -3,7 +3,8 @@ use crate::{
     binance_premium_index, bybit_premium_index, contract_multipliers,
     fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
     intra_analysis::{
-        self, ArbDirection, IntraAnalysisOrder, IntraAnalysisRequest, PremiumIndexCandle,
+        self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisOrder, IntraAnalysisRequest,
+        PremiumIndexCandle,
     },
     live_history,
     mark_prices::MarkPriceCache,
@@ -157,6 +158,14 @@ struct IntraAnalysisOrderRecord {
     premium_high_rate: Option<f64>,
     premium_low_rate: Option<f64>,
     premium_close_rate: Option<f64>,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraAnalysisFeeRecord {
+    symbol: String,
+    ts: i64,
+    notional_usdt: f64,
+    fee_usdt: Option<f64>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -414,6 +423,7 @@ struct IntraAnalysisQuery {
     start_ms: Option<i64>,
     end_ms: Option<i64>,
     symbols: Option<String>,
+    reference_fee_bps: Option<f64>,
     max_points: Option<usize>,
     max_matches: Option<usize>,
 }
@@ -905,6 +915,16 @@ async fn get_intra_analysis(
         )
             .into_response());
     }
+    let reference_fee_bps = query.reference_fee_bps.unwrap_or(1.0);
+    if !reference_fee_bps.is_finite() || reference_fee_bps.abs() > 100.0 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "referenceFeeBps must be between -100 and 100",
+            }),
+        )
+            .into_response());
+    }
     if !valid_schema(&strategy.db_schema) {
         return Err(anyhow::anyhow!("invalid strategy schema: {}", strategy.db_schema).into());
     }
@@ -991,6 +1011,35 @@ async fn get_intra_analysis(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let fee_sql = format!(
+        r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
+                  COALESCE(quote_quantity,price * quantity)::float8 AS notional_usdt,
+                  CASE
+                    WHEN upper(COALESCE(fee_asset,'')) IN ('USD','USDC','USDT')
+                      THEN fee_amount::float8
+                    WHEN upper(COALESCE(fee_asset,'')) =
+                         regexp_replace(upper(symbol),'(?:USDT|USDC|USD)$','')
+                      THEN (fee_amount * price)::float8
+                    ELSE fee_usdt::float8
+                  END AS fee_usdt
+           FROM {}.trades
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms,symbol,trade_id"#,
+        strategy.db_schema
+    );
+    let fee_events = sqlx::query_as::<_, IntraAnalysisFeeRecord>(sqlx::AssertSqlSafe(fee_sql))
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_all(&state.pool)
+        .await?
+        .into_iter()
+        .map(|row| IntraAnalysisFeeEvent {
+            symbol: row.symbol,
+            ts: row.ts,
+            notional_usdt: row.notional_usdt,
+            fee_usdt: row.fee_usdt,
+        })
+        .collect::<Vec<_>>();
     let selected_symbols = query
         .symbols
         .unwrap_or_default()
@@ -1011,13 +1060,15 @@ async fn get_intra_analysis(
         start_ms,
         end_ms,
         selected_symbols,
+        reference_fee_bps,
         max_points: query.max_points.unwrap_or(3_000).clamp(200, 10_000),
         max_matches: query.max_matches.unwrap_or(200).clamp(20, 500),
     };
-    let response =
-        tokio::task::spawn_blocking(move || intra_analysis::calculate(orders, calculation))
-            .await
-            .context("join intra combination FIFO calculation")??;
+    let response = tokio::task::spawn_blocking(move || {
+        intra_analysis::calculate_with_fees(orders, fee_events, calculation)
+    })
+    .await
+    .context("join intra combination FIFO calculation")??;
     Ok(Json(response).into_response())
 }
 

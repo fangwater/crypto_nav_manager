@@ -4098,6 +4098,7 @@
 
 .analysis-shell {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
 }
 
@@ -4132,6 +4133,55 @@
   display: flex;
   align-items: flex-end;
   gap: 12px;
+}
+
+.analysis-reference-fee {
+  display: flex;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.analysis-reference-fee label {
+  display: grid;
+  gap: 3px;
+}
+
+.analysis-reference-fee label span {
+  color: var(--subtle);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.analysis-reference-fee input {
+  width: 92px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--ink);
+  background: var(--surface);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-reference-fee button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid #b9d2cb;
+  border-radius: 5px;
+  color: #176b5b;
+  background: #edf7f4;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.analysis-reference-fee button:disabled {
+  border-color: var(--line);
+  color: var(--subtle);
+  background: #eef0f3;
+  cursor: default;
 }
 
 .analysis-symbol-select {
@@ -4207,10 +4257,11 @@
 
 .analysis-metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.55);
+  background: var(--line-soft);
 }
 
 .analysis-metric {
@@ -4220,10 +4271,11 @@
   display: grid;
   align-content: center;
   gap: 5px;
+  background: rgba(255, 255, 255, 0.96);
 }
 
 .analysis-metric + .analysis-metric {
-  border-left: 1px solid var(--line-soft);
+  border-left: 0;
 }
 
 .analysis-metric span {
@@ -4255,6 +4307,7 @@
 
 .analysis-chart-panel {
   margin-top: 0;
+  min-width: 0;
 }
 
 .analysis-chart-stage {
@@ -4507,7 +4560,7 @@
 
 .analysis-table {
   width: 100%;
-  min-width: 1380px;
+  min-width: 1720px;
   border-collapse: collapse;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -4597,16 +4650,8 @@
 }
 
 @media (max-width: 1180px) {
-  .analysis-metrics {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .analysis-metric:nth-child(4) {
-    border-left: 0;
-  }
-
-  .analysis-metric:nth-child(n + 4) {
-    border-top: 1px solid var(--line-soft);
+  .analysis-toolbar__right {
+    flex-wrap: wrap;
   }
 }
 
@@ -4702,6 +4747,15 @@
     gap: 12px;
   }
 
+  .analysis-reference-fee {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .analysis-reference-fee input {
+    width: 100%;
+  }
+
   .analysis-symbol-select select,
   .analysis-toolbar .segmented--compact {
     width: 100%;
@@ -4747,14 +4801,6 @@
     min-height: 82px;
     border-top: 0;
     border-left: 0;
-  }
-
-  .analysis-metric:nth-child(even) {
-    border-left: 1px solid var(--line-soft);
-  }
-
-  .analysis-metric:nth-child(n + 3) {
-    border-top: 1px solid var(--line-soft);
   }
 
   .analysis-metric--primary strong {

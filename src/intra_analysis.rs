@@ -42,6 +42,15 @@ pub struct IntraAnalysisOrder {
     pub premium: Option<PremiumIndexCandle>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IntraAnalysisFeeEvent {
+    pub symbol: String,
+    pub ts: i64,
+    pub notional_usdt: f64,
+    /// Positive values are costs and negative values are rebates.
+    pub fee_usdt: Option<f64>,
+}
+
 impl IntraAnalysisOrder {
     fn basis(&self) -> f64 {
         self.futures_price - self.spot_price
@@ -85,6 +94,7 @@ pub struct IntraAnalysisRequest {
     pub start_ms: i64,
     pub end_ms: i64,
     pub selected_symbols: Vec<String>,
+    pub reference_fee_bps: f64,
     pub max_points: usize,
     pub max_matches: usize,
 }
@@ -121,6 +131,17 @@ pub struct IntraAnalysisSummary {
     pub matched_notional_usdt: f64,
     pub realized_pnl_usdt: f64,
     pub return_bps: f64,
+    pub trading_fee_usdt: f64,
+    pub fee_after_pnl_usdt: f64,
+    pub fee_after_return_bps: f64,
+    pub reference_fee_bps: f64,
+    pub reference_trading_fee_usdt: f64,
+    pub reference_fee_after_pnl_usdt: f64,
+    pub reference_fee_after_return_bps: f64,
+    pub fee_trade_count: u64,
+    pub fee_trade_notional_usdt: f64,
+    pub converted_fee_trade_count: u64,
+    pub actual_fee_coverage: f64,
     pub decomposed_match_count: u64,
     pub premium_coverage: f64,
     pub decomposed_notional_usdt: f64,
@@ -159,6 +180,10 @@ pub struct IntraSymbolAnalysis {
 pub struct IntraAnalysisPoint {
     pub ts: i64,
     pub realized_pnl_usdt: f64,
+    pub trading_fee_usdt: f64,
+    pub fee_after_pnl_usdt: f64,
+    pub reference_trading_fee_usdt: f64,
+    pub reference_fee_after_pnl_usdt: f64,
     pub market_pnl_usdt: f64,
     pub execution_pnl_usdt: f64,
     pub execution_capture_usdt: f64,
@@ -212,12 +237,57 @@ pub struct IntraAnalysisSource {
     pub premium_rate_field: &'static str,
     pub loaded_mt_rows: usize,
     pub window_mt_rows: usize,
+    pub loaded_fee_trade_rows: usize,
+    pub window_fee_trade_rows: usize,
+    pub converted_fee_trade_rows: usize,
     pub returned_points: usize,
     pub returned_symbol_points: usize,
     pub returned_matches: usize,
     pub sampled: bool,
     pub fees_included: bool,
     pub funding_included: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FeeAccumulator {
+    trade_count: u64,
+    converted_trade_count: u64,
+    trade_notional_usdt: f64,
+    converted_notional_usdt: f64,
+    trading_fee_usdt: f64,
+    reference_trading_fee_usdt: f64,
+}
+
+impl FeeAccumulator {
+    fn record(&mut self, event: &IntraAnalysisFeeEvent, reference_fee_bps: f64) {
+        self.trade_count += 1;
+        self.trade_notional_usdt += event.notional_usdt;
+        self.reference_trading_fee_usdt += event.notional_usdt * reference_fee_bps / 10_000.0;
+        if let Some(fee_usdt) = event.fee_usdt {
+            self.converted_trade_count += 1;
+            self.converted_notional_usdt += event.notional_usdt;
+            self.trading_fee_usdt += fee_usdt;
+        }
+    }
+
+    fn apply_to_summary(self, summary: &mut IntraAnalysisSummary, reference_fee_bps: f64) {
+        summary.trading_fee_usdt = clean_zero(self.trading_fee_usdt);
+        summary.fee_after_pnl_usdt = clean_zero(summary.realized_pnl_usdt - self.trading_fee_usdt);
+        summary.fee_after_return_bps =
+            ratio(summary.fee_after_pnl_usdt, summary.matched_notional_usdt) * 10_000.0;
+        summary.reference_fee_bps = reference_fee_bps;
+        summary.reference_trading_fee_usdt = clean_zero(self.reference_trading_fee_usdt);
+        summary.reference_fee_after_pnl_usdt =
+            clean_zero(summary.realized_pnl_usdt - self.reference_trading_fee_usdt);
+        summary.reference_fee_after_return_bps = ratio(
+            summary.reference_fee_after_pnl_usdt,
+            summary.matched_notional_usdt,
+        ) * 10_000.0;
+        summary.fee_trade_count = self.trade_count;
+        summary.fee_trade_notional_usdt = clean_zero(self.trade_notional_usdt);
+        summary.converted_fee_trade_count = self.converted_trade_count;
+        summary.actual_fee_coverage = ratio(self.converted_notional_usdt, self.trade_notional_usdt);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +472,7 @@ impl SummaryAccumulator {
                 open.reverse_basis_notional_bps,
                 open.reverse_notional_usdt,
             ),
+            ..IntraAnalysisSummary::default()
         }
     }
 }
@@ -451,7 +522,15 @@ impl OpenSummary {
 }
 
 pub fn calculate(
+    orders: Vec<IntraAnalysisOrder>,
+    request: IntraAnalysisRequest,
+) -> Result<IntraAnalysisResponse> {
+    calculate_with_fees(orders, Vec::new(), request)
+}
+
+pub fn calculate_with_fees(
     mut orders: Vec<IntraAnalysisOrder>,
+    mut fee_events: Vec<IntraAnalysisFeeEvent>,
     request: IntraAnalysisRequest,
 ) -> Result<IntraAnalysisResponse> {
     if request.start_ms < request.strategy_start_ms {
@@ -459,6 +538,9 @@ pub fn calculate(
     }
     if request.end_ms < request.start_ms {
         bail!("end_ms must be greater than or equal to start_ms");
+    }
+    if !request.reference_fee_bps.is_finite() || request.reference_fee_bps.abs() > 100.0 {
+        bail!("reference_fee_bps must be finite and between -100 and 100");
     }
     for order in &mut orders {
         order.symbol = order.symbol.to_ascii_uppercase();
@@ -469,8 +551,18 @@ pub fn calculate(
             .cmp(&right.completed_at_ms)
             .then_with(|| left.fkey.cmp(&right.fkey))
     });
+    for event in &mut fee_events {
+        event.symbol = event.symbol.to_ascii_uppercase();
+        validate_fee_event(event)?;
+    }
+    fee_events.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
 
     let loaded_mt_rows = orders.len();
+    let loaded_fee_trade_rows = fee_events.len();
     let available_symbols = orders
         .iter()
         .map(|order| order.symbol.clone())
@@ -479,6 +571,12 @@ pub fn calculate(
         .collect::<Vec<_>>();
     let selected_symbols = selected_symbols(&available_symbols, request.selected_symbols)?;
     let selected = selected_symbols.iter().cloned().collect::<HashSet<_>>();
+    let mut aggregate_fees = FeeAccumulator::default();
+    let mut symbol_fees = available_symbols
+        .iter()
+        .cloned()
+        .map(|symbol| (symbol, FeeAccumulator::default()))
+        .collect::<HashMap<_, _>>();
     let mut states = available_symbols
         .iter()
         .cloned()
@@ -555,6 +653,7 @@ pub fn calculate(
                         matched_notional_usdt: clean_zero(point_notional),
                         closed_match_count: point_matches,
                         decomposed_match_count: point_decomposed_matches,
+                        ..IntraAnalysisPoint::default()
                     },
                 );
             }
@@ -660,6 +759,7 @@ pub fn calculate(
                             matched_notional_usdt: clean_zero(point_notional),
                             closed_match_count: point_matches,
                             decomposed_match_count: point_decomposed_matches,
+                            ..IntraAnalysisPoint::default()
                         },
                     );
                     if request.max_matches > 0 {
@@ -693,29 +793,40 @@ pub fn calculate(
         }
     }
 
-    push_or_replace_point(
+    let mut window_fee_trade_rows = 0_usize;
+    let mut converted_fee_trade_rows = 0_usize;
+    for event in fee_events
+        .iter()
+        .filter(|event| event.ts >= request.start_ms && event.ts <= request.end_ms)
+    {
+        symbol_fees
+            .entry(event.symbol.clone())
+            .or_default()
+            .record(event, request.reference_fee_bps);
+        if selected.contains(&event.symbol) {
+            window_fee_trade_rows += 1;
+            converted_fee_trade_rows += usize::from(event.fee_usdt.is_some());
+            aggregate_fees.record(event, request.reference_fee_bps);
+        }
+    }
+
+    apply_fee_series(
         &mut points,
-        IntraAnalysisPoint {
-            ts: request.end_ms,
-            realized_pnl_usdt: clean_zero(point_pnl),
-            market_pnl_usdt: clean_zero(point_market_pnl),
-            execution_pnl_usdt: clean_zero(point_execution_pnl),
-            execution_capture_usdt: clean_zero(point_execution_capture),
-            matched_notional_usdt: clean_zero(point_notional),
-            closed_match_count: point_matches,
-            decomposed_match_count: point_decomposed_matches,
-        },
+        &mut symbol_points,
+        &fee_events,
+        &selected,
+        request.start_ms,
+        request.end_ms,
+        request.reference_fee_bps,
     );
+
+    ensure_final_point(&mut points, request.end_ms);
     for symbol in &selected_symbols {
-        let mut final_point = *symbol_point_totals
-            .get(symbol)
-            .expect("selected symbols have point totals");
-        final_point.ts = request.end_ms;
-        push_or_replace_point(
+        ensure_final_point(
             symbol_points
                 .get_mut(symbol)
                 .expect("selected symbols have point series"),
-            final_point,
+            request.end_ms,
         );
     }
 
@@ -732,9 +843,15 @@ pub fn calculate(
                 aggregate_stats.add(state.stats);
                 aggregate_open.add(open);
             }
+            let mut summary = state.stats.finish(open);
+            symbol_fees
+                .get(symbol)
+                .copied()
+                .unwrap_or_default()
+                .apply_to_summary(&mut summary, request.reference_fee_bps);
             IntraSymbolAnalysis {
                 symbol: symbol.clone(),
-                summary: state.stats.finish(open),
+                summary,
             }
         })
         .collect::<Vec<_>>();
@@ -774,14 +891,19 @@ pub fn calculate(
         premium_rate_field: "close",
         loaded_mt_rows,
         window_mt_rows,
+        loaded_fee_trade_rows,
+        window_fee_trade_rows,
+        converted_fee_trade_rows,
         returned_points: points.len(),
         returned_symbol_points,
         returned_matches: matches.len(),
         sampled: points.len() < original_point_count || sampled_symbol_points,
-        fees_included: false,
+        fees_included: true,
         funding_included: false,
     };
 
+    let mut summary = aggregate_stats.finish(aggregate_open);
+    aggregate_fees.apply_to_summary(&mut summary, request.reference_fee_bps);
     Ok(IntraAnalysisResponse {
         strategy_slug: request.strategy_slug,
         display_name: request.display_name,
@@ -790,7 +912,7 @@ pub fn calculate(
         end_ms: request.end_ms,
         selected_symbols,
         available_symbols,
-        summary: aggregate_stats.finish(aggregate_open),
+        summary,
         symbols,
         points,
         symbol_points,
@@ -859,6 +981,111 @@ fn validate_order(order: &IntraAnalysisOrder) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_fee_event(event: &IntraAnalysisFeeEvent) -> Result<()> {
+    if event.symbol.trim().is_empty() {
+        bail!("intra analysis fee event has an empty symbol");
+    }
+    if event.ts <= 0 {
+        bail!(
+            "intra analysis fee event has invalid timestamp: {}",
+            event.ts
+        );
+    }
+    if !event.notional_usdt.is_finite() || event.notional_usdt <= 0.0 {
+        bail!(
+            "intra analysis fee event has invalid notional: {}",
+            event.notional_usdt
+        );
+    }
+    if event.fee_usdt.is_some_and(|fee| !fee.is_finite()) {
+        bail!("intra analysis fee event has a non-finite fee");
+    }
+    Ok(())
+}
+
+fn apply_fee_series(
+    portfolio_points: &mut Vec<IntraAnalysisPoint>,
+    symbol_points: &mut HashMap<String, Vec<IntraAnalysisPoint>>,
+    fee_events: &[IntraAnalysisFeeEvent],
+    selected: &HashSet<String>,
+    start_ms: i64,
+    end_ms: i64,
+    reference_fee_bps: f64,
+) {
+    let filtered = fee_events
+        .iter()
+        .filter(|event| {
+            event.ts >= start_ms && event.ts <= end_ms && selected.contains(&event.symbol)
+        })
+        .collect::<Vec<_>>();
+    for event in &filtered {
+        insert_timeline_point(portfolio_points, event.ts);
+        if let Some(points) = symbol_points.get_mut(&event.symbol) {
+            insert_timeline_point(points, event.ts);
+        }
+    }
+    overlay_fee_values(
+        portfolio_points,
+        filtered.iter().copied(),
+        reference_fee_bps,
+    );
+    for (symbol, points) in symbol_points {
+        overlay_fee_values(
+            points,
+            filtered
+                .iter()
+                .copied()
+                .filter(|event| &event.symbol == symbol),
+            reference_fee_bps,
+        );
+    }
+}
+
+fn insert_timeline_point(points: &mut Vec<IntraAnalysisPoint>, ts: i64) {
+    let index = points.partition_point(|point| point.ts < ts);
+    if points.get(index).is_some_and(|point| point.ts == ts) {
+        return;
+    }
+    let mut point = if index == 0 {
+        IntraAnalysisPoint::default()
+    } else {
+        points[index - 1]
+    };
+    point.ts = ts;
+    points.insert(index, point);
+}
+
+fn overlay_fee_values<'a>(
+    points: &mut [IntraAnalysisPoint],
+    events: impl IntoIterator<Item = &'a IntraAnalysisFeeEvent>,
+    reference_fee_bps: f64,
+) {
+    let mut events = events.into_iter().peekable();
+    let mut fees = FeeAccumulator::default();
+    for point in points {
+        while events.peek().is_some_and(|event| event.ts <= point.ts) {
+            fees.record(
+                events.next().expect("peeked fee event exists"),
+                reference_fee_bps,
+            );
+        }
+        point.trading_fee_usdt = clean_zero(fees.trading_fee_usdt);
+        point.reference_trading_fee_usdt = clean_zero(fees.reference_trading_fee_usdt);
+        point.fee_after_pnl_usdt = clean_zero(point.realized_pnl_usdt - point.trading_fee_usdt);
+        point.reference_fee_after_pnl_usdt =
+            clean_zero(point.realized_pnl_usdt - point.reference_trading_fee_usdt);
+    }
+}
+
+fn ensure_final_point(points: &mut Vec<IntraAnalysisPoint>, end_ms: i64) {
+    if points.last().is_some_and(|point| point.ts == end_ms) {
+        return;
+    }
+    let mut point = points.last().copied().unwrap_or_default();
+    point.ts = end_ms;
+    push_or_replace_point(points, point);
 }
 
 fn push_or_replace_point(points: &mut Vec<IntraAnalysisPoint>, point: IntraAnalysisPoint) {
@@ -945,8 +1172,23 @@ mod tests {
             start_ms,
             end_ms,
             selected_symbols: Vec::new(),
+            reference_fee_bps: 1.0,
             max_points: 1_000,
             max_matches: 200,
+        }
+    }
+
+    fn fee_event(
+        symbol: &str,
+        ts: i64,
+        notional_usdt: f64,
+        fee_usdt: Option<f64>,
+    ) -> IntraAnalysisFeeEvent {
+        IntraAnalysisFeeEvent {
+            symbol: symbol.to_string(),
+            ts,
+            notional_usdt,
+            fee_usdt,
         }
     }
 
@@ -988,6 +1230,62 @@ mod tests {
         assert_eq!(response.matches[0].open_direction, ArbDirection::Positive);
         assert_close(response.matches[0].entry_basis_bps, 1_000.0);
         assert_close(response.matches[0].exit_basis_bps, 3.0 / 105.0 * 10_000.0);
+    }
+
+    #[test]
+    fn overlays_actual_and_reference_fee_cashflows_on_fifo_gross_pnl() {
+        let response = calculate_with_fees(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 2.0),
+                order(2, ArbDirection::Reverse, 1_300, 105.0, 108.0, 2.0),
+            ],
+            vec![
+                fee_event("btcusdt", 1_150, 200.0, Some(0.20)),
+                fee_event("BTCUSDT", 1_250, 210.0, Some(-0.05)),
+                fee_event("BTCUSDT", 1_350, 50.0, None),
+            ],
+            request(1_000, 1_400),
+        )
+        .unwrap();
+
+        assert_close(response.summary.realized_pnl_usdt, 14.0);
+        assert_close(response.summary.trading_fee_usdt, 0.15);
+        assert_close(response.summary.fee_after_pnl_usdt, 13.85);
+        assert_close(response.summary.reference_trading_fee_usdt, 0.046);
+        assert_close(response.summary.reference_fee_after_pnl_usdt, 13.954);
+        assert_eq!(response.summary.fee_trade_count, 3);
+        assert_eq!(response.summary.converted_fee_trade_count, 2);
+        assert_close(response.summary.actual_fee_coverage, 410.0 / 460.0);
+        assert_eq!(response.source.window_fee_trade_rows, 3);
+        assert_eq!(response.source.converted_fee_trade_rows, 2);
+        let at_fee = response
+            .points
+            .iter()
+            .find(|point| point.ts == 1_250)
+            .unwrap();
+        assert_close(at_fee.trading_fee_usdt, 0.15);
+        assert_close(at_fee.fee_after_pnl_usdt, -0.15);
+        let final_point = response.points.last().unwrap();
+        assert_close(final_point.fee_after_pnl_usdt, 13.85);
+        assert_close(final_point.reference_fee_after_pnl_usdt, 13.954);
+    }
+
+    #[test]
+    fn fee_series_preserves_negative_cumulative_rebates() {
+        let response = calculate_with_fees(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Reverse, 1_300, 100.0, 105.0, 1.0),
+            ],
+            vec![fee_event("BTCUSDT", 1_200, 100.0, Some(-0.25))],
+            request(1_000, 1_400),
+        )
+        .unwrap();
+
+        assert_close(response.summary.trading_fee_usdt, -0.25);
+        assert_close(response.summary.fee_after_pnl_usdt, 5.25);
+        assert_close(response.points.last().unwrap().trading_fee_usdt, -0.25);
+        assert_close(response.points.last().unwrap().fee_after_pnl_usdt, 5.25);
     }
 
     #[test]
@@ -1153,6 +1451,41 @@ mod tests {
                 .realized_pnl_usdt,
             5.0,
         );
+    }
+
+    #[test]
+    fn unselected_symbol_retains_its_fee_breakdown() {
+        let mut eth_open = order(3, ArbDirection::Positive, 1_100, 100.0, 120.0, 1.0);
+        eth_open.symbol = "ETHUSDT".to_string();
+        let mut eth_close = order(4, ArbDirection::Reverse, 1_200, 100.0, 100.0, 1.0);
+        eth_close.symbol = "ETHUSDT".to_string();
+        let mut calculation = request(1_000, 1_300);
+        calculation.selected_symbols = vec!["BTCUSDT".to_string()];
+
+        let response = calculate_with_fees(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Reverse, 1_200, 100.0, 105.0, 1.0),
+                eth_open,
+                eth_close,
+            ],
+            vec![
+                fee_event("BTCUSDT", 1_150, 100.0, Some(0.1)),
+                fee_event("ETHUSDT", 1_150, 200.0, Some(0.3)),
+            ],
+            calculation,
+        )
+        .unwrap();
+
+        assert_close(response.summary.trading_fee_usdt, 0.1);
+        assert_eq!(response.source.window_fee_trade_rows, 1);
+        let eth = response
+            .symbols
+            .iter()
+            .find(|row| row.symbol == "ETHUSDT")
+            .unwrap();
+        assert_close(eth.summary.trading_fee_usdt, 0.3);
+        assert_close(eth.summary.reference_trading_fee_usdt, 0.02);
     }
 
     #[test]

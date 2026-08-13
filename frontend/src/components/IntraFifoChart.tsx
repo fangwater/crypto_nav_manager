@@ -83,7 +83,7 @@ export function IntraFifoChart({
         })
       : [
           {
-            name: '实际成交',
+            name: 'Fee 前收益',
             type: 'line' as const,
             data: points.map((point) => [point.ts, point.realizedPnlUsdt]),
             showSymbol: false,
@@ -92,6 +92,39 @@ export function IntraFifoChart({
             lineStyle: { width: 2.2, color: '#176b5b' },
             itemStyle: { color: '#176b5b' },
             areaStyle: { color: 'rgba(23, 107, 91, 0.06)', origin: 0 },
+            emphasis: { focus: 'series' as const },
+          },
+          {
+            name: '累计实际 Fee 影响',
+            type: 'line' as const,
+            data: points.map((point) => [point.ts, -point.tradingFeeUsdt]),
+            showSymbol: false,
+            sampling: 'lttb' as const,
+            connectNulls: true,
+            lineStyle: { width: 1.45, color: '#b5473c', type: 'dashed' as const },
+            itemStyle: { color: '#b5473c' },
+            emphasis: { focus: 'series' as const },
+          },
+          {
+            name: '实际 Fee 后收益',
+            type: 'line' as const,
+            data: points.map((point) => [point.ts, point.feeAfterPnlUsdt]),
+            showSymbol: false,
+            sampling: 'lttb' as const,
+            connectNulls: true,
+            lineStyle: { width: 2, color: '#087f8c' },
+            itemStyle: { color: '#087f8c' },
+            emphasis: { focus: 'series' as const },
+          },
+          {
+            name: '参考 Fee 后收益',
+            type: 'line' as const,
+            data: points.map((point) => [point.ts, point.referenceFeeAfterPnlUsdt]),
+            showSymbol: false,
+            sampling: 'lttb' as const,
+            connectNulls: true,
+            lineStyle: { width: 1.65, color: '#6c6f2d', type: 'dotted' as const },
+            itemStyle: { color: '#6c6f2d' },
             emphasis: { focus: 'series' as const },
           },
           {
@@ -142,7 +175,15 @@ export function IntraFifoChart({
           itemWidth: 20,
           itemHeight: 3,
           textStyle: { color: '#596273', fontSize: 10 },
-          data: ['实际成交', '选币基差', '闭环执行', '窗口 MT 执行'],
+          data: [
+            'Fee 前收益',
+            '累计实际 Fee 影响',
+            '实际 Fee 后收益',
+            '参考 Fee 后收益',
+            '选币基差',
+            '闭环执行',
+            '窗口 MT 执行',
+          ],
         },
         tooltip: {
           trigger: 'axis',
@@ -222,7 +263,7 @@ export function IntraFifoChart({
       className="analysis-chart"
       aria-label={
         mode === 'portfolio'
-          ? '正反套 FIFO 选币基差收益、闭环执行收益与 MT 时点执行捕捉累计曲线'
+          ? '正反套 FIFO Fee 前、实际 Fee 影响、实际 Fee 后、参考 Fee 后与执行累计曲线'
           : `各币 ${intraAnalysisMetricLabel(metric)}累计曲线`
       }
     />

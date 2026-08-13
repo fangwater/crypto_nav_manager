@@ -4,7 +4,7 @@ export const intraAnalysisMetricOptions: ReadonlyArray<{
   key: IntraAnalysisSeriesKey
   label: string
 }> = [
-  { key: 'realizedPnlUsdt', label: '实际成交' },
+  { key: 'realizedPnlUsdt', label: 'Fee 前收益' },
   { key: 'marketPnlUsdt', label: '选币基差' },
   { key: 'executionPnlUsdt', label: '闭环执行' },
   { key: 'executionCaptureUsdt', label: '窗口 MT 执行' },

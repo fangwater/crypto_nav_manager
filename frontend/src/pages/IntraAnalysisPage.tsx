@@ -200,6 +200,18 @@ function SymbolRow({ row }: { row: IntraSymbolAnalysis }) {
         <strong>{money(row.realizedPnlUsdt, true)}</strong>
         <small>{bps(row.returnBps, true)} bps</small>
       </td>
+      <td className={valueClass(-row.tradingFeeUsdt)}>
+        <strong>{money(-row.tradingFeeUsdt, true)}</strong>
+        <small>{percentage(row.actualFeeCoverage)} covered</small>
+      </td>
+      <td className={valueClass(row.feeAfterPnlUsdt)}>
+        <strong>{money(row.feeAfterPnlUsdt, true)}</strong>
+        <small>{bps(row.feeAfterReturnBps, true)} bps</small>
+      </td>
+      <td className={valueClass(row.referenceFeeAfterPnlUsdt)}>
+        <strong>{money(row.referenceFeeAfterPnlUsdt, true)}</strong>
+        <small>{bps(row.referenceFeeAfterReturnBps, true)} bps</small>
+      </td>
       <td className={valueClass(row.marketPnlUsdt)}>
         <strong>{money(row.marketPnlUsdt, true)}</strong>
         <small>{bps(row.marketReturnBps, true)} bps</small>
@@ -240,6 +252,8 @@ export function IntraAnalysisPage() {
   const [endInput, setEndInput] = useState('')
   const [startMs, setStartMs] = useState<number | null>(null)
   const [endMs, setEndMs] = useState<number | null>(null)
+  const [referenceFeeInput, setReferenceFeeInput] = useState('1')
+  const [referenceFeeBps, setReferenceFeeBps] = useState(1)
   const [symbol, setSymbol] = useState('')
   const [chartMode, setChartMode] = useState<IntraFifoChartMode>('portfolio')
   const [chartMetric, setChartMetric] =
@@ -255,6 +269,8 @@ export function IntraAnalysisPage() {
     setStrategy(null)
     setAnalysis(null)
     setSymbol('')
+    setReferenceFeeInput('1')
+    setReferenceFeeBps(1)
     setPageError(null)
     setLoading(true)
     getStrategy(slug)
@@ -286,6 +302,7 @@ export function IntraAnalysisPage() {
       startMs,
       endMs,
       symbols: symbol ? [symbol] : undefined,
+      referenceFeeBps,
       maxPoints: 3500,
       maxMatches: 200,
       signal: controller.signal,
@@ -299,7 +316,7 @@ export function IntraAnalysisPage() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [strategy, startMs, endMs, symbol])
+  }, [strategy, startMs, endMs, symbol, referenceFeeBps])
 
   const visibleSymbols = useMemo(() => {
     if (!analysis) return []
@@ -405,6 +422,20 @@ export function IntraAnalysisPage() {
     setEndMs(nextEnd)
   }
 
+  function applyReferenceFee() {
+    const nextReferenceFeeBps = Number(referenceFeeInput)
+    if (
+      referenceFeeInput.trim() === '' ||
+      !Number.isFinite(nextReferenceFeeBps) ||
+      Math.abs(nextReferenceFeeBps) > 100
+    ) {
+      setPageError('参考 Fee 必须在 -100 至 100 bps 之间')
+      return
+    }
+    setPageError(null)
+    setReferenceFeeBps(nextReferenceFeeBps)
+  }
+
   function selectChartSymbols(selection: Exclude<ChartSymbolSelection, 'custom'>) {
     setChartSymbolSelection(selection)
   }
@@ -465,7 +496,7 @@ export function IntraAnalysisPage() {
   const summary = analysis?.summary
   const chartTotal = summary
     ? chartMode === 'portfolio'
-      ? summary.realizedPnlUsdt
+      ? summary.feeAfterPnlUsdt
       : visibleChartSymbolPoints.reduce(
           (total, series) => total + (series.points.at(-1)?.[chartMetric] ?? 0),
           0,
@@ -503,7 +534,7 @@ export function IntraAnalysisPage() {
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
-            <span title="不包含手续费、Funding 和利息">Gross only</span>
+            <span title="包含实际与参考 Fee；不包含 Funding 和利息">Fee included</span>
           </div>
         </div>
       </header>
@@ -538,6 +569,33 @@ export function IntraAnalysisPage() {
             </button>
           </div>
           <div className="analysis-toolbar__right">
+            <div className="analysis-reference-fee">
+              <label>
+                <span>参考 Fee (bps)</span>
+                <input
+                  type="number"
+                  min="-100"
+                  max="100"
+                  step="0.01"
+                  value={referenceFeeInput}
+                  onChange={(event) => setReferenceFeeInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') applyReferenceFee()
+                  }}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={applyReferenceFee}
+                disabled={
+                  loading ||
+                  referenceFeeInput.trim() === '' ||
+                  Number(referenceFeeInput) === referenceFeeBps
+                }
+              >
+                应用
+              </button>
+            </div>
             <label className="analysis-symbol-select">
               <span>币种</span>
               <select
@@ -597,11 +655,42 @@ export function IntraAnalysisPage() {
 
         <section className="analysis-metrics" aria-label="组合 FIFO 汇总">
           <div className="analysis-metric analysis-metric--primary">
-            <span>FIFO 毛收益</span>
+            <span>Fee 前收益</span>
             <strong className={valueClass(summary?.realizedPnlUsdt ?? 0)}>
               {summary ? money(summary.realizedPnlUsdt, true) : '--'}
             </strong>
             <small>{summary ? bps(summary.returnBps, true) : '--'} bps</small>
+          </div>
+          <div className="analysis-metric">
+            <span>累计实际 Fee 影响</span>
+            <strong className={valueClass(-(summary?.tradingFeeUsdt ?? 0))}>
+              {summary ? money(-summary.tradingFeeUsdt, true) : '--'}
+            </strong>
+            <small>
+              {summary
+                ? `${percentage(summary.actualFeeCoverage)} covered · ` +
+                  `${compactNumber(summary.convertedFeeTradeCount)}/${compactNumber(summary.feeTradeCount)} fills`
+                : '--'}
+            </small>
+          </div>
+          <div className="analysis-metric analysis-metric--primary">
+            <span>实际 Fee 后收益</span>
+            <strong className={valueClass(summary?.feeAfterPnlUsdt ?? 0)}>
+              {summary ? money(summary.feeAfterPnlUsdt, true) : '--'}
+            </strong>
+            <small>{summary ? bps(summary.feeAfterReturnBps, true) : '--'} bps</small>
+          </div>
+          <div className="analysis-metric">
+            <span>参考 Fee 后收益</span>
+            <strong className={valueClass(summary?.referenceFeeAfterPnlUsdt ?? 0)}>
+              {summary ? money(summary.referenceFeeAfterPnlUsdt, true) : '--'}
+            </strong>
+            <small>
+              {summary
+                ? `${bps(summary.referenceFeeBps, true)} bps · ` +
+                  `${money(-summary.referenceTradingFeeUsdt, true)} fee`
+                : '--'}
+            </small>
           </div>
           <div className="analysis-metric">
             <span>选币基差收益</span>
@@ -682,6 +771,7 @@ export function IntraAnalysisPage() {
                 </label>
               )}
               <span className="analysis-chart-total">
+                {chartMode === 'portfolio' && '实际 Fee 后 '}
                 {chartTotal === null ? '--' : money(chartTotal, true)} USDT
               </span>
             </div>
@@ -793,8 +883,13 @@ export function IntraAnalysisPage() {
                   : selectedChartSymbols.length} symbols
               </span>
               <span>{percentage(analysis.summary.premiumCoverage)} premium</span>
+              <span>
+                {percentage(analysis.summary.actualFeeCoverage)} actual fee ·{' '}
+                {compactNumber(analysis.source.windowFeeTradeRows)} fills
+              </span>
               {analysis.source.sampled && <span>sampled</span>}
-              <span>fee / funding excluded</span>
+              <span>{bps(analysis.summary.referenceFeeBps, true)} bps reference fee</span>
+              <span>funding / interest excluded</span>
             </div>
           )}
         </section>
@@ -815,7 +910,10 @@ export function IntraAnalysisPage() {
                   <th>MT 正 / 反</th>
                   <th>FIFO / 胜率</th>
                   <th>闭环本金</th>
-                  <th>实际成交</th>
+                  <th>Fee 前收益</th>
+                  <th>累计实际 Fee 影响</th>
+                  <th>实际 Fee 后收益</th>
+                  <th>参考 Fee 后收益</th>
                   <th>选币基差</th>
                   <th>闭环两腿执行</th>
                   <th>窗口 MT 执行</th>
@@ -827,7 +925,7 @@ export function IntraAnalysisPage() {
               <tbody>
                 {visibleSymbols.map((row) => <SymbolRow key={row.symbol} row={row} />)}
                 {!loading && visibleSymbols.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={11}>暂无闭环数据</td></tr>
+                  <tr><td className="analysis-empty" colSpan={14}>暂无闭环数据</td></tr>
                 )}
               </tbody>
             </table>
@@ -857,7 +955,7 @@ export function IntraAnalysisPage() {
                   <th>选币基差</th>
                   <th>开仓腿执行</th>
                   <th>平仓腿执行</th>
-                  <th>实际成交</th>
+                  <th>Fee 前收益</th>
                 </tr>
               </thead>
               <tbody>

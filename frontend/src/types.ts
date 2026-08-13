@@ -297,6 +297,17 @@ export interface IntraAnalysisSummary {
   matchedNotionalUsdt: number
   realizedPnlUsdt: number
   returnBps: number
+  tradingFeeUsdt: number
+  feeAfterPnlUsdt: number
+  feeAfterReturnBps: number
+  referenceFeeBps: number
+  referenceTradingFeeUsdt: number
+  referenceFeeAfterPnlUsdt: number
+  referenceFeeAfterReturnBps: number
+  feeTradeCount: number
+  feeTradeNotionalUsdt: number
+  convertedFeeTradeCount: number
+  actualFeeCoverage: number
   decomposedMatchCount: number
   premiumCoverage: number
   decomposedNotionalUsdt: number
@@ -329,6 +340,10 @@ export interface IntraSymbolAnalysis extends IntraAnalysisSummary {
 export interface IntraAnalysisPoint {
   ts: number
   realizedPnlUsdt: number
+  tradingFeeUsdt: number
+  feeAfterPnlUsdt: number
+  referenceTradingFeeUsdt: number
+  referenceFeeAfterPnlUsdt: number
   marketPnlUsdt: number
   executionPnlUsdt: number
   executionCaptureUsdt: number
@@ -382,6 +397,9 @@ export interface IntraAnalysisSource {
   premiumRateField: string
   loadedMtRows: number
   windowMtRows: number
+  loadedFeeTradeRows: number
+  windowFeeTradeRows: number
+  convertedFeeTradeRows: number
   returnedPoints: number
   returnedSymbolPoints: number
   returnedMatches: number

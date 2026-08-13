@@ -199,6 +199,7 @@ export interface IntraAnalysisQuery {
   startMs: number
   endMs: number
   symbols?: string[]
+  referenceFeeBps?: number
   maxPoints?: number
   maxMatches?: number
   signal?: AbortSignal
@@ -213,6 +214,7 @@ export function getIntraAnalysis(
     endMs: String(query.endMs),
     maxPoints: String(query.maxPoints ?? 3000),
     maxMatches: String(query.maxMatches ?? 200),
+    referenceFeeBps: String(query.referenceFeeBps ?? 1),
   })
   if (query.symbols?.length) {
     params.set('symbols', query.symbols.join(','))
