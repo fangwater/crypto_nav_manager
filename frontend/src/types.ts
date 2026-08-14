@@ -295,6 +295,8 @@ export interface IntraAnalysisSummary {
   returnBps: number
   fundingPnlUsdt: number
   fundingReturnBps: number
+  interestCostUsdt: number
+  interestCostReturnBps: number
   grossPnlUsdt: number
   grossReturnBps: number
   tradingFeeUsdt: number
@@ -334,6 +336,7 @@ export interface IntraAnalysisPoint {
   ts: number
   realizedPnlUsdt: number
   fundingPnlUsdt: number
+  interestCostUsdt: number
   grossPnlUsdt: number
   tradingFeeUsdt: number
   feeAfterPnlUsdt: number
@@ -382,6 +385,7 @@ export interface IntraClosedMatch {
   exitExecutionPnlUsdt: number | null
   executionPnlUsdt: number | null
   fundingPnlUsdt: number
+  interestCostUsdt: number
   grossPnlUsdt: number
   feeNotionalUsdt: number
   tradingFeeUsdt: number
@@ -406,12 +410,18 @@ export interface IntraAnalysisSource {
   windowFundingRows: number
   allocatedFundingRows: number
   fundingAllocation: string
+  loadedInterestRows: number
+  windowInterestRows: number
+  convertedInterestRows: number
+  allocatedInterestRows: number
+  interestAllocation: string
   returnedPoints: number
   returnedSymbolPoints: number
   returnedMatches: number
   sampled: boolean
   feesIncluded: boolean
   fundingIncluded: boolean
+  interestIncluded: boolean
 }
 
 export interface IntraAnalysis {

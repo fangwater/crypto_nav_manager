@@ -266,6 +266,10 @@ function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraF
         <strong>{money(row.fundingPnlUsdt, true)}</strong>
         <small>{bps(row.fundingReturnBps, true)} bps</small>
       </td>
+      <td className={valueClass(-row.interestCostUsdt)}>
+        <strong>{money(-row.interestCostUsdt, true)}</strong>
+        <small>{bps(-row.interestCostReturnBps, true)} bps</small>
+      </td>
       <td className={valueClass(row.marketPnlUsdt)}>
         <strong>{money(row.marketPnlUsdt, true)}</strong>
         <small>{bps(row.marketReturnBps, true)} bps</small>
@@ -597,7 +601,7 @@ export function IntraAnalysisPage() {
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
-            <span title="只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding，不包含利息">
+            <span title="只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding 与 Interest">
               Closed FIFO only
             </span>
           </div>
@@ -702,7 +706,7 @@ export function IntraAnalysisPage() {
           <div>
             <Database size={16} />
             <span>口径</span>
-            <strong>只计 FIFO 已闭环数量 · Funding 随闭环归属</strong>
+            <strong>交易价差 + Funding - Interest - Fee</strong>
           </div>
           <div>
             <Database size={16} />
@@ -741,7 +745,7 @@ export function IntraAnalysisPage() {
               </button>
             ))}
           </div>
-          <span>实际 Fee 按闭环四腿本金分摊；Funding 按事件时开放期货本金分配后，只释放闭环数量</span>
+          <span>Funding 与 Interest 按事件时开放本金分配，随 FIFO 闭环数量释放；Fee 按闭环四腿本金分摊</span>
         </section>
 
         <section className="analysis-metrics" aria-label="组合 FIFO 汇总">
@@ -775,6 +779,15 @@ export function IntraAnalysisPage() {
               {summary ? money(summary.fundingPnlUsdt, true) : '--'}
             </strong>
             <small>{summary ? bps(summary.fundingReturnBps, true) : '--'} bps</small>
+          </div>
+          <div className="analysis-metric">
+            <span>闭环 Interest</span>
+            <strong className={valueClass(-(summary?.interestCostUsdt ?? 0))}>
+              {summary ? money(-summary.interestCostUsdt, true) : '--'}
+            </strong>
+            <small>
+              {summary ? bps(-summary.interestCostReturnBps, true) : '--'} bps
+            </small>
           </div>
           <div className="analysis-metric">
             <span>选币基差收益</span>
@@ -952,7 +965,12 @@ export function IntraAnalysisPage() {
                 {compactNumber(analysis.source.windowFundingRows)} funding events allocated
               </span>
               <span>funding on open lots, released by FIFO closed quantity</span>
-              <span>interest excluded</span>
+              <span>
+                {compactNumber(analysis.source.allocatedInterestRows)} /{' '}
+                {compactNumber(analysis.source.windowInterestRows)} interest events allocated
+              </span>
+              <span>{compactNumber(analysis.source.convertedInterestRows)} interest events converted</span>
+              <span>interest on open spot borrowing, released by FIFO closed quantity</span>
             </div>
           )}
         </section>
@@ -975,6 +993,7 @@ export function IntraAnalysisPage() {
                   <th>{feeModeConfig.label}收益</th>
                   <th>Fee 影响</th>
                   <th>闭环 Funding</th>
+                  <th>闭环 Interest</th>
                   <th>选币基差</th>
                   <th>闭环两腿执行</th>
                   <th>闭环 k 覆盖</th>
@@ -985,7 +1004,7 @@ export function IntraAnalysisPage() {
                   <SymbolRow key={row.symbol} row={row} feeMode={feeMode} />
                 ))}
                 {!loading && visibleSymbols.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={9}>暂无闭环数据</td></tr>
+                  <tr><td className="analysis-empty" colSpan={10}>暂无闭环数据</td></tr>
                 )}
               </tbody>
             </table>
@@ -1016,6 +1035,7 @@ export function IntraAnalysisPage() {
                   <th>开仓腿执行</th>
                   <th>平仓腿执行</th>
                   <th>闭环 Funding</th>
+                  <th>闭环 Interest</th>
                   <th>Fee 影响</th>
                   <th>{feeModeConfig.label}收益</th>
                 </tr>
@@ -1072,6 +1092,9 @@ export function IntraAnalysisPage() {
                     <td className={valueClass(row.fundingPnlUsdt)}>
                       <strong>{money(row.fundingPnlUsdt, true)}</strong>
                     </td>
+                    <td className={valueClass(-row.interestCostUsdt)}>
+                      <strong>{money(-row.interestCostUsdt, true)}</strong>
+                    </td>
                     <td className={valueClass(matchFeeModeImpact(row, feeMode))}>
                       <strong>{money(matchFeeModeImpact(row, feeMode), true)}</strong>
                     </td>
@@ -1082,7 +1105,7 @@ export function IntraAnalysisPage() {
                   </tr>
                 ))}
                 {!loading && analysis?.matches.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={14}>当前范围没有 FIFO 闭环</td></tr>
+                  <tr><td className="analysis-empty" colSpan={15}>当前范围没有 FIFO 闭环</td></tr>
                 )}
               </tbody>
             </table>

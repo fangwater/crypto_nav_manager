@@ -3,8 +3,8 @@ use crate::{
     binance_premium_index, bybit_premium_index, contract_multipliers,
     fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
     intra_analysis::{
-        self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisFundingEvent, IntraAnalysisOrder,
-        IntraAnalysisRequest, PremiumIndexCandle,
+        self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisFundingEvent,
+        IntraAnalysisInterestEvent, IntraAnalysisOrder, IntraAnalysisRequest, PremiumIndexCandle,
     },
     live_history,
     mark_prices::MarkPriceCache,
@@ -173,6 +173,15 @@ struct IntraAnalysisFundingRecord {
     symbol: String,
     ts: i64,
     amount_usdt: f64,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraAnalysisInterestRecord {
+    symbol: Option<String>,
+    asset: String,
+    amount: f64,
+    amount_usdt: Option<f64>,
+    ts: i64,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -1018,6 +1027,13 @@ async fn get_intra_analysis(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut spot_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+    for order in &orders {
+        spot_price_history
+            .entry(order.symbol.to_ascii_uppercase())
+            .or_default()
+            .push((order.completed_at_ms, order.spot_price));
+    }
     let fee_sql = format!(
         r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
                   COALESCE(quote_quantity,price * quantity)::float8 AS notional_usdt,
@@ -1069,6 +1085,48 @@ async fn get_intra_analysis(
                 amount_usdt: row.amount_usdt,
             })
             .collect::<Vec<_>>();
+    let interest_sql = format!(
+        r#"SELECT upper(symbol) AS symbol,upper(asset) AS asset,
+                  amount::float8 AS amount,amount_usdt::float8 AS amount_usdt,
+                  event_time_ms AS ts
+           FROM {}.interest
+           WHERE event_time_ms >= $1 AND event_time_ms <= $2
+           ORDER BY event_time_ms,asset,record_id"#,
+        strategy.db_schema
+    );
+    let interest_events =
+        sqlx::query_as::<_, IntraAnalysisInterestRecord>(sqlx::AssertSqlSafe(interest_sql))
+            .bind(start_ms)
+            .bind(end_ms)
+            .fetch_all(&state.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let asset = row.asset.to_ascii_uppercase();
+                let quote_interest = matches!(asset.as_str(), "USD" | "USDC" | "USDT");
+                let symbol = row
+                    .symbol
+                    .filter(|symbol| !symbol.trim().is_empty())
+                    .map(|symbol| symbol.to_ascii_uppercase())
+                    .or_else(|| (!quote_interest).then(|| format!("{asset}USDT")));
+                let amount_usdt = row
+                    .amount_usdt
+                    .or_else(|| quote_interest.then_some(row.amount))
+                    .or_else(|| {
+                        symbol
+                            .as_ref()
+                            .and_then(|symbol| spot_price_history.get(symbol))
+                            .and_then(|prices| pnl::nearest_trade_price(prices, row.ts))
+                            .map(|price| row.amount * price)
+                    });
+                IntraAnalysisInterestEvent {
+                    symbol: if quote_interest { None } else { symbol },
+                    ts: row.ts,
+                    cost_usdt: amount_usdt
+                        .map(|amount| pnl::interest_cost_usdt(&strategy.exchange, amount)),
+                }
+            })
+            .collect::<Vec<_>>();
     let selected_symbols = query
         .symbols
         .unwrap_or_default()
@@ -1094,10 +1152,11 @@ async fn get_intra_analysis(
         max_matches: query.max_matches.unwrap_or(200).clamp(20, 500),
     };
     let response = tokio::task::spawn_blocking(move || {
-        intra_analysis::calculate_with_fees_and_funding(
+        intra_analysis::calculate_with_fees_funding_and_interest(
             orders,
             fee_events,
             funding_events,
+            interest_events,
             calculation,
         )
     })
@@ -1133,7 +1192,7 @@ fn expected_history_datasets(
     const BINANCE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
     const GATE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
     const BITGET_FR: &[&str] = &["trades", "funding", "interest"];
-    const BINANCE_INTRA: &[&str] = &["trades", "funding"];
+    const BINANCE_INTRA: &[&str] = &["trades", "funding", "interest"];
     const BYBIT_INTRA: &[&str] = &["trades", "funding", "interest"];
     const MM: &[&str] = &["trades"];
 
@@ -2181,6 +2240,10 @@ mod tests {
         assert_eq!(
             expected_history_datasets("binance_fr_arb01", "local", "binance", "funding_rate"),
             Some(["trades", "funding", "interest", "liquidations"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("binance-intra-arb01", "local", "binance", "intra_exchange",),
+            Some(["trades", "funding", "interest"].as_slice())
         );
         assert_eq!(
             expected_history_datasets("bybit-intra-arb01", "sg", "bybit", "intra_exchange"),

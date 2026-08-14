@@ -158,6 +158,17 @@ export function IntraFifoChart({
             itemStyle: { color: '#7c3a91' },
             emphasis: { focus: 'series' as const },
           },
+          {
+            name: '闭环 Interest',
+            type: 'line' as const,
+            data: points.map((point) => [point.ts, -point.interestCostUsdt]),
+            showSymbol: false,
+            sampling: 'lttb' as const,
+            connectNulls: true,
+            lineStyle: { width: 1.6, color: '#c2413b', type: 'dashed' as const },
+            itemStyle: { color: '#c2413b' },
+            emphasis: { focus: 'series' as const },
+          },
         ]
 
     chart.setOption(
@@ -179,6 +190,7 @@ export function IntraFifoChart({
             '选币基差',
             '闭环执行',
             '闭环 Funding',
+            '闭环 Interest',
           ],
         },
         tooltip: {

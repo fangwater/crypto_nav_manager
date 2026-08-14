@@ -132,10 +132,10 @@ cargo run --release --bin sync_history -- \
 The command infers the exchange, account mode, and strategy class from
 `strategy_envs`. Incremental scans overlap the last successful scan by 30
 minutes and upsert with exchange-native record IDs. Market-making strategies
-and Binance intra strategies do not query interest. Binance intra `all` scans
-also include the `rebates` dataset; run `--dataset rebates --full` to backfill
-wallet distributions from the strategy's `st_ms`. Repeat `--strategy` to scan
-multiple accounts in one invocation.
+do not query interest. Binance intra `all` scans include both `interest` and
+the `rebates` dataset; run `--dataset rebates --full` to backfill wallet
+distributions from the strategy's `st_ms`. Repeat `--strategy` to scan multiple
+accounts in one invocation.
 
 The API service continuously syncs the four local Binance FR accounts plus
 `binance-intra-arb01`, `bybit-intra-arb01`, `bybit-intra-arb02`,

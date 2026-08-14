@@ -121,10 +121,7 @@ impl Strategy {
     fn supports(&self, dataset: Dataset) -> bool {
         match dataset {
             Dataset::All | Dataset::Trades | Dataset::Funding => true,
-            Dataset::Interest => {
-                self.class != StrategyClass::Mm
-                    && !(self.class == StrategyClass::Intra && self.exchange == "binance")
-            }
+            Dataset::Interest => self.class != StrategyClass::Mm,
             Dataset::Rebates => self.exchange == "binance" && self.class == StrategyClass::Intra,
             Dataset::Liquidations => {
                 matches!(self.exchange.as_str(), "binance" | "gate")
@@ -2246,7 +2243,7 @@ mod tests {
     #[test]
     fn interest_policy_matches_strategy_rules() {
         assert!(!strategy("bybit", StrategyClass::Mm).supports(Dataset::Interest));
-        assert!(!strategy("binance", StrategyClass::Intra).supports(Dataset::Interest));
+        assert!(strategy("binance", StrategyClass::Intra).supports(Dataset::Interest));
         assert!(strategy("bybit", StrategyClass::Intra).supports(Dataset::Interest));
         assert!(strategy("bitget", StrategyClass::Fr).supports(Dataset::Interest));
     }

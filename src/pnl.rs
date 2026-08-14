@@ -1608,7 +1608,7 @@ async fn load_spot_swap_inputs(
     })
 }
 
-fn nearest_trade_price(prices: &[(i64, f64)], ts: i64) -> Option<f64> {
+pub(crate) fn nearest_trade_price(prices: &[(i64, f64)], ts: i64) -> Option<f64> {
     let next = prices.partition_point(|(price_ts, _)| *price_ts < ts);
     match (next.checked_sub(1), prices.get(next)) {
         (Some(previous), Some((next_ts, next_price))) => {
@@ -1625,7 +1625,7 @@ fn nearest_trade_price(prices: &[(i64, f64)], ts: i64) -> Option<f64> {
     }
 }
 
-fn interest_cost_usdt(exchange: &str, amount_usdt: f64) -> f64 {
+pub(crate) fn interest_cost_usdt(exchange: &str, amount_usdt: f64) -> f64 {
     if exchange == "binance" {
         amount_usdt.max(0.0)
     } else {

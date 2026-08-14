@@ -460,7 +460,7 @@ fn account_datasets(strategy: &LiveHistoryStrategy) -> &'static [&'static str] {
             &["funding", "interest", "liquidations"]
         }
         ("bitget", "funding_rate") => &["funding", "interest"],
-        ("binance", "intra_exchange") => &["funding"],
+        ("binance", "intra_exchange") => &["funding", "interest"],
         ("bybit", "intra_exchange") => &["funding", "interest"],
         _ => &[],
     }
@@ -719,7 +719,7 @@ mod tests {
                 "binance",
                 "intra_exchange"
             )),
-            ["funding"]
+            ["funding", "interest"]
         );
         assert_eq!(
             account_datasets(&strategy("bybit-intra-arb01", "bybit", "intra_exchange")),
