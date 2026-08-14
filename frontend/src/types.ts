@@ -286,13 +286,9 @@ export interface StrategyPnl {
 export type IntraArbDirection = 'positive' | 'reverse'
 
 export interface IntraAnalysisSummary {
-  mtCount: number
-  positiveMtCount: number
-  reverseMtCount: number
   closedMatchCount: number
   winningMatchCount: number
   winRate: number
-  mtNotionalUsdt: number
   matchedQuantity: number
   matchedNotionalUsdt: number
   realizedPnlUsdt: number
@@ -319,13 +315,6 @@ export interface IntraAnalysisSummary {
   executionPnlUsdt: number
   marketReturnBps: number
   executionReturnBps: number
-  executionMtCount: number
-  executionMtNotionalUsdt: number
-  executionMtPremiumCoverage: number
-  executionCaptureUsdt: number
-  executionCaptureReturnBps: number
-  positiveExecutionCaptureUsdt: number
-  reverseExecutionCaptureUsdt: number
   averageHoldingMs: number
   positiveOpenLotCount: number
   reverseOpenLotCount: number
@@ -352,7 +341,6 @@ export interface IntraAnalysisPoint {
   referenceFeeAfterPnlUsdt: number
   marketPnlUsdt: number
   executionPnlUsdt: number
-  executionCaptureUsdt: number
   matchedNotionalUsdt: number
   closedMatchCount: number
   decomposedMatchCount: number
@@ -410,7 +398,6 @@ export interface IntraAnalysisSource {
   premiumAdapter: string
   premiumRateField: string
   loadedMtRows: number
-  windowMtRows: number
   loadedFeeTradeRows: number
   windowFeeTradeRows: number
   convertedFeeTradeRows: number

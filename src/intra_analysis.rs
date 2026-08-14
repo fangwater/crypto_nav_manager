@@ -77,12 +77,6 @@ impl IntraAnalysisOrder {
         self.premium
             .map(|premium| self.basis_bps() - premium.close_rate * 10_000.0)
     }
-
-    fn execution_capture_usdt(&self) -> Option<f64> {
-        self.market_basis().map(|market_basis| {
-            self.quantity * self.direction.sign() * (self.basis() - market_basis)
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,13 +122,9 @@ pub struct IntraAnalysisResponse {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntraAnalysisSummary {
-    pub mt_count: u64,
-    pub positive_mt_count: u64,
-    pub reverse_mt_count: u64,
     pub closed_match_count: u64,
     pub winning_match_count: u64,
     pub win_rate: f64,
-    pub mt_notional_usdt: f64,
     pub matched_quantity: f64,
     pub matched_notional_usdt: f64,
     pub realized_pnl_usdt: f64,
@@ -161,13 +151,6 @@ pub struct IntraAnalysisSummary {
     pub execution_pnl_usdt: f64,
     pub market_return_bps: f64,
     pub execution_return_bps: f64,
-    pub execution_mt_count: u64,
-    pub execution_mt_notional_usdt: f64,
-    pub execution_mt_premium_coverage: f64,
-    pub execution_capture_usdt: f64,
-    pub execution_capture_return_bps: f64,
-    pub positive_execution_capture_usdt: f64,
-    pub reverse_execution_capture_usdt: f64,
     pub average_holding_ms: f64,
     pub positive_open_lot_count: u64,
     pub reverse_open_lot_count: u64,
@@ -200,7 +183,6 @@ pub struct IntraAnalysisPoint {
     pub reference_fee_after_pnl_usdt: f64,
     pub market_pnl_usdt: f64,
     pub execution_pnl_usdt: f64,
-    pub execution_capture_usdt: f64,
     pub matched_notional_usdt: f64,
     pub closed_match_count: u64,
     pub decomposed_match_count: u64,
@@ -257,7 +239,6 @@ pub struct IntraAnalysisSource {
     pub premium_adapter: &'static str,
     pub premium_rate_field: &'static str,
     pub loaded_mt_rows: usize,
-    pub window_mt_rows: usize,
     pub loaded_fee_trade_rows: usize,
     pub window_fee_trade_rows: usize,
     pub converted_fee_trade_rows: usize,
@@ -353,12 +334,8 @@ struct SymbolState {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SummaryAccumulator {
-    mt_count: u64,
-    positive_mt_count: u64,
-    reverse_mt_count: u64,
     closed_match_count: u64,
     winning_match_count: u64,
-    mt_notional_usdt: f64,
     matched_quantity: f64,
     matched_notional_usdt: f64,
     realized_pnl_usdt: f64,
@@ -369,33 +346,10 @@ struct SummaryAccumulator {
     decomposed_notional_usdt: f64,
     market_pnl_usdt: f64,
     execution_pnl_usdt: f64,
-    execution_mt_count: u64,
-    execution_mt_notional_usdt: f64,
-    execution_capture_usdt: f64,
-    positive_execution_capture_usdt: f64,
-    reverse_execution_capture_usdt: f64,
     holding_notional_ms: f64,
 }
 
 impl SummaryAccumulator {
-    fn record_order(&mut self, order: &IntraAnalysisOrder) {
-        self.mt_count += 1;
-        match order.direction {
-            ArbDirection::Positive => self.positive_mt_count += 1,
-            ArbDirection::Reverse => self.reverse_mt_count += 1,
-        }
-        self.mt_notional_usdt += order.quantity * order.spot_price;
-        if let Some(execution_capture) = order.execution_capture_usdt() {
-            self.execution_mt_count += 1;
-            self.execution_mt_notional_usdt += order.quantity * order.spot_price;
-            self.execution_capture_usdt += execution_capture;
-            match order.direction {
-                ArbDirection::Positive => self.positive_execution_capture_usdt += execution_capture,
-                ArbDirection::Reverse => self.reverse_execution_capture_usdt += execution_capture,
-            }
-        }
-    }
-
     fn record_match(&mut self, row: &IntraClosedMatch, matched_notional: f64) {
         self.closed_match_count += 1;
         if row.pnl_usdt > 0.0 {
@@ -419,12 +373,8 @@ impl SummaryAccumulator {
     }
 
     fn add(&mut self, other: Self) {
-        self.mt_count += other.mt_count;
-        self.positive_mt_count += other.positive_mt_count;
-        self.reverse_mt_count += other.reverse_mt_count;
         self.closed_match_count += other.closed_match_count;
         self.winning_match_count += other.winning_match_count;
-        self.mt_notional_usdt += other.mt_notional_usdt;
         self.matched_quantity += other.matched_quantity;
         self.matched_notional_usdt += other.matched_notional_usdt;
         self.realized_pnl_usdt += other.realized_pnl_usdt;
@@ -435,27 +385,18 @@ impl SummaryAccumulator {
         self.decomposed_notional_usdt += other.decomposed_notional_usdt;
         self.market_pnl_usdt += other.market_pnl_usdt;
         self.execution_pnl_usdt += other.execution_pnl_usdt;
-        self.execution_mt_count += other.execution_mt_count;
-        self.execution_mt_notional_usdt += other.execution_mt_notional_usdt;
-        self.execution_capture_usdt += other.execution_capture_usdt;
-        self.positive_execution_capture_usdt += other.positive_execution_capture_usdt;
-        self.reverse_execution_capture_usdt += other.reverse_execution_capture_usdt;
         self.holding_notional_ms += other.holding_notional_ms;
     }
 
     fn finish(self, open: OpenSummary) -> IntraAnalysisSummary {
         let gross_pnl_usdt = self.realized_pnl_usdt + self.funding_pnl_usdt;
         IntraAnalysisSummary {
-            mt_count: self.mt_count,
-            positive_mt_count: self.positive_mt_count,
-            reverse_mt_count: self.reverse_mt_count,
             closed_match_count: self.closed_match_count,
             winning_match_count: self.winning_match_count,
             win_rate: ratio(
                 self.winning_match_count as f64,
                 self.closed_match_count as f64,
             ),
-            mt_notional_usdt: clean_zero(self.mt_notional_usdt),
             matched_quantity: clean_zero(self.matched_quantity),
             matched_notional_usdt: clean_zero(self.matched_notional_usdt),
             realized_pnl_usdt: clean_zero(self.realized_pnl_usdt),
@@ -490,19 +431,6 @@ impl SummaryAccumulator {
                 * 10_000.0,
             execution_return_bps: ratio(self.execution_pnl_usdt, self.decomposed_notional_usdt)
                 * 10_000.0,
-            execution_mt_count: self.execution_mt_count,
-            execution_mt_notional_usdt: clean_zero(self.execution_mt_notional_usdt),
-            execution_mt_premium_coverage: ratio(
-                self.execution_mt_count as f64,
-                self.mt_count as f64,
-            ),
-            execution_capture_usdt: clean_zero(self.execution_capture_usdt),
-            execution_capture_return_bps: ratio(
-                self.execution_capture_usdt,
-                self.execution_mt_notional_usdt,
-            ) * 10_000.0,
-            positive_execution_capture_usdt: clean_zero(self.positive_execution_capture_usdt),
-            reverse_execution_capture_usdt: clean_zero(self.reverse_execution_capture_usdt),
             average_holding_ms: ratio(self.holding_notional_ms, self.matched_notional_usdt),
             positive_open_lot_count: open.positive_lot_count,
             reverse_open_lot_count: open.reverse_lot_count,
@@ -703,7 +631,6 @@ pub fn calculate_with_fees_and_funding(
         .map(|symbol| (symbol, IntraAnalysisPoint::default()))
         .collect::<HashMap<_, _>>();
     let mut recent_matches = VecDeque::with_capacity(request.max_matches.saturating_add(1));
-    let mut window_mt_rows = 0_usize;
     let mut allocated_funding_rows = 0_usize;
     let mut funding_index = 0_usize;
 
@@ -725,15 +652,9 @@ pub fn calculate_with_fees_and_funding(
             funding_index += 1;
         }
         let in_window = order.completed_at_ms >= request.start_ms;
-        if in_window {
-            window_mt_rows += 1;
-        }
         let state = states
             .get_mut(&order.symbol)
             .expect("all order symbols have an initialized state");
-        if in_window {
-            state.stats.record_order(order);
-        }
 
         let opposite = match order.direction {
             ArbDirection::Positive => &mut state.reverse,
@@ -997,7 +918,6 @@ pub fn calculate_with_fees_and_funding(
         premium_adapter: request.premium_adapter,
         premium_rate_field: "close",
         loaded_mt_rows,
-        window_mt_rows,
         loaded_fee_trade_rows,
         window_fee_trade_rows,
         converted_fee_trade_rows,
@@ -1471,13 +1391,8 @@ mod tests {
         assert_close(response.summary.realized_pnl_usdt, 10.0);
         assert_close(response.summary.market_pnl_usdt, 8.0);
         assert_close(response.summary.execution_pnl_usdt, 2.0);
-        assert_close(response.summary.execution_capture_usdt, 2.0);
-        assert_close(response.summary.positive_execution_capture_usdt, -2.0);
-        assert_close(response.summary.reverse_execution_capture_usdt, 4.0);
         assert_close(response.summary.premium_coverage, 1.0);
-        assert_close(response.summary.execution_mt_premium_coverage, 1.0);
         assert_eq!(response.summary.decomposed_match_count, 1);
-        assert_eq!(response.summary.execution_mt_count, 2);
         assert_close(response.matches[0].entry_premium_bps.unwrap(), -800.0);
         assert_close(response.matches[0].exit_premium_bps.unwrap(), -400.0);
         assert_close(
@@ -1519,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_window_orders_seed_fifo_without_entering_window_counts() {
+    fn pre_window_orders_seed_fifo_for_window_closes() {
         let response = calculate(
             vec![
                 order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
@@ -1529,16 +1444,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.summary.mt_count, 1);
-        assert_eq!(response.summary.reverse_mt_count, 1);
-        assert_eq!(response.summary.positive_mt_count, 0);
+        assert_eq!(response.summary.closed_match_count, 1);
         assert_close(response.summary.realized_pnl_usdt, 5.0);
         assert_eq!(response.points.first().unwrap().realized_pnl_usdt, 0.0);
         assert_close(response.points.last().unwrap().realized_pnl_usdt, 5.0);
     }
 
     #[test]
-    fn window_execution_diagnostic_stays_out_of_closed_pnl_series() {
+    fn closed_execution_includes_pre_window_entry_leg() {
         let response = calculate(
             vec![
                 with_premium(
@@ -1557,13 +1470,9 @@ mod tests {
         assert_close(response.summary.realized_pnl_usdt, 5.0);
         assert_close(response.summary.market_pnl_usdt, 2.0);
         assert_close(response.summary.execution_pnl_usdt, 3.0);
-        assert_eq!(response.summary.execution_mt_count, 1);
-        assert_close(response.summary.execution_capture_usdt, 1.0);
-        assert_close(response.summary.positive_execution_capture_usdt, 0.0);
-        assert_close(response.summary.reverse_execution_capture_usdt, 1.0);
         assert_close(response.matches[0].entry_execution_pnl_usdt.unwrap(), 2.0);
         assert_close(response.matches[0].exit_execution_pnl_usdt.unwrap(), 1.0);
-        assert_close(response.points.last().unwrap().execution_capture_usdt, 0.0);
+        assert_close(response.points.last().unwrap().execution_pnl_usdt, 3.0);
     }
 
     #[test]
@@ -1711,13 +1620,6 @@ mod tests {
                 .map(|point| point.execution_pnl_usdt)
                 .sum(),
             portfolio.execution_pnl_usdt,
-        );
-        assert_close(
-            final_points
-                .iter()
-                .map(|point| point.execution_capture_usdt)
-                .sum(),
-            portfolio.execution_capture_usdt,
         );
         assert_eq!(
             response.source.returned_symbol_points,
