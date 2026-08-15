@@ -81,6 +81,7 @@ export function latencyChartHasRequiredSeries(model: LatencyChartModel): boolean
     names.has('现货信号 p90') &&
     names.has('合约信号 p50') &&
     names.has('合约信号 p90') &&
-    model.chartId !== model.distinctFrom
+    model.chartId === 'hourly-latency' &&
+    model.distinctFrom === 'fifo-closed-pnl'
   )
 }
