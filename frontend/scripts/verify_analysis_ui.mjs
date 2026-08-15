@@ -134,6 +134,56 @@ export function verifyLatencyChart() {
   assert.deepEqual(model.series[0].values, [1.1])
   assert.deepEqual(model.series[7].values, [1.3])
 
+  const gapped = {
+    strategySlug: 'bybit-intra-arb01',
+    points: [
+      {
+        strategySlug: 'bybit-intra-arb01',
+        windowStartMs: 1_000,
+        windowEndMs: 3_601_000,
+        computedAtMs: 3_601_000,
+        marginNewCreate: { sampleCount: 2, normalCount: 2, p50Ms: 1.4, p90Ms: 1.9 },
+        futuresNewCreate: { sampleCount: 0, normalCount: 0, p50Ms: null, p90Ms: null },
+        spotTrigger: { sampleCount: 1, normalCount: 1, p50Ms: 2.1, p90Ms: 2.6 },
+        futuresTrigger: { sampleCount: 1, normalCount: 1, p50Ms: 2.0, p90Ms: 2.4 },
+      },
+      {
+        strategySlug: 'bybit-intra-arb01',
+        windowStartMs: 3_601_000,
+        windowEndMs: 7_201_000,
+        computedAtMs: 7_201_000,
+        marginNewCreate: { sampleCount: 0, normalCount: 0, p50Ms: null, p90Ms: null },
+        futuresNewCreate: { sampleCount: 0, normalCount: 0, p50Ms: null, p90Ms: null },
+        spotTrigger: { sampleCount: 0, normalCount: 0, p50Ms: null, p90Ms: null },
+        futuresTrigger: { sampleCount: 0, normalCount: 0, p50Ms: null, p90Ms: null },
+      },
+      {
+        strategySlug: 'bybit-intra-arb01',
+        windowStartMs: 7_201_000,
+        windowEndMs: 10_801_000,
+        computedAtMs: 10_801_000,
+        marginNewCreate: { sampleCount: 3, normalCount: 3, p50Ms: 1.5, p90Ms: 2.0 },
+        futuresNewCreate: { sampleCount: 1, normalCount: 1, p50Ms: 0.7, p90Ms: 0.8 },
+        spotTrigger: { sampleCount: 2, normalCount: 2, p50Ms: 2.2, p90Ms: 2.7 },
+        futuresTrigger: { sampleCount: 2, normalCount: 2, p50Ms: 2.1, p90Ms: 2.5 },
+      },
+    ],
+  }
+  const filled = chart.bindHourlyLatencyChart(gapped)
+  assert.deepEqual(chart.ffillLatencyValues([null, 1.4, null, null, 1.6, null]), [
+    null,
+    1.4,
+    1.4,
+    1.4,
+    1.6,
+    1.6,
+  ])
+  assert.deepEqual(filled.series[0].values, [1.4, 1.4, 1.5])
+  assert.deepEqual(filled.series[1].values, [1.9, 1.9, 2.0])
+  assert.deepEqual(filled.series[2].values, [null, null, 0.7])
+  assert.deepEqual(filled.series[4].values, [2.1, 2.1, 2.2])
+  assert.deepEqual(filled.series[6].values, [2.0, 2.0, 2.1])
+
   const page = read('src/pages/IntraAnalysisPage.tsx')
   assert.match(page, /data-chart-id="fifo-closed-pnl"/)
   assert.match(page, /data-chart-id="hourly-latency"/)

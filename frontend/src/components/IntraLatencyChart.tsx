@@ -87,6 +87,7 @@ export function IntraLatencyChart({
       series: model.series.map((line) => ({
         name: line.name,
         type: 'line',
+        connectNulls: true,
         showSymbol: model.categoryTimes.length <= 24,
         data: line.values,
       })),

@@ -49,6 +49,19 @@ const LATENCY_LINES: ReadonlyArray<{
   { key: 'futuresTrigger', quantile: 'p90Ms', name: '合约信号 p90' },
 ]
 
+export function ffillLatencyValues(
+  values: Array<number | null>,
+): Array<number | null> {
+  let last: number | null = null
+  return values.map((value) => {
+    if (value != null && Number.isFinite(value)) {
+      last = value
+      return value
+    }
+    return last
+  })
+}
+
 export function bindHourlyLatencyChart(
   series: HourlyLatencySeries | null | undefined,
 ): LatencyChartModel {
@@ -62,10 +75,12 @@ export function bindHourlyLatencyChart(
     series: LATENCY_LINES.map((line) => ({
       key: `${String(line.key)}-${line.quantile}`,
       name: line.name,
-      values: points.map((point) => {
-        const quantiles = point[line.key] as LatencyQuantiles
-        return quantiles[line.quantile]
-      }),
+      values: ffillLatencyValues(
+        points.map((point) => {
+          const quantiles = point[line.key] as LatencyQuantiles
+          return quantiles[line.quantile]
+        }),
+      ),
     })),
   }
 }
