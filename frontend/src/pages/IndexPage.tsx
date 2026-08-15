@@ -28,6 +28,7 @@ import {
   alignmentTitle,
   alignmentTone,
 } from '../alignment'
+import { strategySurfaceAnalysisLink } from '../analysisNav'
 import type {
   AccountRisk,
   AlignmentStatus,
@@ -45,10 +46,6 @@ const filters: Array<{ value: Filter; label: string }> = [
 ]
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1_000
-const analysisStrategySlugs = new Set([
-  'binance-intra-arb01',
-  'bybit-intra-arb01',
-])
 const syncTimeFormatter = new Intl.DateTimeFormat(undefined, {
   month: '2-digit',
   day: '2-digit',
@@ -419,6 +416,7 @@ export function IndexPage() {
                 risk?.status === 'live'
                   ? (risk.riskLevel ?? 'live')
                   : (risk?.status ?? 'missing')
+              const analysisLink = strategySurfaceAnalysisLink(strategy.slug)
               return (
                 <article
                   className={
@@ -509,14 +507,14 @@ export function IndexPage() {
                   <div className="strategy-card__footer">
                     <code title={strategy.envPath}>{strategy.envPath}</code>
                     <div className="strategy-card__actions">
-                      {analysisStrategySlugs.has(strategy.slug) && (
+                      {analysisLink && (
                         <Link
                           className="strategy-card__analysis"
-                          to={'/analysis/' + strategy.slug}
+                          to={analysisLink.to}
                           title="查看组合 FIFO 分析"
                         >
                           <FlaskConical size={14} />
-                          <span>组合分析</span>
+                          <span>{analysisLink.label}</span>
                         </Link>
                       )}
                       <Link

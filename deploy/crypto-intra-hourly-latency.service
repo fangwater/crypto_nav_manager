@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto NAV hourly intra latency ingest
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crypto_nav_manager
+ExecStart=/home/ubuntu/crypto_nav_manager/target/release/sync_intra_hourly_latency
+Environment=RUST_LOG=info
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=read-only
+UMask=0077

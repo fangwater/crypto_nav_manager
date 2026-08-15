@@ -4163,7 +4163,79 @@
   font-weight: 650;
 }
 
-.analysis-header-tags span:first-child {
+.detail-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.analysis-metric-helper {
+  position: relative;
+}
+
+.analysis-metric-helper__toggle {
+  min-height: 30px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #c5d4e0;
+  border-radius: 4px;
+  color: #35546d;
+  background: #f4f8fb;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.analysis-metric-helper__toggle:hover,
+.analysis-metric-helper__toggle[aria-expanded='true'] {
+  border-color: #8eabc0;
+  background: #eaf2f8;
+}
+
+.analysis-metric-helper__panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  width: min(420px, calc(100vw - 32px));
+  max-height: min(70vh, 560px);
+  overflow: auto;
+  padding: 12px 14px;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 30px rgba(28, 39, 51, 0.12);
+}
+
+.analysis-metric-helper__panel article {
+  display: grid;
+  gap: 4px;
+}
+
+.analysis-metric-helper__panel h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.analysis-metric-helper__panel p,
+.analysis-metric-helper__panel small {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.analysis-latency-panel .analysis-chart-stage {
+  min-height: 320px;
+}
+
+.analysis-header-tags span:first-of-type {
   color: #5f4a12;
   border-color: #dfcf9d;
   background: #fff9e8;

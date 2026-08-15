@@ -12,16 +12,19 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { getIntraAnalysis, getStrategy } from '../api'
+import { getIntraAnalysis, getIntraHourlyLatency, getStrategy } from '../api'
+import { AnalysisMetricHelper } from '../components/AnalysisMetricHelper'
 import {
   IntraFifoChart,
   type IntraFifoChartMode,
 } from '../components/IntraFifoChart'
+import { IntraLatencyChart } from '../components/IntraLatencyChart'
 import {
   intraFeeModeConfig,
   intraFeeModeOptions,
   intraSymbolColor,
 } from '../intraAnalysisSeries'
+import type { HourlyLatencySeries } from '../analysisLatencyChart'
 import type {
   IntraAnalysis,
   IntraArbDirection,
@@ -290,6 +293,7 @@ export function IntraAnalysisPage() {
   const { slug = '' } = useParams()
   const [strategy, setStrategy] = useState<Strategy | null>(null)
   const [analysis, setAnalysis] = useState<IntraAnalysis | null>(null)
+  const [latencySeries, setLatencySeries] = useState<HourlyLatencySeries | null>(null)
   const [startInput, setStartInput] = useState('')
   const [endInput, setEndInput] = useState('')
   const [startMs, setStartMs] = useState<number | null>(null)
@@ -309,6 +313,7 @@ export function IntraAnalysisPage() {
     let active = true
     setStrategy(null)
     setAnalysis(null)
+    setLatencySeries(null)
     setSymbol('')
     setFeeMode('actual')
     setReferenceFeeInput('1')
@@ -340,16 +345,26 @@ export function IntraAnalysisPage() {
     const controller = new AbortController()
     setLoading(true)
     setPageError(null)
-    getIntraAnalysis(strategy.slug, {
-      startMs,
-      endMs,
-      symbols: symbol ? [symbol] : undefined,
-      referenceFeeBps,
-      maxPoints: 3500,
-      maxMatches: 200,
-      signal: controller.signal,
-    })
-      .then(setAnalysis)
+    Promise.all([
+      getIntraAnalysis(strategy.slug, {
+        startMs,
+        endMs,
+        symbols: symbol ? [symbol] : undefined,
+        referenceFeeBps,
+        maxPoints: 3500,
+        maxMatches: 200,
+        signal: controller.signal,
+      }),
+      getIntraHourlyLatency(strategy.slug, {
+        startMs,
+        endMs,
+        signal: controller.signal,
+      }),
+    ])
+      .then(([nextAnalysis, nextLatency]) => {
+        setAnalysis(nextAnalysis)
+        setLatencySeries(nextLatency)
+      })
       .catch((reason: unknown) => {
         if (reason instanceof DOMException && reason.name === 'AbortError') return
         setPageError(reason instanceof Error ? reason.message : String(reason))
@@ -598,6 +613,7 @@ export function IntraAnalysisPage() {
             </div>
           </div>
           <div className="analysis-header-tags">
+            <AnalysisMetricHelper />
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
@@ -815,7 +831,10 @@ export function IntraAnalysisPage() {
           </div>
         </section>
 
-        <section className="chart-panel analysis-chart-panel">
+        <section
+          className="chart-panel analysis-chart-panel"
+          data-chart-id="fifo-closed-pnl"
+        >
           <div className="chart-panel__header">
             <div>
               <p className="eyebrow">TRADE DECOMPOSITION</p>
@@ -973,6 +992,38 @@ export function IntraAnalysisPage() {
               <span>interest on open spot borrowing, released by FIFO closed quantity</span>
             </div>
           )}
+        </section>
+
+        <section
+          className="chart-panel analysis-chart-panel analysis-latency-panel"
+          data-chart-id="hourly-latency"
+        >
+          <div className="chart-panel__header">
+            <div>
+              <p className="eyebrow">HOURLY ORDER LATENCY</p>
+              <h2>小时订单时延</h2>
+            </div>
+            <span className="analysis-chart-total">
+              {latencySeries?.points.length ?? 0} hours
+            </span>
+          </div>
+          <div className="analysis-chart-body">
+            <div className="analysis-chart-stage">
+              <IntraLatencyChart series={latencySeries} />
+              {loading && (
+                <div className="chart-loading">
+                  <LoaderCircle size={20} />
+                  <span>计算中</span>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="chart-foot">
+            <span>Margin / Futures NEW−create p50/p90</span>
+            <span>现货信号 / 合约信号行情延迟 p50/p90</span>
+            <span>按触发腿拆分，平局不计入</span>
+            <span>正常路径 ≤ 100 ms</span>
+          </div>
         </section>
 
         <section className="analysis-table-panel">

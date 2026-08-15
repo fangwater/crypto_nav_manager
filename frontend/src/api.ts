@@ -1,3 +1,4 @@
+import type { HourlyLatencySeries } from './analysisLatencyChart'
 import type {
   AccountFeeRates,
   AccountRisk,
@@ -221,6 +222,26 @@ export function getIntraAnalysis(
   }
   return getJson<IntraAnalysis>(
     '/analysis/' + encodeURIComponent(slug) + '/intra-fifo?' + params,
+    query.signal,
+  )
+}
+
+export interface IntraHourlyLatencyQuery {
+  startMs?: number
+  endMs?: number
+  signal?: AbortSignal
+}
+
+export function getIntraHourlyLatency(
+  slug: string,
+  query: IntraHourlyLatencyQuery = {},
+): Promise<HourlyLatencySeries> {
+  const params = new URLSearchParams()
+  if (query.startMs != null) params.set('startMs', String(query.startMs))
+  if (query.endMs != null) params.set('endMs', String(query.endMs))
+  const suffix = params.size > 0 ? '?' + params.toString() : ''
+  return getJson<HourlyLatencySeries>(
+    '/analysis/' + encodeURIComponent(slug) + '/hourly-latency' + suffix,
     query.signal,
   )
 }

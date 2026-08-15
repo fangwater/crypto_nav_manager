@@ -6,6 +6,7 @@ use crate::{
         self, ArbDirection, IntraAnalysisFeeEvent, IntraAnalysisFundingEvent,
         IntraAnalysisInterestEvent, IntraAnalysisOrder, IntraAnalysisRequest, PremiumIndexCandle,
     },
+    intra_latency::{self, HourlyLatencyPoint, HourlyLatencySeries, LatencyQuantiles},
     live_history,
     mark_prices::MarkPriceCache,
     pnl::{self, InitialPosition, PnlCalculation, PnlSourceKind},
@@ -444,6 +445,37 @@ struct IntraAnalysisQuery {
     max_matches: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IntraHourlyLatencyQuery {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+struct IntraHourlyLatencyRecord {
+    strategy_slug: String,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    computed_at_ms: i64,
+    margin_new_create_count: i64,
+    margin_new_create_normal_count: i64,
+    margin_new_create_p50_ms: Option<f64>,
+    margin_new_create_p90_ms: Option<f64>,
+    futures_new_create_count: i64,
+    futures_new_create_normal_count: i64,
+    futures_new_create_p50_ms: Option<f64>,
+    futures_new_create_p90_ms: Option<f64>,
+    spot_trigger_count: i64,
+    spot_trigger_normal_count: i64,
+    spot_trigger_p50_ms: Option<f64>,
+    spot_trigger_p90_ms: Option<f64>,
+    futures_trigger_count: i64,
+    futures_trigger_normal_count: i64,
+    futures_trigger_p50_ms: Option<f64>,
+    futures_trigger_p90_ms: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
@@ -517,6 +549,7 @@ pub async fn run() -> Result<()> {
         binance_premium_index::spawn(pool.clone());
         bybit_premium_index::spawn(pool.clone());
         live_history::spawn(pool.clone())?;
+        intra_latency::spawn()?;
         let mark_prices = MarkPriceCache::start().await;
         (account_risks, mark_prices)
     };
@@ -531,6 +564,10 @@ pub async fn run() -> Result<()> {
         .route("/api/alignment-status", get(list_alignment_status))
         .route("/api/intra-matching", get(list_intra_matching))
         .route("/api/analysis/{slug}/intra-fifo", get(get_intra_analysis))
+        .route(
+            "/api/analysis/{slug}/hourly-latency",
+            get(get_intra_hourly_latency),
+        )
         .route("/api/fee-rates", get(list_fee_rates))
         .route("/api/fee-rates/{slug}", get(get_account_fee_rates))
         .route("/api/snapshots", get(list_latest_snapshots))
@@ -1163,6 +1200,96 @@ async fn get_intra_analysis(
     .await
     .context("join intra combination FIFO calculation")??;
     Ok(Json(response).into_response())
+}
+
+async fn get_intra_hourly_latency(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Query(query): Query<IntraHourlyLatencyQuery>,
+) -> Result<Response, ApiError> {
+    if !intra_latency::supports_hourly_latency(&slug) {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: "hourly latency is not available for this strategy",
+            }),
+        )
+            .into_response());
+    }
+    let start_ms = query.start_ms.unwrap_or(0);
+    let end_ms = query
+        .end_ms
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    if end_ms < start_ms {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "endMs must be greater than or equal to startMs",
+            }),
+        )
+            .into_response());
+    }
+    let rows = sqlx::query_as::<_, IntraHourlyLatencyRecord>(
+        r#"SELECT strategy_slug, window_start_ms, window_end_ms, computed_at_ms,
+                  margin_new_create_count, margin_new_create_normal_count,
+                  margin_new_create_p50_ms, margin_new_create_p90_ms,
+                  futures_new_create_count, futures_new_create_normal_count,
+                  futures_new_create_p50_ms, futures_new_create_p90_ms,
+                  spot_trigger_count, spot_trigger_normal_count,
+                  spot_trigger_p50_ms, spot_trigger_p90_ms,
+                  futures_trigger_count, futures_trigger_normal_count,
+                  futures_trigger_p50_ms, futures_trigger_p90_ms
+           FROM intra_hourly_latency
+           WHERE strategy_slug=$1
+             AND window_start_ms >= $2
+             AND window_start_ms < $3
+           ORDER BY window_start_ms"#,
+    )
+    .bind(&slug)
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_all(&state.pool)
+    .await?;
+    let points = rows
+        .into_iter()
+        .map(|row| {
+            HourlyLatencyPoint::from_stored_parts(
+                row.strategy_slug,
+                row.window_start_ms,
+                row.window_end_ms,
+                row.computed_at_ms,
+                LatencyQuantiles::from_stored(
+                    row.margin_new_create_count as u64,
+                    row.margin_new_create_normal_count as u64,
+                    row.margin_new_create_p50_ms,
+                    row.margin_new_create_p90_ms,
+                ),
+                LatencyQuantiles::from_stored(
+                    row.futures_new_create_count as u64,
+                    row.futures_new_create_normal_count as u64,
+                    row.futures_new_create_p50_ms,
+                    row.futures_new_create_p90_ms,
+                ),
+                LatencyQuantiles::from_stored(
+                    row.spot_trigger_count as u64,
+                    row.spot_trigger_normal_count as u64,
+                    row.spot_trigger_p50_ms,
+                    row.spot_trigger_p90_ms,
+                ),
+                LatencyQuantiles::from_stored(
+                    row.futures_trigger_count as u64,
+                    row.futures_trigger_normal_count as u64,
+                    row.futures_trigger_p50_ms,
+                    row.futures_trigger_p90_ms,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(HourlyLatencySeries {
+        strategy_slug: slug,
+        points,
+    })
+    .into_response())
 }
 
 fn intra_analysis_adapter(strategy: &IntraAnalysisStrategyRecord) -> Option<IntraAnalysisAdapter> {
@@ -2110,6 +2237,7 @@ mod tests {
         intra_analysis_adapter, is_default_bybit_instrument, parse_initial_positions,
         snapshot_source_url, valid_schema,
     };
+    use crate::intra_latency;
 
     #[test]
     fn detects_only_non_empty_assignments() {
@@ -2166,6 +2294,11 @@ mod tests {
             "bybit_premium_index_klines"
         );
         assert!(intra_analysis_adapter(&bybit_arb02).is_none());
+        assert!(intra_latency::supports_hourly_latency(
+            "binance-intra-arb01"
+        ));
+        assert!(intra_latency::supports_hourly_latency("bybit-intra-arb01"));
+        assert!(!intra_latency::supports_hourly_latency("bybit-intra-arb02"));
     }
 
     #[test]

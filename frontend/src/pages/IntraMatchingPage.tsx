@@ -5,12 +5,14 @@ import {
   CircleAlert,
   Clock3,
   Database,
+  FlaskConical,
   GitCompareArrows,
   RefreshCw,
   TimerReset,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { strategySurfaceAnalysisLink } from '../analysisNav'
 import {
   getAlignmentStatuses,
   getIntraMatchingSummaries,
@@ -208,6 +210,9 @@ export function IntraMatchingPage() {
     ? writeTone(selected, alignment)
     : 'waiting'
   const tradeState = alignmentTone(alignment)
+  const analysisLink = selected
+    ? strategySurfaceAnalysisLink(selected.strategySlug)
+    : null
 
   return (
     <>
@@ -222,10 +227,22 @@ export function IntraMatchingPage() {
               <p>Intra 订单状态</p>
             </div>
           </Link>
-          <Link className="header-nav-link" to="/">
-            <ArrowLeft size={16} />
-            盘子总览
-          </Link>
+          <div className="detail-header-actions">
+            {analysisLink && (
+              <Link
+                className="strategy-card__analysis"
+                to={analysisLink.to}
+                title="查看组合 FIFO 分析"
+              >
+                <FlaskConical size={14} />
+                {analysisLink.label}
+              </Link>
+            )}
+            <Link className="header-nav-link" to="/">
+              <ArrowLeft size={16} />
+              盘子总览
+            </Link>
+          </div>
         </div>
       </header>
 

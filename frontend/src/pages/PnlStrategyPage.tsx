@@ -5,6 +5,7 @@ import {
   CircleAlert,
   Database,
   ExternalLink,
+  FlaskConical,
   GitCompareArrows,
   LoaderCircle,
   RefreshCw,
@@ -29,6 +30,7 @@ import {
   alignmentTitle,
   alignmentTone,
 } from '../alignment'
+import { strategySurfaceAnalysisLink } from '../analysisNav'
 import { PnlChart } from '../components/PnlChart'
 import { PositionChart } from '../components/PositionChart'
 import type {
@@ -444,6 +446,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
 
   const summary = pnl?.summary
   const isMarketMaking = strategy.strategyKind === 'market_making'
+  const analysisLink = strategySurfaceAnalysisLink(strategy.slug)
   const activePositionSeries: PositionSeriesKey[] =
     positionDisplayMode === 'exposure'
       ? ['exposureUsdt']
@@ -477,11 +480,23 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
               <h1>{strategy.displayName}</h1>
             </div>
           </div>
-          <a className="config-button" href={strategy.configUrl}>
-            <Settings size={17} />
-            配置
-            <ExternalLink size={14} />
-          </a>
+          <div className="detail-header-actions">
+            {analysisLink && (
+              <Link
+                className="strategy-card__analysis"
+                to={analysisLink.to}
+                title="查看组合 FIFO 分析"
+              >
+                <FlaskConical size={14} />
+                <span>{analysisLink.label}</span>
+              </Link>
+            )}
+            <a className="config-button" href={strategy.configUrl}>
+              <Settings size={17} />
+              配置
+              <ExternalLink size={14} />
+            </a>
+          </div>
         </div>
       </header>
 
