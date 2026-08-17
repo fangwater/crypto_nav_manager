@@ -3,9 +3,14 @@ import { useId, useState } from 'react'
 import {
   ANALYSIS_METRIC_HELP,
   toggleAnalysisHelperOpen,
+  type AnalysisMetricHelpItem,
 } from '../analysisMetricHelp'
 
-export function AnalysisMetricHelper() {
+export function AnalysisMetricHelper({
+  items = ANALYSIS_METRIC_HELP,
+}: {
+  items?: readonly AnalysisMetricHelpItem[]
+}) {
   const [open, setOpen] = useState(false)
   const panelId = useId()
 
@@ -28,7 +33,7 @@ export function AnalysisMetricHelper() {
           role="region"
           aria-label="指标计算说明"
         >
-          {ANALYSIS_METRIC_HELP.map((item) => (
+          {items.map((item) => (
             <article key={item.id}>
               <h3>{item.title}</h3>
               <p>{item.formula}</p>

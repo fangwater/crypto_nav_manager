@@ -104,6 +104,36 @@ export function analysisMetricHelpById(id: string): AnalysisMetricHelpItem | und
   return ANALYSIS_METRIC_HELP.find((item) => item.id === id)
 }
 
+export function analysisMetricHelpForStrategy(slug: string): AnalysisMetricHelpItem[] {
+  const includeCarry = slug !== 'binance-intra-arb01'
+  return ANALYSIS_METRIC_HELP.flatMap((item) => {
+    if (!includeCarry && (item.id === 'closed-funding' || item.id === 'closed-interest')) {
+      return []
+    }
+    if (!includeCarry && item.id === 'fee-mode-pnl') {
+      return [
+        {
+          ...item,
+          formula:
+            'Fee 前 = 交易价差；实际 Fee 后再减窗口成交费；参考 Fee 后按参考 bps × 闭环四腿本金扣费',
+          meaning:
+            '页面顶部主数字随“收益口径”切换。只统计 FIFO 已经对上开平仓的数量，未闭环仓位不进这个数。Binance intra 研究口径不含闭环 Funding / Interest。',
+        },
+      ]
+    }
+    if (!includeCarry && item.id === 'fee-impact') {
+      return [
+        {
+          ...item,
+          meaning:
+            '显示当前口径相对交易价差多扣了多少手续费。实际覆盖率看窗口成交里能换成 USDT 的名义金额占比。',
+        },
+      ]
+    }
+    return [item]
+  })
+}
+
 export function toggleAnalysisHelperOpen(current: boolean): boolean {
   return !current
 }

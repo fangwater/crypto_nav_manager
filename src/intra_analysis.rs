@@ -6,6 +6,10 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 const QUANTITY_EPSILON: f64 = 1e-10;
 
+pub fn includes_closed_carry(strategy_slug: &str) -> bool {
+    strategy_slug != "binance-intra-arb01"
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArbDirection {
@@ -1347,6 +1351,13 @@ mod tests {
             quantity,
             premium: None,
         }
+    }
+
+    #[test]
+    fn binance_intra_analysis_excludes_closed_carry() {
+        assert!(!includes_closed_carry("binance-intra-arb01"));
+        assert!(includes_closed_carry("bybit-intra-arb01"));
+        assert!(includes_closed_carry("bybit-intra-arb02"));
     }
 
     fn request(start_ms: i64, end_ms: i64) -> IntraAnalysisRequest {

@@ -9,6 +9,10 @@ export function isIntraAnalysisSlug(slug: string): slug is IntraAnalysisSlug {
   return (INTRA_ANALYSIS_SLUGS as readonly string[]).includes(slug)
 }
 
+export function intraAnalysisIncludesClosedCarry(slug: string) {
+  return slug !== 'binance-intra-arb01'
+}
+
 export function intraAnalysisPath(slug: string): string | null {
   return isIntraAnalysisSlug(slug) ? `/analysis/${slug}` : null
 }

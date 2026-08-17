@@ -2,14 +2,14 @@ import { LineChart } from 'echarts/charts'
 import {
   DataZoomComponent,
   GridComponent,
-  LegendComponent,
   TooltipComponent,
 } from 'echarts/components'
 import * as echarts from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   bindHourlyLatencyChart,
+  visibleLatencyChartModel,
   type HourlyLatencySeries,
 } from '../analysisLatencyChart'
 
@@ -17,21 +17,9 @@ echarts.use([
   LineChart,
   DataZoomComponent,
   GridComponent,
-  LegendComponent,
   TooltipComponent,
   CanvasRenderer,
 ])
-
-const seriesColors = [
-  '#176b5b',
-  '#7aa89d',
-  '#2563a7',
-  '#7ea2c8',
-  '#b45309',
-  '#d4a373',
-  '#7c3a91',
-  '#b48bc9',
-]
 
 function chartTime(value: number) {
   const date = new Date(value)
@@ -43,11 +31,16 @@ function chartTime(value: number) {
 
 export function IntraLatencyChart({
   series,
+  selectedKeys,
 }: {
   series: HourlyLatencySeries | null
+  selectedKeys: readonly string[]
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const model = bindHourlyLatencyChart(series)
+  const model = useMemo(
+    () => visibleLatencyChartModel(bindHourlyLatencyChart(series), selectedKeys),
+    [series, selectedKeys],
+  )
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -56,15 +49,7 @@ export function IntraLatencyChart({
     })
     chart.setOption({
       animation: false,
-      color: seriesColors,
-      grid: { top: 56, right: 18, bottom: 48, left: 52 },
-      legend: {
-        top: 0,
-        left: 0,
-        itemWidth: 10,
-        itemHeight: 6,
-        textStyle: { fontSize: 10, color: '#5b6570' },
-      },
+      grid: { top: 18, right: 18, bottom: 48, left: 52 },
       tooltip: {
         trigger: 'axis',
         valueFormatter: (value: number | string) =>
@@ -90,6 +75,12 @@ export function IntraLatencyChart({
         connectNulls: true,
         showSymbol: model.categoryTimes.length <= 24,
         data: line.values,
+        lineStyle: {
+          width: 1.6,
+          color: line.color,
+          type: line.dashed ? 'dashed' : 'solid',
+        },
+        itemStyle: { color: line.color },
       })),
     })
     const onResize = () => chart.resize()
@@ -106,6 +97,7 @@ export function IntraLatencyChart({
       className="analysis-chart analysis-latency-chart"
       data-chart-id={model.chartId}
       data-distinct-from={model.distinctFrom}
+      data-selected-count={model.series.length}
     />
   )
 }

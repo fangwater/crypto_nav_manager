@@ -19,12 +19,25 @@ import {
   type IntraFifoChartMode,
 } from '../components/IntraFifoChart'
 import { IntraLatencyChart } from '../components/IntraLatencyChart'
+import { analysisMetricHelpForStrategy } from '../analysisMetricHelp'
+import { intraAnalysisIncludesClosedCarry } from '../analysisNav'
 import {
   intraFeeModeConfig,
   intraFeeModeOptions,
   intraSymbolColor,
 } from '../intraAnalysisSeries'
-import type { HourlyLatencySeries } from '../analysisLatencyChart'
+import {
+  LATENCY_CHART_FAMILIES,
+  LATENCY_CHART_LINES,
+  LATENCY_LINE_FILTERS,
+  defaultLatencyLineKeys,
+  latencyLineFilterFromKeys,
+  latencyLineKeysForFilter,
+  toggleLatencyFamilyKeys,
+  toggleLatencyLineKey,
+  type HourlyLatencySeries,
+  type LatencyFamilyKey,
+} from '../analysisLatencyChart'
 import type {
   IntraAnalysis,
   IntraArbDirection,
@@ -240,7 +253,76 @@ function SymbolPool({
   )
 }
 
-function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraFeeMode }) {
+function LatencyFamily({
+  family,
+  name,
+  selectedKeys,
+  onToggleLine,
+  onToggleFamily,
+}: {
+  family: LatencyFamilyKey
+  name: string
+  selectedKeys: ReadonlySet<string>
+  onToggleLine: (key: string) => void
+  onToggleFamily: (family: LatencyFamilyKey) => void
+}) {
+  const rows = LATENCY_CHART_LINES.filter((line) => line.family === family)
+  const selectedCount = rows.filter((line) => selectedKeys.has(line.key)).length
+  const allSelected = rows.length > 0 && selectedCount === rows.length
+
+  return (
+    <section className="analysis-symbol-pool analysis-latency-family">
+      <label className="analysis-symbol-pool__header">
+        <input
+          type="checkbox"
+          checked={allSelected}
+          onChange={() => onToggleFamily(family)}
+        />
+        <span>{name}</span>
+        <small>{selectedCount} / {rows.length}</small>
+      </label>
+      <div className="analysis-symbol-pool__list">
+        {rows.map((line) => (
+          <label
+            className={
+              'analysis-symbol-option' +
+              (selectedKeys.has(line.key) ? ' is-selected' : '')
+            }
+            key={line.key}
+          >
+            <input
+              type="checkbox"
+              checked={selectedKeys.has(line.key)}
+              onChange={() => onToggleLine(line.key)}
+            />
+            <span
+              className={
+                'analysis-symbol-option__swatch' +
+                (line.dashed ? ' analysis-symbol-option__swatch--dashed' : '')
+              }
+              style={{
+                backgroundColor: line.color,
+                borderTopColor: line.color,
+              }}
+              aria-hidden="true"
+            />
+            <strong>{line.quantileLabel}</strong>
+          </label>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function SymbolRow({
+  row,
+  feeMode,
+  includeClosedCarry,
+}: {
+  row: IntraSymbolAnalysis
+  feeMode: IntraFeeMode
+  includeClosedCarry: boolean
+}) {
   const pnl = feeModePnl(row, feeMode)
   const feeImpact = feeModeImpact(row, feeMode)
   return (
@@ -265,14 +347,18 @@ function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraF
               : '未计 Fee'}
         </small>
       </td>
-      <td className={valueClass(row.fundingPnlUsdt)}>
-        <strong>{money(row.fundingPnlUsdt, true)}</strong>
-        <small>{bps(row.fundingReturnBps, true)} bps</small>
-      </td>
-      <td className={valueClass(-row.interestCostUsdt)}>
-        <strong>{money(-row.interestCostUsdt, true)}</strong>
-        <small>{bps(-row.interestCostReturnBps, true)} bps</small>
-      </td>
+      {includeClosedCarry && (
+        <>
+          <td className={valueClass(row.fundingPnlUsdt)}>
+            <strong>{money(row.fundingPnlUsdt, true)}</strong>
+            <small>{bps(row.fundingReturnBps, true)} bps</small>
+          </td>
+          <td className={valueClass(-row.interestCostUsdt)}>
+            <strong>{money(-row.interestCostUsdt, true)}</strong>
+            <small>{bps(-row.interestCostReturnBps, true)} bps</small>
+          </td>
+        </>
+      )}
       <td className={valueClass(row.marketPnlUsdt)}>
         <strong>{money(row.marketPnlUsdt, true)}</strong>
         <small>{bps(row.marketReturnBps, true)} bps</small>
@@ -291,6 +377,7 @@ function SymbolRow({ row, feeMode }: { row: IntraSymbolAnalysis; feeMode: IntraF
 
 export function IntraAnalysisPage() {
   const { slug = '' } = useParams()
+  const includeClosedCarry = intraAnalysisIncludesClosedCarry(slug)
   const [strategy, setStrategy] = useState<Strategy | null>(null)
   const [analysis, setAnalysis] = useState<IntraAnalysis | null>(null)
   const [latencySeries, setLatencySeries] = useState<HourlyLatencySeries | null>(null)
@@ -306,6 +393,9 @@ export function IntraAnalysisPage() {
   const [chartSymbolSelection, setChartSymbolSelection] =
     useState<ChartSymbolSelection>('all')
   const [selectedChartSymbols, setSelectedChartSymbols] = useState<string[]>([])
+  const [selectedLatencyKeys, setSelectedLatencyKeys] = useState<string[]>(
+    defaultLatencyLineKeys,
+  )
   const [pageError, setPageError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
@@ -471,6 +561,11 @@ export function IntraAnalysisPage() {
       ),
     [chartSymbolRows],
   )
+  const selectedLatencyKeySet = useMemo(
+    () => new Set(selectedLatencyKeys),
+    [selectedLatencyKeys],
+  )
+  const latencyLineFilter = latencyLineFilterFromKeys(selectedLatencyKeys)
 
   function applyRange() {
     if (!strategy) return
@@ -548,6 +643,18 @@ export function IntraAnalysisPage() {
     })
   }
 
+  function selectLatencyLines(filter: (typeof LATENCY_LINE_FILTERS)[number]['key']) {
+    setSelectedLatencyKeys(latencyLineKeysForFilter(filter))
+  }
+
+  function toggleLatencyLine(key: string) {
+    setSelectedLatencyKeys((current) => toggleLatencyLineKey(current, key))
+  }
+
+  function toggleLatencyFamily(family: LatencyFamilyKey) {
+    setSelectedLatencyKeys((current) => toggleLatencyFamilyKeys(current, family))
+  }
+
   if (!strategy && !pageError) {
     return (
       <main className="detail-shell">
@@ -613,11 +720,17 @@ export function IntraAnalysisPage() {
             </div>
           </div>
           <div className="analysis-header-tags">
-            <AnalysisMetricHelper />
+            <AnalysisMetricHelper items={analysisMetricHelpForStrategy(slug)} />
             <span title="独立研究口径，不进入正式 NAV">
               <FlaskConical size={14} /> Research
             </span>
-            <span title="只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding 与 Interest">
+            <span
+              title={
+                includeClosedCarry
+                  ? '只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding 与 Interest'
+                  : '只统计 FIFO 已闭环数量；研究口径不含闭环 Funding / Interest'
+              }
+            >
               Closed FIFO only
             </span>
           </div>
@@ -722,7 +835,11 @@ export function IntraAnalysisPage() {
           <div>
             <Database size={16} />
             <span>口径</span>
-            <strong>交易价差 + Funding - Interest - Fee</strong>
+            <strong>
+              {includeClosedCarry
+                ? '交易价差 + Funding - Interest - Fee'
+                : '交易价差 - Fee'}
+            </strong>
           </div>
           <div>
             <Database size={16} />
@@ -761,7 +878,11 @@ export function IntraAnalysisPage() {
               </button>
             ))}
           </div>
-          <span>Funding 与 Interest 按事件时开放本金分配，随 FIFO 闭环数量释放；Fee 按闭环四腿本金分摊</span>
+          <span>
+            {includeClosedCarry
+              ? 'Funding 与 Interest 按事件时开放本金分配，随 FIFO 闭环数量释放；Fee 按闭环四腿本金分摊'
+              : '研究口径不含闭环 Funding / Interest；Fee 按闭环四腿本金分摊'}
+          </span>
         </section>
 
         <section className="analysis-metrics" aria-label="组合 FIFO 汇总">
@@ -789,22 +910,26 @@ export function IntraAnalysisPage() {
                 : '--'}
             </small>
           </div>
-          <div className="analysis-metric">
-            <span>闭环 Funding</span>
-            <strong className={valueClass(summary?.fundingPnlUsdt ?? 0)}>
-              {summary ? money(summary.fundingPnlUsdt, true) : '--'}
-            </strong>
-            <small>{summary ? bps(summary.fundingReturnBps, true) : '--'} bps</small>
-          </div>
-          <div className="analysis-metric">
-            <span>闭环 Interest</span>
-            <strong className={valueClass(-(summary?.interestCostUsdt ?? 0))}>
-              {summary ? money(-summary.interestCostUsdt, true) : '--'}
-            </strong>
-            <small>
-              {summary ? bps(-summary.interestCostReturnBps, true) : '--'} bps
-            </small>
-          </div>
+          {includeClosedCarry && (
+            <>
+              <div className="analysis-metric">
+                <span>闭环 Funding</span>
+                <strong className={valueClass(summary?.fundingPnlUsdt ?? 0)}>
+                  {summary ? money(summary.fundingPnlUsdt, true) : '--'}
+                </strong>
+                <small>{summary ? bps(summary.fundingReturnBps, true) : '--'} bps</small>
+              </div>
+              <div className="analysis-metric">
+                <span>闭环 Interest</span>
+                <strong className={valueClass(-(summary?.interestCostUsdt ?? 0))}>
+                  {summary ? money(-summary.interestCostUsdt, true) : '--'}
+                </strong>
+                <small>
+                  {summary ? bps(-summary.interestCostReturnBps, true) : '--'} bps
+                </small>
+              </div>
+            </>
+          )}
           <div className="analysis-metric">
             <span>选币基差收益</span>
             <strong className={valueClass(summary?.marketPnlUsdt ?? 0)}>
@@ -883,6 +1008,7 @@ export function IntraAnalysisPage() {
                   symbolColors={chartSymbolColors}
                   mode={chartMode}
                   feeMode={feeMode}
+                  includeClosedCarry={includeClosedCarry}
                 />
               )}
               {chartMode === 'symbol' &&
@@ -979,17 +1105,21 @@ export function IntraAnalysisPage() {
               {analysis.source.sampled && <span>sampled</span>}
               <span>closed four-leg fee allocation</span>
               <span>{bps(analysis.summary.referenceFeeBps)} bps reference fee</span>
-              <span>
-                {compactNumber(analysis.source.allocatedFundingRows)} /{' '}
-                {compactNumber(analysis.source.windowFundingRows)} funding events allocated
-              </span>
-              <span>funding on open lots, released by FIFO closed quantity</span>
-              <span>
-                {compactNumber(analysis.source.allocatedInterestRows)} /{' '}
-                {compactNumber(analysis.source.windowInterestRows)} interest events allocated
-              </span>
-              <span>{compactNumber(analysis.source.convertedInterestRows)} interest events converted</span>
-              <span>interest on open spot borrowing, released by FIFO closed quantity</span>
+              {includeClosedCarry && (
+                <>
+                  <span>
+                    {compactNumber(analysis.source.allocatedFundingRows)} /{' '}
+                    {compactNumber(analysis.source.windowFundingRows)} funding events allocated
+                  </span>
+                  <span>funding on open lots, released by FIFO closed quantity</span>
+                  <span>
+                    {compactNumber(analysis.source.allocatedInterestRows)} /{' '}
+                    {compactNumber(analysis.source.windowInterestRows)} interest events allocated
+                  </span>
+                  <span>{compactNumber(analysis.source.convertedInterestRows)} interest events converted</span>
+                  <span>interest on open spot borrowing, released by FIFO closed quantity</span>
+                </>
+              )}
             </div>
           )}
         </section>
@@ -1004,12 +1134,22 @@ export function IntraAnalysisPage() {
               <h2>小时订单时延</h2>
             </div>
             <span className="analysis-chart-total">
+              {selectedLatencyKeys.length} / {LATENCY_CHART_LINES.length} series ·{' '}
               {latencySeries?.points.length ?? 0} hours
             </span>
           </div>
-          <div className="analysis-chart-body">
+          <div className="analysis-chart-body analysis-chart-body--symbol">
             <div className="analysis-chart-stage">
-              <IntraLatencyChart series={latencySeries} />
+              {selectedLatencyKeys.length > 0 ? (
+                <IntraLatencyChart
+                  series={latencySeries}
+                  selectedKeys={selectedLatencyKeys}
+                />
+              ) : (
+                <div className="chart-loading analysis-chart-empty">
+                  <span>请从右侧勾选时延序列</span>
+                </div>
+              )}
               {loading && (
                 <div className="chart-loading">
                   <LoaderCircle size={20} />
@@ -1017,10 +1157,47 @@ export function IntraAnalysisPage() {
                 </div>
               )}
             </div>
+            <aside className="analysis-symbol-selector" aria-label="小时时延序列选择">
+              <div className="analysis-symbol-selector__header">
+                <div>
+                  <span>时延曲线</span>
+                  <strong>
+                    {selectedLatencyKeys.length} / {LATENCY_CHART_LINES.length}
+                  </strong>
+                </div>
+                <div
+                  className="segmented segmented--compact analysis-symbol-filter"
+                  aria-label="按时延分位筛选"
+                >
+                  {LATENCY_LINE_FILTERS.map((option) => (
+                    <button
+                      key={option.key}
+                      className={latencyLineFilter === option.key ? 'is-active' : ''}
+                      type="button"
+                      onClick={() => selectLatencyLines(option.key)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="analysis-symbol-pools analysis-latency-pools">
+                {LATENCY_CHART_FAMILIES.map((family) => (
+                  <LatencyFamily
+                    key={family.family}
+                    family={family.family}
+                    name={family.name}
+                    selectedKeys={selectedLatencyKeySet}
+                    onToggleLine={toggleLatencyLine}
+                    onToggleFamily={toggleLatencyFamily}
+                  />
+                ))}
+              </div>
+            </aside>
           </div>
           <div className="chart-foot">
-            <span>Margin / Futures NEW−create p50/p90</span>
-            <span>现货信号 / 合约信号行情延迟 p50/p90</span>
+            <span>默认只显示 p50，避免 8 条线叠在一起</span>
+            <span>p90 为虚线</span>
             <span>按触发腿拆分，平局不计入</span>
             <span>正常路径 ≤ 100 ms</span>
           </div>
@@ -1043,8 +1220,12 @@ export function IntraAnalysisPage() {
                   <th>闭环本金</th>
                   <th>{feeModeConfig.label}收益</th>
                   <th>Fee 影响</th>
-                  <th>闭环 Funding</th>
-                  <th>闭环 Interest</th>
+                  {includeClosedCarry && (
+                    <>
+                      <th>闭环 Funding</th>
+                      <th>闭环 Interest</th>
+                    </>
+                  )}
                   <th>选币基差</th>
                   <th>闭环两腿执行</th>
                   <th>闭环 k 覆盖</th>
@@ -1052,10 +1233,19 @@ export function IntraAnalysisPage() {
               </thead>
               <tbody>
                 {visibleSymbols.map((row) => (
-                  <SymbolRow key={row.symbol} row={row} feeMode={feeMode} />
+                  <SymbolRow
+                    key={row.symbol}
+                    row={row}
+                    feeMode={feeMode}
+                    includeClosedCarry={includeClosedCarry}
+                  />
                 ))}
                 {!loading && visibleSymbols.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={10}>暂无闭环数据</td></tr>
+                  <tr>
+                    <td className="analysis-empty" colSpan={includeClosedCarry ? 10 : 8}>
+                      暂无闭环数据
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>
@@ -1085,8 +1275,12 @@ export function IntraAnalysisPage() {
                   <th>选币基差</th>
                   <th>开仓腿执行</th>
                   <th>平仓腿执行</th>
-                  <th>闭环 Funding</th>
-                  <th>闭环 Interest</th>
+                  {includeClosedCarry && (
+                    <>
+                      <th>闭环 Funding</th>
+                      <th>闭环 Interest</th>
+                    </>
+                  )}
                   <th>Fee 影响</th>
                   <th>{feeModeConfig.label}收益</th>
                 </tr>
@@ -1140,12 +1334,16 @@ export function IntraAnalysisPage() {
                     <td className={valueClass(row.exitExecutionPnlUsdt ?? 0)}>
                       <strong>{optionalMoney(row.exitExecutionPnlUsdt)}</strong>
                     </td>
-                    <td className={valueClass(row.fundingPnlUsdt)}>
-                      <strong>{money(row.fundingPnlUsdt, true)}</strong>
-                    </td>
-                    <td className={valueClass(-row.interestCostUsdt)}>
-                      <strong>{money(-row.interestCostUsdt, true)}</strong>
-                    </td>
+                    {includeClosedCarry && (
+                      <>
+                        <td className={valueClass(row.fundingPnlUsdt)}>
+                          <strong>{money(row.fundingPnlUsdt, true)}</strong>
+                        </td>
+                        <td className={valueClass(-row.interestCostUsdt)}>
+                          <strong>{money(-row.interestCostUsdt, true)}</strong>
+                        </td>
+                      </>
+                    )}
                     <td className={valueClass(matchFeeModeImpact(row, feeMode))}>
                       <strong>{money(matchFeeModeImpact(row, feeMode), true)}</strong>
                     </td>
@@ -1156,7 +1354,11 @@ export function IntraAnalysisPage() {
                   </tr>
                 ))}
                 {!loading && analysis?.matches.length === 0 && (
-                  <tr><td className="analysis-empty" colSpan={15}>当前范围没有 FIFO 闭环</td></tr>
+                  <tr>
+                    <td className="analysis-empty" colSpan={includeClosedCarry ? 15 : 13}>
+                      当前范围没有 FIFO 闭环
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>

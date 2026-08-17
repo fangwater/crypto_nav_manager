@@ -64,10 +64,26 @@ export function verifyHelper() {
   assert.match(helperSource, /useState\(false\)/)
   assert.match(helperSource, /aria-expanded=\{open\}/)
   assert.match(helperSource, /\{open && \(/)
-  assert.match(helperSource, /ANALYSIS_METRIC_HELP/)
+  assert.match(helperSource, /items\.map/)
 
   const page = read('src/pages/IntraAnalysisPage.tsx')
-  assert.match(page, /<AnalysisMetricHelper \/>/)
+  assert.match(page, /<AnalysisMetricHelper items=\{analysisMetricHelpForStrategy\(slug\)\} \/>/)
+  assert.match(page, /intraAnalysisIncludesClosedCarry\(slug\)/)
+  const binanceHelp = help.analysisMetricHelpForStrategy('binance-intra-arb01')
+  const bybitHelp = help.analysisMetricHelpForStrategy('bybit-intra-arb01')
+  assert.equal(
+    binanceHelp.some((item) => item.id === 'closed-funding'),
+    false,
+  )
+  assert.equal(
+    binanceHelp.some((item) => item.id === 'closed-interest'),
+    false,
+  )
+  assert.ok(bybitHelp.some((item) => item.id === 'closed-funding'))
+  assert.match(
+    binanceHelp.find((item) => item.id === 'fee-mode-pnl').formula,
+    /Fee 前 = 交易价差/,
+  )
   return { helperItems: titles.length, collapsedByDefault: true }
 }
 
@@ -82,6 +98,8 @@ export function verifyNavigation() {
     assert.equal(page.rendersAnalysisPage, true)
   }
   assert.equal(nav.strategySurfaceAnalysisLink('bybit-intra-arb02'), null)
+  assert.equal(nav.intraAnalysisIncludesClosedCarry('binance-intra-arb01'), false)
+  assert.equal(nav.intraAnalysisIncludesClosedCarry('bybit-intra-arb01'), true)
 
   const app = read('src/App.tsx')
   assert.match(app, /path="\/analysis\/:slug"/)
@@ -184,10 +202,45 @@ export function verifyLatencyChart() {
   assert.deepEqual(filled.series[4].values, [2.1, 2.1, 2.2])
   assert.deepEqual(filled.series[6].values, [2.0, 2.0, 2.1])
 
+  const defaultKeys = chart.defaultLatencyLineKeys()
+  assert.deepEqual(defaultKeys, [
+    'marginNewCreate-p50Ms',
+    'futuresNewCreate-p50Ms',
+    'spotTrigger-p50Ms',
+    'futuresTrigger-p50Ms',
+  ])
+  assert.equal(chart.latencyLineFilterFromKeys(defaultKeys), 'p50')
+  assert.deepEqual(
+    chart.toggleLatencyLineKey(defaultKeys, 'marginNewCreate-p90Ms'),
+    [
+      'marginNewCreate-p50Ms',
+      'marginNewCreate-p90Ms',
+      'futuresNewCreate-p50Ms',
+      'spotTrigger-p50Ms',
+      'futuresTrigger-p50Ms',
+    ],
+  )
+  assert.deepEqual(
+    chart.toggleLatencyFamilyKeys(defaultKeys, 'marginNewCreate'),
+    [
+      'marginNewCreate-p50Ms',
+      'marginNewCreate-p90Ms',
+      'futuresNewCreate-p50Ms',
+      'spotTrigger-p50Ms',
+      'futuresTrigger-p50Ms',
+    ],
+  )
+  const visible = chart.visibleLatencyChartModel(model, ['spotTrigger-p50Ms'])
+  assert.deepEqual(visible.series.map((line) => line.key), ['spotTrigger-p50Ms'])
+  assert.equal(visible.series[0].color, '#b45309')
+
   const page = read('src/pages/IntraAnalysisPage.tsx')
   assert.match(page, /data-chart-id="fifo-closed-pnl"/)
   assert.match(page, /data-chart-id="hourly-latency"/)
-  assert.match(page, /<IntraLatencyChart series=\{latencySeries\} \/>/)
+  assert.match(page, /selectedKeys=\{selectedLatencyKeys\}/)
+  assert.match(page, /aria-label="小时时延序列选择"/)
+  const chartSource = read('src/components/IntraLatencyChart.tsx')
+  assert.match(chartSource, /selectedKeys: readonly string\[\]/)
   return { seriesCount: model.series.length, distinctFromFifo: true }
 }
 

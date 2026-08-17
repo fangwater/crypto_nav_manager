@@ -1064,12 +1064,15 @@ async fn get_intra_analysis(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let include_closed_carry = intra_analysis::includes_closed_carry(&strategy.slug);
     let mut spot_price_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
-    for order in &orders {
-        spot_price_history
-            .entry(order.symbol.to_ascii_uppercase())
-            .or_default()
-            .push((order.completed_at_ms, order.spot_price));
+    if include_closed_carry {
+        for order in &orders {
+            spot_price_history
+                .entry(order.symbol.to_ascii_uppercase())
+                .or_default()
+                .push((order.completed_at_ms, order.spot_price));
+        }
     }
     let fee_sql = format!(
         r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
@@ -1100,16 +1103,16 @@ async fn get_intra_analysis(
             fee_usdt: row.fee_usdt,
         })
         .collect::<Vec<_>>();
-    let funding_sql = format!(
-        r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
-                  COALESCE(amount_usdt,amount)::float8 AS amount_usdt
-           FROM {}.funding
-           WHERE symbol IS NOT NULL
-             AND event_time_ms >= $1 AND event_time_ms <= $2
-           ORDER BY event_time_ms,symbol,record_id"#,
-        strategy.db_schema
-    );
-    let funding_events =
+    let funding_events = if include_closed_carry {
+        let funding_sql = format!(
+            r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
+                      COALESCE(amount_usdt,amount)::float8 AS amount_usdt
+               FROM {}.funding
+               WHERE symbol IS NOT NULL
+                 AND event_time_ms >= $1 AND event_time_ms <= $2
+               ORDER BY event_time_ms,symbol,record_id"#,
+            strategy.db_schema
+        );
         sqlx::query_as::<_, IntraAnalysisFundingRecord>(sqlx::AssertSqlSafe(funding_sql))
             .bind(start_ms)
             .bind(end_ms)
@@ -1121,17 +1124,20 @@ async fn get_intra_analysis(
                 ts: row.ts,
                 amount_usdt: row.amount_usdt,
             })
-            .collect::<Vec<_>>();
-    let interest_sql = format!(
-        r#"SELECT upper(symbol) AS symbol,upper(asset) AS asset,
-                  amount::float8 AS amount,amount_usdt::float8 AS amount_usdt,
-                  event_time_ms AS ts
-           FROM {}.interest
-           WHERE event_time_ms >= $1 AND event_time_ms <= $2
-           ORDER BY event_time_ms,asset,record_id"#,
-        strategy.db_schema
-    );
-    let interest_events =
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let interest_events = if include_closed_carry {
+        let interest_sql = format!(
+            r#"SELECT upper(symbol) AS symbol,upper(asset) AS asset,
+                      amount::float8 AS amount,amount_usdt::float8 AS amount_usdt,
+                      event_time_ms AS ts
+               FROM {}.interest
+               WHERE event_time_ms >= $1 AND event_time_ms <= $2
+               ORDER BY event_time_ms,asset,record_id"#,
+            strategy.db_schema
+        );
         sqlx::query_as::<_, IntraAnalysisInterestRecord>(sqlx::AssertSqlSafe(interest_sql))
             .bind(start_ms)
             .bind(end_ms)
@@ -1163,7 +1169,10 @@ async fn get_intra_analysis(
                         .map(|amount| pnl::interest_cost_usdt(&strategy.exchange, amount)),
                 }
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let selected_symbols = query
         .symbols
         .unwrap_or_default()
@@ -2237,7 +2246,7 @@ mod tests {
         intra_analysis_adapter, is_default_bybit_instrument, parse_initial_positions,
         snapshot_source_url, valid_schema,
     };
-    use crate::intra_latency;
+    use crate::{intra_analysis, intra_latency};
 
     #[test]
     fn detects_only_non_empty_assignments() {
@@ -2299,6 +2308,8 @@ mod tests {
         ));
         assert!(intra_latency::supports_hourly_latency("bybit-intra-arb01"));
         assert!(!intra_latency::supports_hourly_latency("bybit-intra-arb02"));
+        assert!(!intra_analysis::includes_closed_carry("binance-intra-arb01"));
+        assert!(intra_analysis::includes_closed_carry("bybit-intra-arb01"));
     }
 
     #[test]

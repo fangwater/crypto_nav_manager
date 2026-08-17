@@ -21,9 +21,30 @@ export interface HourlyLatencySeries {
   points: HourlyLatencyPoint[]
 }
 
+export type LatencyFamilyKey = keyof Pick<
+  HourlyLatencyPoint,
+  'marginNewCreate' | 'futuresNewCreate' | 'spotTrigger' | 'futuresTrigger'
+>
+
+export type LatencyQuantile = 'p50Ms' | 'p90Ms'
+export type LatencyLineFilter = 'all' | 'p50' | 'p90'
+
+export interface LatencyChartLineDef {
+  key: string
+  family: LatencyFamilyKey
+  familyName: string
+  quantile: LatencyQuantile
+  quantileLabel: 'p50' | 'p90'
+  name: string
+  color: string
+  dashed: boolean
+}
+
 export interface LatencyChartLine {
   key: string
   name: string
+  color: string
+  dashed: boolean
   values: Array<number | null>
 }
 
@@ -34,20 +55,170 @@ export interface LatencyChartModel {
   series: LatencyChartLine[]
 }
 
-const LATENCY_LINES: ReadonlyArray<{
-  key: keyof HourlyLatencyPoint
-  quantile: 'p50Ms' | 'p90Ms'
-  name: string
-}> = [
-  { key: 'marginNewCreate', quantile: 'p50Ms', name: 'Margin NEW−create p50' },
-  { key: 'marginNewCreate', quantile: 'p90Ms', name: 'Margin NEW−create p90' },
-  { key: 'futuresNewCreate', quantile: 'p50Ms', name: 'Futures NEW−create p50' },
-  { key: 'futuresNewCreate', quantile: 'p90Ms', name: 'Futures NEW−create p90' },
-  { key: 'spotTrigger', quantile: 'p50Ms', name: '现货信号 p50' },
-  { key: 'spotTrigger', quantile: 'p90Ms', name: '现货信号 p90' },
-  { key: 'futuresTrigger', quantile: 'p50Ms', name: '合约信号 p50' },
-  { key: 'futuresTrigger', quantile: 'p90Ms', name: '合约信号 p90' },
+export const LATENCY_CHART_LINES: readonly LatencyChartLineDef[] = [
+  {
+    key: 'marginNewCreate-p50Ms',
+    family: 'marginNewCreate',
+    familyName: 'Margin NEW−create',
+    quantile: 'p50Ms',
+    quantileLabel: 'p50',
+    name: 'Margin NEW−create p50',
+    color: '#176b5b',
+    dashed: false,
+  },
+  {
+    key: 'marginNewCreate-p90Ms',
+    family: 'marginNewCreate',
+    familyName: 'Margin NEW−create',
+    quantile: 'p90Ms',
+    quantileLabel: 'p90',
+    name: 'Margin NEW−create p90',
+    color: '#7aa89d',
+    dashed: true,
+  },
+  {
+    key: 'futuresNewCreate-p50Ms',
+    family: 'futuresNewCreate',
+    familyName: 'Futures NEW−create',
+    quantile: 'p50Ms',
+    quantileLabel: 'p50',
+    name: 'Futures NEW−create p50',
+    color: '#2563a7',
+    dashed: false,
+  },
+  {
+    key: 'futuresNewCreate-p90Ms',
+    family: 'futuresNewCreate',
+    familyName: 'Futures NEW−create',
+    quantile: 'p90Ms',
+    quantileLabel: 'p90',
+    name: 'Futures NEW−create p90',
+    color: '#7ea2c8',
+    dashed: true,
+  },
+  {
+    key: 'spotTrigger-p50Ms',
+    family: 'spotTrigger',
+    familyName: '现货信号',
+    quantile: 'p50Ms',
+    quantileLabel: 'p50',
+    name: '现货信号 p50',
+    color: '#b45309',
+    dashed: false,
+  },
+  {
+    key: 'spotTrigger-p90Ms',
+    family: 'spotTrigger',
+    familyName: '现货信号',
+    quantile: 'p90Ms',
+    quantileLabel: 'p90',
+    name: '现货信号 p90',
+    color: '#d4a373',
+    dashed: true,
+  },
+  {
+    key: 'futuresTrigger-p50Ms',
+    family: 'futuresTrigger',
+    familyName: '合约信号',
+    quantile: 'p50Ms',
+    quantileLabel: 'p50',
+    name: '合约信号 p50',
+    color: '#7c3a91',
+    dashed: false,
+  },
+  {
+    key: 'futuresTrigger-p90Ms',
+    family: 'futuresTrigger',
+    familyName: '合约信号',
+    quantile: 'p90Ms',
+    quantileLabel: 'p90',
+    name: '合约信号 p90',
+    color: '#b48bc9',
+    dashed: true,
+  },
 ]
+
+export const LATENCY_CHART_FAMILIES: readonly {
+  family: LatencyFamilyKey
+  name: string
+}[] = [
+  { family: 'marginNewCreate', name: 'Margin NEW−create' },
+  { family: 'futuresNewCreate', name: 'Futures NEW−create' },
+  { family: 'spotTrigger', name: '现货信号' },
+  { family: 'futuresTrigger', name: '合约信号' },
+]
+
+export const LATENCY_LINE_FILTERS: readonly {
+  key: LatencyLineFilter
+  label: string
+}[] = [
+  { key: 'all', label: '全部' },
+  { key: 'p50', label: 'p50' },
+  { key: 'p90', label: 'p90' },
+]
+
+export function defaultLatencyLineKeys(): string[] {
+  return latencyLineKeysForFilter('p50')
+}
+
+export function latencyLineKeysForFilter(filter: LatencyLineFilter): string[] {
+  if (filter === 'all') {
+    return LATENCY_CHART_LINES.map((line) => line.key)
+  }
+  const quantile: LatencyQuantile = filter === 'p50' ? 'p50Ms' : 'p90Ms'
+  return LATENCY_CHART_LINES.filter((line) => line.quantile === quantile).map(
+    (line) => line.key,
+  )
+}
+
+export function sameLatencyLineKeys(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((key, index) => key === right[index])
+  )
+}
+
+export function latencyLineFilterFromKeys(
+  selected: readonly string[],
+): LatencyLineFilter | 'custom' {
+  for (const filter of ['p50', 'p90', 'all'] as const) {
+    if (sameLatencyLineKeys(selected, latencyLineKeysForFilter(filter))) {
+      return filter
+    }
+  }
+  return 'custom'
+}
+
+export function toggleLatencyLineKey(
+  selected: readonly string[],
+  key: string,
+): string[] {
+  const next = new Set(selected)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  return LATENCY_CHART_LINES.map((line) => line.key).filter((lineKey) =>
+    next.has(lineKey),
+  )
+}
+
+export function toggleLatencyFamilyKeys(
+  selected: readonly string[],
+  family: LatencyFamilyKey,
+): string[] {
+  const familyKeys = LATENCY_CHART_LINES.filter((line) => line.family === family).map(
+    (line) => line.key,
+  )
+  const allSelected = familyKeys.every((key) => selected.includes(key))
+  const next = new Set(selected)
+  if (allSelected) familyKeys.forEach((key) => next.delete(key))
+  else familyKeys.forEach((key) => next.add(key))
+  return LATENCY_CHART_LINES.map((line) => line.key).filter((lineKey) =>
+    next.has(lineKey),
+  )
+}
 
 export function ffillLatencyValues(
   values: Array<number | null>,
@@ -72,16 +243,26 @@ export function bindHourlyLatencyChart(
     chartId: 'hourly-latency',
     distinctFrom: 'fifo-closed-pnl',
     categoryTimes: points.map((point) => point.windowStartMs),
-    series: LATENCY_LINES.map((line) => ({
-      key: `${String(line.key)}-${line.quantile}`,
+    series: LATENCY_CHART_LINES.map((line) => ({
+      key: line.key,
       name: line.name,
+      color: line.color,
+      dashed: line.dashed,
       values: ffillLatencyValues(
-        points.map((point) => {
-          const quantiles = point[line.key] as LatencyQuantiles
-          return quantiles[line.quantile]
-        }),
+        points.map((point) => point[line.family][line.quantile]),
       ),
     })),
+  }
+}
+
+export function visibleLatencyChartModel(
+  model: LatencyChartModel,
+  selectedKeys: readonly string[],
+): LatencyChartModel {
+  const allowed = new Set(selectedKeys)
+  return {
+    ...model,
+    series: model.series.filter((line) => allowed.has(line.key)),
   }
 }
 
