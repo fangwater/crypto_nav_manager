@@ -447,7 +447,7 @@ impl BinanceClient {
         asset: Option<&str>,
         archived: bool,
     ) -> Result<Vec<Value>, ExchangeError> {
-        self.require_portfolio_margin()?;
+        let (base, path) = margin_interest_endpoint(self.mode);
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut current = 1_u32;
@@ -463,12 +463,7 @@ impl BinanceClient {
                     params.push(("asset".to_string(), asset.to_string()));
                 }
                 let value = self
-                    .history_signed_get(
-                        PAPI_BASE,
-                        "/papi/v1/margin/marginInterestHistory",
-                        params,
-                        1,
-                    )
+                    .history_signed_get(base, path, params, 1)
                     .await?;
                 let page = value
                     .get("rows")
@@ -829,6 +824,15 @@ fn history_retry_delay(error: &ExchangeError) -> Option<std::time::Duration> {
     }
 }
 
+fn margin_interest_endpoint(mode: BinanceAccountMode) -> (&'static str, &'static str) {
+    match mode {
+        BinanceAccountMode::PortfolioMargin => {
+            (PAPI_BASE, "/papi/v1/margin/marginInterestHistory")
+        }
+        BinanceAccountMode::UsdmFutures => (API_BASE, "/sapi/v1/margin/interestHistory"),
+    }
+}
+
 fn margin_interest_query_ranges(
     range: TimeRange,
     current_time_ms: i64,
@@ -1017,6 +1021,18 @@ mod tests {
         assert_eq!(
             history_retry_delay(&error),
             Some(std::time::Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn margin_interest_uses_account_mode_endpoint() {
+        assert_eq!(
+            margin_interest_endpoint(BinanceAccountMode::PortfolioMargin),
+            (PAPI_BASE, "/papi/v1/margin/marginInterestHistory")
+        );
+        assert_eq!(
+            margin_interest_endpoint(BinanceAccountMode::UsdmFutures),
+            (API_BASE, "/sapi/v1/margin/interestHistory")
         );
     }
 

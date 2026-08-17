@@ -31,7 +31,7 @@
 | UM 合约成交 | GET /papi/v1/um/userTrades | Portfolio Margin |
 | 资金费收入 | GET /papi/v1/um/income，incomeType=FUNDING_FEE | Portfolio Margin |
 | UM 合约手续费率 | GET /fapi/v1/commissionRate；GET /papi/v1/um/commissionRate | USD-M Futures；Portfolio Margin |
-| 借贷计息历史 | GET /papi/v1/margin/marginInterestHistory | Portfolio Margin |
+| 借贷计息历史 | GET /papi/v1/margin/marginInterestHistory；GET /sapi/v1/margin/interestHistory | Portfolio Margin；USD-M / 标准杠杆账户 |
 | Spot MM 小时返佣入账 | GET /sapi/v1/asset/assetDividend | USD-M Futures 标准账户 |
 | 标记价、当前资金费率 | GET /fapi/v1/premiumIndex | 公共 |
 | 合约、现货估值价格 | GET /fapi/v2/ticker/price；GET /api/v3/ticker/price | 公共 |
@@ -44,8 +44,10 @@ UM futures transaction history 异步下载或本地历史 CSV。Spot MM 返佣�
 assetDividend 窗口若达到 500 条上限则自动二分，并按分发记录 `id` 幂等写入 `rebates` 表。
 Binance FR 的 CSV 首次导入完成后，`sync_history --dataset trades` 以成功水位线或 PG 最新成交
 继续增量同步，不从 `st_ms` 重扫；`funding` 和 `interest` 的首次补齐使用 `--full` 从 `st_ms`
-开始。Portfolio Margin interest 强制按最多 30 天窗口分页，并在 6 个月归档边界前后重叠 7 天
-查询 `archived`/当前存储，最终按 `txId` 去重。历史 GET 使用 60 秒 `recvWindow`，仅对本地
+开始。Binance interest 强制按最多 30 天窗口分页，并在 6 个月归档边界前后重叠 7 天
+查询 `archived`/当前存储，最终按 `txId` 去重。Portfolio Margin 走 papi
+`/margin/marginInterestHistory`；`binance-intra-arb01` 这类 USD-M 标准账户走 sapi
+`/margin/interestHistory`，与历史 CSV 导入脚本一致。历史 GET 使用 60 秒 `recvWindow`，仅对本地
 权重等待、传输/响应体解码失败和 Binance `-1021` 做有限的幂等重试。
 Binance intra PnL 对 Spot Maker 使用固定 `-0.4 bps` 手续费成本补丁，模拟下一小时入账的
 MM2 返佣；不会再把 `rebates` 表重复加入 PnL。可用
