@@ -20,7 +20,7 @@ import {
 } from '../components/IntraFifoChart'
 import { IntraLatencyChart } from '../components/IntraLatencyChart'
 import { analysisMetricHelpForStrategy } from '../analysisMetricHelp'
-import { intraAnalysisIncludesClosedCarry } from '../analysisNav'
+import { intraAnalysisHref, intraAnalysisIncludesClosedCarry, suggestIntraAnalysisSlug } from '../analysisNav'
 import {
   intraFeeModeConfig,
   intraFeeModeOptions,
@@ -664,6 +664,7 @@ export function IntraAnalysisPage() {
   }
 
   if (!strategy) {
+    const suggestedSlug = suggestIntraAnalysisSlug(slug)
     return (
       <main className="detail-shell">
         <Link className="back-link" to="/">
@@ -675,6 +676,13 @@ export function IntraAnalysisPage() {
           <div>
             <strong>研究数据加载失败</strong>
             <span>{pageError}</span>
+            {suggestedSlug ? (
+              <span>
+                你是不是想打开{' '}
+                <Link to={intraAnalysisHref(suggestedSlug)}>{suggestedSlug}</Link>
+                ？
+              </span>
+            ) : null}
           </div>
         </div>
       </main>

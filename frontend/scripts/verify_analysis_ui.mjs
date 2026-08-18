@@ -100,6 +100,13 @@ export function verifyNavigation() {
   assert.equal(nav.strategySurfaceAnalysisLink('bybit-intra-arb02'), null)
   assert.equal(nav.intraAnalysisIncludesClosedCarry('binance-intra-arb01'), false)
   assert.equal(nav.intraAnalysisIncludesClosedCarry('bybit-intra-arb01'), true)
+  assert.equal(nav.suggestIntraAnalysisSlug('bytbit-intra-arb01'), 'bybit-intra-arb01')
+  assert.equal(nav.suggestIntraAnalysisSlug('biannce-intra-arb01'), 'binance-intra-arb01')
+  assert.equal(nav.suggestIntraAnalysisSlug('bybit-intra-arb01'), null)
+
+  const analysisPage = read('src/pages/IntraAnalysisPage.tsx')
+  assert.match(analysisPage, /suggestIntraAnalysisSlug\(slug\)/)
+  assert.match(analysisPage, /intraAnalysisHref\(suggestedSlug\)/)
 
   const app = read('src/App.tsx')
   assert.match(app, /path="\/analysis\/:slug"/)
