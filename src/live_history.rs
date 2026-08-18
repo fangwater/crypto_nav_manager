@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{AssertSqlSafe, FromRow, PgPool};
 use std::{
     collections::BTreeSet,
     env,
@@ -25,6 +25,7 @@ const FR_ONLINE_LISTS: [&str; 5] = [
     "unimmr_close_symbols",
 ];
 const INTRA_ONLINE_LISTS: [&str; 3] = ["dump_symbols", "fwd_trade_symbols", "bwd_trade_symbols"];
+const RECENT_TRADE_SYMBOL_LOOKBACK_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 struct LiveHistoryConfig {
@@ -41,6 +42,7 @@ struct LiveHistoryConfig {
 #[derive(Clone, Debug, FromRow)]
 struct LiveHistoryStrategy {
     slug: String,
+    db_schema: String,
     env_path: String,
     exchange: String,
     strategy_kind: String,
@@ -190,10 +192,30 @@ async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHis
                     false
                 }
             };
+        let recent_symbols = if uses_online_symbols(&strategy) {
+            match load_recent_trade_symbols(&pool, &strategy.db_schema).await {
+                Ok(symbols) => symbols,
+                Err(error) => {
+                    warn!(
+                        strategy = %strategy.slug,
+                        error = ?error,
+                        "load recent trade symbols failed"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let task_config = config.clone();
         let task_strategy = strategy.clone();
         match tokio::task::spawn_blocking(move || {
-            sync_strategy(&task_config, task_strategy, automatic_alignment_enabled)
+            sync_strategy(
+                &task_config,
+                task_strategy,
+                automatic_alignment_enabled,
+                recent_symbols,
+            )
         })
         .await
         {
@@ -252,7 +274,7 @@ async fn load_automatic_alignment_enabled(pool: &PgPool, slug: &str) -> Result<b
 
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     sqlx::query_as(
-        r#"SELECT s.slug, s.env_path, s.exchange, s.strategy_kind,
+        r#"SELECT s.slug, s.db_schema, s.env_path, s.exchange, s.strategy_kind,
                   (ROW_NUMBER() OVER (
                     PARTITION BY s.exchange ORDER BY s.sort_order, s.slug
                   ) - 1)::bigint AS schedule_offset_minutes
@@ -282,26 +304,35 @@ fn sync_strategy(
     config: &LiveHistoryConfig,
     strategy: LiveHistoryStrategy,
     automatic_alignment_enabled: bool,
+    recent_symbols: Vec<String>,
 ) -> Result<SyncReport> {
     let mut failures = Vec::new();
     let mut summaries = Vec::new();
     let needs_online_symbols = uses_online_symbols(&strategy);
     let symbols = if needs_online_symbols {
-        match load_online_symbols(config, &strategy) {
-            Ok(symbols) if symbols.is_empty() => {
-                warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
-                Vec::new()
-            }
+        let online = match load_online_symbols(config, &strategy) {
             Ok(symbols) => symbols,
             Err(error) => {
                 warn!(
                     strategy = %strategy.slug,
                     error = ?error,
-                    "load online symbols failed; skip live trades"
+                    "load online symbols failed"
                 );
                 Vec::new()
             }
+        };
+        let symbols = merge_trade_symbols(online.iter().cloned(), recent_symbols);
+        if symbols.is_empty() {
+            warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
+        } else if symbols.len() > online.len() {
+            info!(
+                strategy = %strategy.slug,
+                online_symbols = online.len(),
+                trade_symbols = symbols.len(),
+                "including recently traded symbols missing from online lists"
+            );
         }
+        symbols
     } else {
         Vec::new()
     };
@@ -529,6 +560,70 @@ fn run_sync_history(
         .to_string())
 }
 
+async fn load_recent_trade_symbols(pool: &PgPool, schema: &str) -> Result<Vec<String>> {
+    if !valid_schema(schema) {
+        bail!("invalid strategy schema: {schema}");
+    }
+    let time_column = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema=$1 AND table_name='trades' \
+           AND column_name IN ('event_time_ms','ts') \
+         ORDER BY CASE column_name WHEN 'event_time_ms' THEN 0 ELSE 1 END \
+         LIMIT 1",
+    )
+    .bind(schema)
+    .fetch_optional(pool)
+    .await
+    .context("detect trade timestamp column")?;
+    let Some(time_column) = time_column else {
+        return Ok(Vec::new());
+    };
+    if time_column != "event_time_ms" && time_column != "ts" {
+        bail!("unexpected trade timestamp column {time_column}");
+    }
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis(),
+    )
+    .context("current timestamp exceeds i64")?;
+    let start_ms = now_ms.saturating_sub(RECENT_TRADE_SYMBOL_LOOKBACK_MS);
+    let sql = format!(
+        "SELECT DISTINCT symbol FROM {schema}.trades \
+         WHERE {time_column} >= $1 AND symbol IS NOT NULL"
+    );
+    let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(sql.as_str()))
+        .bind(start_ms)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("load recent trade symbols from {schema}.trades"))?;
+    Ok(merge_trade_symbols(rows, std::iter::empty::<String>()))
+}
+
+fn merge_trade_symbols(
+    online: impl IntoIterator<Item = String>,
+    recent: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut symbols = BTreeSet::new();
+    for symbol in online.into_iter().chain(recent) {
+        if let Some(normalized) = normalize_online_symbol(&symbol) {
+            symbols.insert(normalized);
+        }
+    }
+    symbols.into_iter().collect()
+}
+
+fn valid_schema(schema: &str) -> bool {
+    let mut characters = schema.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase())
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
 fn load_online_symbols(
     config: &LiveHistoryConfig,
     strategy: &LiveHistoryStrategy,
@@ -655,13 +750,14 @@ mod tests {
 
     use super::{
         LiveHistoryStrategy, account_datasets, alignment_check_enabled, delay_until_next_slot,
-        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_redis_mget,
-        uses_online_symbols,
+        merge_trade_symbols, normalize_online_symbol, online_symbol_keys, order_synthesis_enabled,
+        parse_redis_mget, uses_online_symbols,
     };
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
         LiveHistoryStrategy {
             slug: slug.to_string(),
+            db_schema: slug.replace('-', "_"),
             env_path: format!("/home/ubuntu/{slug}/env.sh"),
             exchange: exchange.to_string(),
             strategy_kind: strategy_kind.to_string(),
@@ -792,5 +888,16 @@ mod tests {
             Some("1000PEPEUSDT".to_string())
         );
         assert_eq!(normalize_online_symbol(""), None);
+    }
+
+    #[test]
+    fn keeps_recently_traded_symbols_after_they_leave_online_lists() {
+        assert_eq!(
+            merge_trade_symbols(
+                ["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+                ["linkusdt".to_string(), "BTC-USDT-SWAP".to_string()],
+            ),
+            vec!["BTCUSDT", "ETHUSDT", "LINKUSDT"]
+        );
     }
 }
