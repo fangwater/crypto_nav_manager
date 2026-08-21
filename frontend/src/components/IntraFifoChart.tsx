@@ -127,28 +127,6 @@ export function IntraFifoChart({
                 },
               ]
             : []),
-          {
-            name: '选币基差',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, point.marketPnlUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 1.6, color: '#2563a7' },
-            itemStyle: { color: '#2563a7' },
-            emphasis: { focus: 'series' as const },
-          },
-          {
-            name: '闭环执行',
-            type: 'line' as const,
-            data: points.map((point) => [point.ts, point.executionPnlUsdt]),
-            showSymbol: false,
-            sampling: 'lttb' as const,
-            connectNulls: true,
-            lineStyle: { width: 1.6, color: '#b45309' },
-            itemStyle: { color: '#b45309' },
-            emphasis: { focus: 'series' as const },
-          },
           ...(includeClosedCarry
             ? [
                 {
@@ -193,8 +171,6 @@ export function IntraFifoChart({
           data: [
             fee.label,
             ...(feeImpact ? [feeImpact.name] : []),
-            '选币基差',
-            '闭环执行',
             ...(includeClosedCarry ? ['闭环 Funding', '闭环 Interest'] : []),
           ],
         },
@@ -268,7 +244,7 @@ export function IntraFifoChart({
       observer.disconnect()
       chart.dispose()
     }
-  }, [feeMode, mode, points, symbolColors, symbolPoints])
+  }, [feeMode, includeClosedCarry, mode, points, symbolColors, symbolPoints])
 
   return (
     <div
@@ -276,7 +252,7 @@ export function IntraFifoChart({
       className="analysis-chart"
       aria-label={
         mode === 'portfolio'
-          ? `正反套 FIFO ${intraFeeModeConfig(feeMode).label}及闭环根因累计曲线`
+          ? `FIFO ${intraFeeModeConfig(feeMode).label}累计曲线`
           : `各币 ${intraFeeModeConfig(feeMode).label}累计曲线`
       }
     />

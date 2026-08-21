@@ -12,7 +12,7 @@ export const ANALYSIS_METRIC_HELP: readonly AnalysisMetricHelpItem[] = [
     formula:
       'Fee 前 = 交易价差 + 闭环 Funding − 闭环 Interest；实际 Fee 后再减窗口成交费；参考 Fee 后按参考 bps × 闭环四腿本金扣费',
     meaning:
-      '页面顶部主数字随“收益口径”切换。只统计 FIFO 已经对上开平仓的数量，未闭环仓位不进这个数。',
+            '页面顶部主数字随“收益口径”切换。只有开、平都在选定区间内的正反配对才计算；区间外开仓或未配对单边不进这个数。',
   },
   {
     id: 'fee-impact',
@@ -39,33 +39,34 @@ export const ANALYSIS_METRIC_HELP: readonly AnalysisMetricHelpItem[] = [
       '页面上的闭环 Interest 是成本，显示为负数。无法换成 USDT 的利息只记覆盖缺口，不改收益。',
   },
   {
-    id: 'market-basis',
-    title: '选币基差收益',
+    id: 'fee-capture',
+    title: '过费兑现',
     formula:
-      '开平仓各取同分钟 premium-index close 作为市场基差；收益 = 数量 × 开仓方向 × (开仓市场基差 − 平仓市场基差)',
+      'A 过费 = 扣费后收益 > 0 的闭环名义 / 全部闭环名义；B 不够 = 成交价差为正但扣费后 ≤ 0；C 没兑现 = 成交价差 ≤ 0。Fee 前口径下 A 为价差为正的名义占比',
     meaning:
-      '衡量“选对了这个币的基差方向”带来的钱，尽量剥离成交滑点。缺 premium 的闭环不进这项。',
+      '看有多少名义真正盖过了手续费。全量 FIFO 分桶，不靠页面上最近闭环样本。Binance intra 实际费含现货 maker −0.4 bps 补丁。',
   },
   {
-    id: 'closed-execution',
-    title: '闭环两腿执行',
-    formula:
-      '开仓执行 = 数量 × 开仓方向 × (成交基差 − 开仓分钟市场基差)；平仓同理；两项相加',
+    id: 'fill-basis',
+    title: '成交基差',
+    formula: '成交基差 = 合约成交价 − 现货成交价；明细表按笔展示开仓腿 → 平仓腿',
     meaning:
-      '成交价相对当时市场基差多赚或少赚的部分。选币基差 + 两腿执行 ≈ 交易价差，前提是开平仓都有 premium。',
-  },
-  {
-    id: 'premium-coverage',
-    title: 'Premium 覆盖',
-    formula: '同时具备开平仓 premium 的闭环次数 / 全部 FIFO 闭环次数',
-    meaning: '选币基差和执行拆解能覆盖多少闭环。覆盖不足时那两项会小于交易价差。',
+      '每一笔都是开、平都在选定区间内的正反闭环。主数字是这些配对合在一起的成交价差，待配对单边不参与。',
   },
   {
     id: 'fifo-closed',
     title: 'FIFO 闭环',
-    formula: '按币种、相反方向把开仓数量与后续平仓数量先进先出配对；胜率 = 交易价差为正的闭环次数 / 总闭环次数',
+    formula:
+      '按币种、只在选定区间内把相反方向数量先进先出配成正反闭环；开仓腿或平仓腿落在区间外的不配对、不计入收益',
     meaning:
-      '研究用的开平配对，不是交易所成交笔数。持仓中的数量要等对上反向腿才进入收益。',
+      'FIFO 用来完整评估一轮正反，但开、平必须都在你选的时间范围内。更早开、今天才平的不算进今日收益，区间内对不上的单边挂在待配对。',
+  },
+  {
+    id: 'unpaired',
+    title: '待配对',
+    formula: '选定区间结束时仍未对上反向腿的剩余数量，按开仓现货价计名义',
+    meaning:
+      '包括区间内开了还没平的库存，以及区间内出现但对不上同区间反向腿的单边。这些不计算收益、胜率和过费分桶。',
   },
   {
     id: 'margin-new-create',
@@ -117,7 +118,7 @@ export function analysisMetricHelpForStrategy(slug: string): AnalysisMetricHelpI
           formula:
             'Fee 前 = 交易价差；实际 Fee 后再减窗口成交费；参考 Fee 后按参考 bps × 闭环四腿本金扣费',
           meaning:
-            '页面顶部主数字随“收益口径”切换。只统计 FIFO 已经对上开平仓的数量，未闭环仓位不进这个数。Binance intra 研究口径不含闭环 Funding / Interest。',
+            '页面顶部主数字随“收益口径”切换。只有开、平都在选定区间内的正反配对才计算；区间外开仓或未配对单边不进这个数。Binance intra 研究口径不含闭环 Funding / Interest。实际 Fee 对现货 maker 按 −0.4 bps 补丁，与账户 PnL 相同。',
         },
       ]
     }
@@ -126,7 +127,7 @@ export function analysisMetricHelpForStrategy(slug: string): AnalysisMetricHelpI
         {
           ...item,
           meaning:
-            '显示当前口径相对交易价差多扣了多少手续费。实际覆盖率看窗口成交里能换成 USDT 的名义金额占比。',
+            '显示当前口径相对交易价差多扣了多少手续费。Binance intra 现货 maker 按 −0.4 bps 补丁计入（成交表记 0，下一小时 MM2 返佣），与账户 PnL 同一口径。实际覆盖率看窗口成交里能换成 USDT 的名义金额占比。',
         },
       ]
     }

@@ -129,7 +129,40 @@ pub struct IntraAnalysisResponse {
     pub points: Vec<IntraAnalysisPoint>,
     pub symbol_points: Vec<IntraSymbolSeries>,
     pub matches: Vec<IntraClosedMatch>,
+    pub pending_lots: Vec<IntraPendingLot>,
     pub source: IntraAnalysisSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntraDirectionSlice {
+    pub closed_match_count: u64,
+    pub winning_match_count: u64,
+    pub win_rate: f64,
+    pub matched_notional_usdt: f64,
+    pub gross_pnl_usdt: f64,
+    pub gross_return_bps: f64,
+    pub trading_fee_usdt: f64,
+    pub fee_after_pnl_usdt: f64,
+    pub fee_after_return_bps: f64,
+    pub reference_trading_fee_usdt: f64,
+    pub reference_fee_after_pnl_usdt: f64,
+    pub reference_fee_after_return_bps: f64,
+    pub average_holding_ms: f64,
+    pub average_entry_basis_bps: f64,
+    pub average_exit_basis_bps: f64,
+    pub captured_positive_notional_usdt: f64,
+    pub captured_above_fee_notional_usdt: f64,
+    pub captured_below_fee_notional_usdt: f64,
+    pub uncaptured_notional_usdt: f64,
+    pub captured_above_reference_fee_notional_usdt: f64,
+    pub captured_below_reference_fee_notional_usdt: f64,
+    pub captured_positive_share: f64,
+    pub captured_above_fee_share: f64,
+    pub captured_below_fee_share: f64,
+    pub uncaptured_share: f64,
+    pub captured_above_reference_fee_share: f64,
+    pub captured_below_reference_fee_share: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -175,6 +208,8 @@ pub struct IntraAnalysisSummary {
     pub reverse_open_notional_usdt: f64,
     pub positive_average_basis_bps: f64,
     pub reverse_average_basis_bps: f64,
+    pub positive: IntraDirectionSlice,
+    pub reverse: IntraDirectionSlice,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -199,9 +234,40 @@ pub struct IntraAnalysisPoint {
     pub reference_fee_after_pnl_usdt: f64,
     pub market_pnl_usdt: f64,
     pub execution_pnl_usdt: f64,
+    pub positive_gross_pnl_usdt: f64,
+    pub reverse_gross_pnl_usdt: f64,
+    pub positive_fee_after_pnl_usdt: f64,
+    pub reverse_fee_after_pnl_usdt: f64,
+    pub positive_reference_fee_after_pnl_usdt: f64,
+    pub reverse_reference_fee_after_pnl_usdt: f64,
     pub matched_notional_usdt: f64,
     pub closed_match_count: u64,
     pub decomposed_match_count: u64,
+}
+
+impl IntraAnalysisPoint {
+    fn add_direction_close(
+        &mut self,
+        direction: ArbDirection,
+        gross_pnl_usdt: f64,
+        trading_fee_usdt: f64,
+        reference_trading_fee_usdt: f64,
+    ) {
+        match direction {
+            ArbDirection::Positive => {
+                self.positive_gross_pnl_usdt += gross_pnl_usdt;
+                self.positive_fee_after_pnl_usdt += gross_pnl_usdt - trading_fee_usdt;
+                self.positive_reference_fee_after_pnl_usdt +=
+                    gross_pnl_usdt - reference_trading_fee_usdt;
+            }
+            ArbDirection::Reverse => {
+                self.reverse_gross_pnl_usdt += gross_pnl_usdt;
+                self.reverse_fee_after_pnl_usdt += gross_pnl_usdt - trading_fee_usdt;
+                self.reverse_reference_fee_after_pnl_usdt +=
+                    gross_pnl_usdt - reference_trading_fee_usdt;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -248,6 +314,20 @@ pub struct IntraClosedMatch {
     pub return_bps: f64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntraPendingLot {
+    pub symbol: String,
+    pub direction: ArbDirection,
+    pub fkey: i64,
+    pub opened_at_ms: i64,
+    pub quantity: f64,
+    pub spot_price: f64,
+    pub futures_price: f64,
+    pub basis_bps: f64,
+    pub notional_usdt: f64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntraAnalysisSource {
@@ -272,6 +352,8 @@ pub struct IntraAnalysisSource {
     pub returned_points: usize,
     pub returned_symbol_points: usize,
     pub returned_matches: usize,
+    pub returned_pending_lots: usize,
+    pub pairing_rule: &'static str,
     pub sampled: bool,
     pub fees_included: bool,
     pub funding_included: bool,
@@ -357,6 +439,124 @@ struct SymbolState {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct DirectionAccumulator {
+    closed_match_count: u64,
+    winning_match_count: u64,
+    matched_notional_usdt: f64,
+    gross_pnl_usdt: f64,
+    trading_fee_usdt: f64,
+    reference_trading_fee_usdt: f64,
+    holding_notional_ms: f64,
+    entry_basis_notional_bps: f64,
+    exit_basis_notional_bps: f64,
+    captured_positive_notional_usdt: f64,
+    captured_above_fee_notional_usdt: f64,
+    captured_below_fee_notional_usdt: f64,
+    uncaptured_notional_usdt: f64,
+    captured_above_reference_fee_notional_usdt: f64,
+    captured_below_reference_fee_notional_usdt: f64,
+}
+
+impl DirectionAccumulator {
+    fn record(&mut self, row: &IntraClosedMatch, matched_notional: f64) {
+        self.closed_match_count += 1;
+        if row.pnl_usdt > 0.0 {
+            self.winning_match_count += 1;
+        }
+        self.matched_notional_usdt += matched_notional;
+        self.gross_pnl_usdt += row.gross_pnl_usdt;
+        self.trading_fee_usdt += row.trading_fee_usdt;
+        self.reference_trading_fee_usdt += row.reference_trading_fee_usdt;
+        self.holding_notional_ms += row.holding_ms as f64 * matched_notional;
+        self.entry_basis_notional_bps += row.entry_basis_bps * matched_notional;
+        self.exit_basis_notional_bps += row.exit_basis_bps * matched_notional;
+        if row.gross_pnl_usdt > 0.0 {
+            self.captured_positive_notional_usdt += matched_notional;
+        }
+        if row.fee_after_pnl_usdt > 0.0 {
+            self.captured_above_fee_notional_usdt += matched_notional;
+        } else if row.gross_pnl_usdt > 0.0 {
+            self.captured_below_fee_notional_usdt += matched_notional;
+        } else {
+            self.uncaptured_notional_usdt += matched_notional;
+        }
+        if row.reference_fee_after_pnl_usdt > 0.0 {
+            self.captured_above_reference_fee_notional_usdt += matched_notional;
+        } else if row.gross_pnl_usdt > 0.0 {
+            self.captured_below_reference_fee_notional_usdt += matched_notional;
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.closed_match_count += other.closed_match_count;
+        self.winning_match_count += other.winning_match_count;
+        self.matched_notional_usdt += other.matched_notional_usdt;
+        self.gross_pnl_usdt += other.gross_pnl_usdt;
+        self.trading_fee_usdt += other.trading_fee_usdt;
+        self.reference_trading_fee_usdt += other.reference_trading_fee_usdt;
+        self.holding_notional_ms += other.holding_notional_ms;
+        self.entry_basis_notional_bps += other.entry_basis_notional_bps;
+        self.exit_basis_notional_bps += other.exit_basis_notional_bps;
+        self.captured_positive_notional_usdt += other.captured_positive_notional_usdt;
+        self.captured_above_fee_notional_usdt += other.captured_above_fee_notional_usdt;
+        self.captured_below_fee_notional_usdt += other.captured_below_fee_notional_usdt;
+        self.uncaptured_notional_usdt += other.uncaptured_notional_usdt;
+        self.captured_above_reference_fee_notional_usdt +=
+            other.captured_above_reference_fee_notional_usdt;
+        self.captured_below_reference_fee_notional_usdt +=
+            other.captured_below_reference_fee_notional_usdt;
+    }
+
+    fn finish(self) -> IntraDirectionSlice {
+        let notional = self.matched_notional_usdt;
+        let fee_after = self.gross_pnl_usdt - self.trading_fee_usdt;
+        let reference_fee_after = self.gross_pnl_usdt - self.reference_trading_fee_usdt;
+        IntraDirectionSlice {
+            closed_match_count: self.closed_match_count,
+            winning_match_count: self.winning_match_count,
+            win_rate: ratio(
+                self.winning_match_count as f64,
+                self.closed_match_count as f64,
+            ),
+            matched_notional_usdt: clean_zero(notional),
+            gross_pnl_usdt: clean_zero(self.gross_pnl_usdt),
+            gross_return_bps: ratio(self.gross_pnl_usdt, notional) * 10_000.0,
+            trading_fee_usdt: clean_zero(self.trading_fee_usdt),
+            fee_after_pnl_usdt: clean_zero(fee_after),
+            fee_after_return_bps: ratio(fee_after, notional) * 10_000.0,
+            reference_trading_fee_usdt: clean_zero(self.reference_trading_fee_usdt),
+            reference_fee_after_pnl_usdt: clean_zero(reference_fee_after),
+            reference_fee_after_return_bps: ratio(reference_fee_after, notional) * 10_000.0,
+            average_holding_ms: ratio(self.holding_notional_ms, notional),
+            average_entry_basis_bps: ratio(self.entry_basis_notional_bps, notional),
+            average_exit_basis_bps: ratio(self.exit_basis_notional_bps, notional),
+            captured_positive_notional_usdt: clean_zero(self.captured_positive_notional_usdt),
+            captured_above_fee_notional_usdt: clean_zero(self.captured_above_fee_notional_usdt),
+            captured_below_fee_notional_usdt: clean_zero(self.captured_below_fee_notional_usdt),
+            uncaptured_notional_usdt: clean_zero(self.uncaptured_notional_usdt),
+            captured_above_reference_fee_notional_usdt: clean_zero(
+                self.captured_above_reference_fee_notional_usdt,
+            ),
+            captured_below_reference_fee_notional_usdt: clean_zero(
+                self.captured_below_reference_fee_notional_usdt,
+            ),
+            captured_positive_share: ratio(self.captured_positive_notional_usdt, notional),
+            captured_above_fee_share: ratio(self.captured_above_fee_notional_usdt, notional),
+            captured_below_fee_share: ratio(self.captured_below_fee_notional_usdt, notional),
+            uncaptured_share: ratio(self.uncaptured_notional_usdt, notional),
+            captured_above_reference_fee_share: ratio(
+                self.captured_above_reference_fee_notional_usdt,
+                notional,
+            ),
+            captured_below_reference_fee_share: ratio(
+                self.captured_below_reference_fee_notional_usdt,
+                notional,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct SummaryAccumulator {
     closed_match_count: u64,
     winning_match_count: u64,
@@ -372,6 +572,8 @@ struct SummaryAccumulator {
     market_pnl_usdt: f64,
     execution_pnl_usdt: f64,
     holding_notional_ms: f64,
+    positive: DirectionAccumulator,
+    reverse: DirectionAccumulator,
 }
 
 impl SummaryAccumulator {
@@ -396,6 +598,10 @@ impl SummaryAccumulator {
             self.execution_pnl_usdt += execution_pnl;
         }
         self.holding_notional_ms += row.holding_ms as f64 * matched_notional;
+        match row.open_direction {
+            ArbDirection::Positive => self.positive.record(row, matched_notional),
+            ArbDirection::Reverse => self.reverse.record(row, matched_notional),
+        }
     }
 
     fn add(&mut self, other: Self) {
@@ -413,6 +619,8 @@ impl SummaryAccumulator {
         self.market_pnl_usdt += other.market_pnl_usdt;
         self.execution_pnl_usdt += other.execution_pnl_usdt;
         self.holding_notional_ms += other.holding_notional_ms;
+        self.positive.add(other.positive);
+        self.reverse.add(other.reverse);
     }
 
     fn finish(self, open: OpenSummary) -> IntraAnalysisSummary {
@@ -477,6 +685,8 @@ impl SummaryAccumulator {
                 open.reverse_basis_notional_bps,
                 open.reverse_notional_usdt,
             ),
+            positive: self.positive.finish(),
+            reverse: self.reverse.finish(),
             ..IntraAnalysisSummary::default()
         }
     }
@@ -684,6 +894,12 @@ pub fn calculate_with_fees_funding_and_interest(
     let mut point_reference_trading_fee = 0.0;
     let mut point_market_pnl = 0.0;
     let mut point_execution_pnl = 0.0;
+    let mut point_positive_gross = 0.0;
+    let mut point_reverse_gross = 0.0;
+    let mut point_positive_trading_fee = 0.0;
+    let mut point_reverse_trading_fee = 0.0;
+    let mut point_positive_reference_trading_fee = 0.0;
+    let mut point_reverse_reference_trading_fee = 0.0;
     let mut point_notional = 0.0;
     let mut point_matches = 0_u64;
     let mut point_decomposed_matches = 0_u64;
@@ -711,10 +927,9 @@ pub fn calculate_with_fees_funding_and_interest(
     let mut allocated_interest_rows = 0_usize;
     let mut interest_index = 0_usize;
 
-    for order in orders
-        .iter()
-        .filter(|order| order.completed_at_ms <= request.end_ms)
-    {
+    for order in orders.iter().filter(|order| {
+        order.completed_at_ms >= request.start_ms && order.completed_at_ms <= request.end_ms
+    }) {
         while let Some(event) = window_funding_events.get(funding_index) {
             if event.ts > order.completed_at_ms {
                 break;
@@ -845,6 +1060,18 @@ pub fn calculate_with_fees_funding_and_interest(
                         point_execution_pnl += execution_pnl;
                         point_decomposed_matches += 1;
                     }
+                    match open.direction {
+                        ArbDirection::Positive => {
+                            point_positive_gross += gross_pnl_usdt;
+                            point_positive_trading_fee += trading_fee_usdt;
+                            point_positive_reference_trading_fee += reference_trading_fee_usdt;
+                        }
+                        ArbDirection::Reverse => {
+                            point_reverse_gross += gross_pnl_usdt;
+                            point_reverse_trading_fee += trading_fee_usdt;
+                            point_reverse_reference_trading_fee += reference_trading_fee_usdt;
+                        }
+                    }
                     point_notional += matched_notional;
                     point_matches += 1;
                     let symbol_total = symbol_point_totals
@@ -870,6 +1097,12 @@ pub fn calculate_with_fees_funding_and_interest(
                         symbol_total.execution_pnl_usdt += execution_pnl;
                         symbol_total.decomposed_match_count += 1;
                     }
+                    symbol_total.add_direction_close(
+                        open.direction,
+                        gross_pnl_usdt,
+                        trading_fee_usdt,
+                        reference_trading_fee_usdt,
+                    );
                     symbol_total.matched_notional_usdt += matched_notional;
                     symbol_total.closed_match_count += 1;
                     push_or_replace_point(
@@ -902,6 +1135,20 @@ pub fn calculate_with_fees_funding_and_interest(
                             ),
                             market_pnl_usdt: clean_zero(point_market_pnl),
                             execution_pnl_usdt: clean_zero(point_execution_pnl),
+                            positive_gross_pnl_usdt: clean_zero(point_positive_gross),
+                            reverse_gross_pnl_usdt: clean_zero(point_reverse_gross),
+                            positive_fee_after_pnl_usdt: clean_zero(
+                                point_positive_gross - point_positive_trading_fee,
+                            ),
+                            reverse_fee_after_pnl_usdt: clean_zero(
+                                point_reverse_gross - point_reverse_trading_fee,
+                            ),
+                            positive_reference_fee_after_pnl_usdt: clean_zero(
+                                point_positive_gross - point_positive_reference_trading_fee,
+                            ),
+                            reverse_reference_fee_after_pnl_usdt: clean_zero(
+                                point_reverse_gross - point_reverse_reference_trading_fee,
+                            ),
                             matched_notional_usdt: clean_zero(point_notional),
                             closed_match_count: point_matches,
                             decomposed_match_count: point_decomposed_matches,
@@ -956,6 +1203,42 @@ pub fn calculate_with_fees_funding_and_interest(
         if allocate_interest(&mut states, event, &selected) {
             allocated_interest_rows += 1;
         }
+    }
+
+    let mut pending_lots = selected_symbols
+        .iter()
+        .flat_map(|symbol| {
+            let state = states
+                .get(symbol)
+                .expect("all selected symbols retain an analysis state");
+            state
+                .positive
+                .iter()
+                .chain(state.reverse.iter())
+                .map(|lot| IntraPendingLot {
+                    symbol: symbol.clone(),
+                    direction: lot.direction,
+                    fkey: lot.fkey,
+                    opened_at_ms: lot.completed_at_ms,
+                    quantity: clean_zero(lot.remaining_quantity),
+                    spot_price: lot.spot_price,
+                    futures_price: lot.futures_price,
+                    basis_bps: lot.basis_bps(),
+                    notional_usdt: clean_zero(lot.remaining_quantity * lot.spot_price),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    pending_lots.sort_by(|left, right| {
+        right
+            .notional_usdt
+            .total_cmp(&left.notional_usdt)
+            .then_with(|| right.opened_at_ms.cmp(&left.opened_at_ms))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    let sampled_pending_lots = request.max_matches > 0 && pending_lots.len() > request.max_matches;
+    if sampled_pending_lots {
+        pending_lots.truncate(request.max_matches);
     }
 
     ensure_final_point(&mut points, request.end_ms);
@@ -1044,7 +1327,11 @@ pub fn calculate_with_fees_funding_and_interest(
         returned_points: points.len(),
         returned_symbol_points,
         returned_matches: matches.len(),
-        sampled: points.len() < original_point_count || sampled_symbol_points,
+        returned_pending_lots: pending_lots.len(),
+        pairing_rule: "open_and_close_inside_selected_window",
+        sampled: points.len() < original_point_count
+            || sampled_symbol_points
+            || sampled_pending_lots,
         fees_included: true,
         funding_included: true,
         interest_included: true,
@@ -1065,6 +1352,7 @@ pub fn calculate_with_fees_funding_and_interest(
         points,
         symbol_points,
         matches,
+        pending_lots,
         source,
     })
 }
@@ -1447,6 +1735,18 @@ mod tests {
         assert_eq!(response.matches[0].open_direction, ArbDirection::Positive);
         assert_close(response.matches[0].entry_basis_bps, 1_000.0);
         assert_close(response.matches[0].exit_basis_bps, 3.0 / 105.0 * 10_000.0);
+        assert_eq!(response.summary.positive.closed_match_count, 1);
+        assert_eq!(response.summary.reverse.closed_match_count, 0);
+        assert_close(response.summary.positive.gross_pnl_usdt, 14.0);
+        assert_close(response.summary.positive.matched_notional_usdt, 205.0);
+        assert_close(response.summary.positive.average_entry_basis_bps, 1_000.0);
+        assert_close(
+            response.summary.positive.average_exit_basis_bps,
+            3.0 / 105.0 * 10_000.0,
+        );
+        assert_close(response.summary.positive.captured_above_fee_share, 1.0);
+        assert_close(response.points.last().unwrap().positive_gross_pnl_usdt, 14.0);
+        assert_close(response.points.last().unwrap().reverse_gross_pnl_usdt, 0.0);
     }
 
     #[test]
@@ -1547,12 +1847,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_close(response.summary.realized_pnl_usdt, 5.0);
-        assert_close(response.summary.funding_pnl_usdt, 3.0);
-        assert_close(response.summary.gross_pnl_usdt, 8.0);
+        assert_eq!(response.summary.closed_match_count, 0);
+        assert_close(response.summary.realized_pnl_usdt, 0.0);
+        assert_close(response.summary.funding_pnl_usdt, 0.0);
         assert_eq!(response.source.loaded_funding_rows, 2);
         assert_eq!(response.source.window_funding_rows, 1);
-        assert_eq!(response.source.allocated_funding_rows, 1);
+        assert_eq!(response.source.allocated_funding_rows, 0);
+        assert_eq!(response.pending_lots.len(), 1);
+        assert_eq!(response.pending_lots[0].direction, ArbDirection::Reverse);
     }
 
     #[test]
@@ -1663,6 +1965,11 @@ mod tests {
 
         assert_close(response.summary.realized_pnl_usdt, 18.0);
         assert_eq!(response.matches[0].open_direction, ArbDirection::Reverse);
+        assert_eq!(response.summary.reverse.closed_match_count, 1);
+        assert_eq!(response.summary.positive.closed_match_count, 0);
+        assert_close(response.summary.reverse.gross_pnl_usdt, 18.0);
+        assert_close(response.points.last().unwrap().reverse_gross_pnl_usdt, 18.0);
+        assert_close(response.points.last().unwrap().positive_gross_pnl_usdt, 0.0);
     }
 
     #[test]
@@ -1728,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_window_orders_seed_fifo_for_window_closes() {
+    fn ignores_pre_window_opens_and_keeps_in_window_closes_pending() {
         let response = calculate(
             vec![
                 order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
@@ -1738,10 +2045,37 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.summary.closed_match_count, 1);
-        assert_close(response.summary.realized_pnl_usdt, 5.0);
+        assert_eq!(response.summary.closed_match_count, 0);
+        assert_close(response.summary.realized_pnl_usdt, 0.0);
+        assert_close(response.summary.reverse_open_quantity, 1.0);
+        assert_eq!(response.pending_lots.len(), 1);
+        assert_eq!(response.pending_lots[0].fkey, 2);
+        assert_eq!(response.pending_lots[0].direction, ArbDirection::Reverse);
         assert_eq!(response.points.first().unwrap().realized_pnl_usdt, 0.0);
-        assert_close(response.points.last().unwrap().realized_pnl_usdt, 5.0);
+        assert_eq!(response.points.last().unwrap().realized_pnl_usdt, 0.0);
+        assert_eq!(
+            response.source.pairing_rule,
+            "open_and_close_inside_selected_window"
+        );
+    }
+
+    #[test]
+    fn counts_only_pairs_whose_open_and_close_are_inside_the_window() {
+        let response = calculate(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(3, ArbDirection::Positive, 2_080, 100.0, 110.0, 1.0),
+                order(4, ArbDirection::Reverse, 2_100, 100.0, 105.0, 1.0),
+            ],
+            request(2_000, 2_200),
+        )
+        .unwrap();
+
+        assert_eq!(response.summary.closed_match_count, 1);
+        assert_eq!(response.matches[0].open_fkey, 3);
+        assert_eq!(response.matches[0].close_fkey, 4);
+        assert_close(response.summary.realized_pnl_usdt, 5.0);
+        assert!(response.pending_lots.is_empty());
     }
 
     #[test]
@@ -1761,12 +2095,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_close(response.summary.realized_pnl_usdt, 5.0);
-        assert_close(response.summary.market_pnl_usdt, 2.0);
-        assert_close(response.summary.execution_pnl_usdt, 3.0);
-        assert_close(response.matches[0].entry_execution_pnl_usdt.unwrap(), 2.0);
-        assert_close(response.matches[0].exit_execution_pnl_usdt.unwrap(), 1.0);
-        assert_close(response.points.last().unwrap().execution_pnl_usdt, 3.0);
+        assert_eq!(response.summary.closed_match_count, 0);
+        assert_close(response.summary.realized_pnl_usdt, 0.0);
+        assert_eq!(response.pending_lots.len(), 1);
+        assert_eq!(response.pending_lots[0].direction, ArbDirection::Reverse);
     }
 
     #[test]
@@ -1915,6 +2247,22 @@ mod tests {
                 .sum(),
             portfolio.execution_pnl_usdt,
         );
+        assert_close(
+            final_points
+                .iter()
+                .map(|point| point.positive_gross_pnl_usdt)
+                .sum(),
+            portfolio.positive_gross_pnl_usdt,
+        );
+        assert_close(
+            final_points
+                .iter()
+                .map(|point| point.reverse_gross_pnl_usdt)
+                .sum(),
+            portfolio.reverse_gross_pnl_usdt,
+        );
+        assert_eq!(response.summary.positive.closed_match_count, 1);
+        assert_eq!(response.summary.reverse.closed_match_count, 1);
         assert_eq!(
             response.source.returned_symbol_points,
             response
@@ -1922,6 +2270,58 @@ mod tests {
                 .iter()
                 .map(|series| series.points.len())
                 .sum::<usize>()
+        );
+    }
+
+    fn with_symbol(mut order: IntraAnalysisOrder, symbol: &str) -> IntraAnalysisOrder {
+        order.symbol = symbol.to_string();
+        order
+    }
+
+    #[test]
+    fn splits_closed_fifo_scoreboard_by_open_direction_and_fee_capture() {
+        let response = calculate_with_fees(
+            vec![
+                order(1, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                order(2, ArbDirection::Reverse, 1_200, 105.0, 108.0, 1.0),
+                with_symbol(
+                    order(3, ArbDirection::Reverse, 1_100, 110.0, 100.0, 1.0),
+                    "ETHUSDT",
+                ),
+                with_symbol(
+                    order(4, ArbDirection::Positive, 1_200, 105.0, 101.0, 1.0),
+                    "ETHUSDT",
+                ),
+                with_symbol(
+                    order(5, ArbDirection::Positive, 1_100, 100.0, 110.0, 1.0),
+                    "SOLUSDT",
+                ),
+                with_symbol(
+                    order(6, ArbDirection::Reverse, 1_200, 100.0, 120.0, 1.0),
+                    "SOLUSDT",
+                ),
+            ],
+            vec![fee_event("ETHUSDT", 1_150, 416.0, Some(10.0))],
+            request(1_000, 1_300),
+        )
+        .unwrap();
+
+        assert_eq!(response.summary.closed_match_count, 3);
+        assert_eq!(response.summary.positive.closed_match_count, 2);
+        assert_eq!(response.summary.reverse.closed_match_count, 1);
+        assert_close(response.summary.positive.gross_pnl_usdt, -3.0);
+        assert_close(response.summary.reverse.gross_pnl_usdt, 6.0);
+        assert_close(response.summary.positive.captured_above_fee_notional_usdt, 102.5);
+        assert_close(response.summary.positive.uncaptured_notional_usdt, 100.0);
+        assert_close(response.summary.reverse.captured_below_fee_notional_usdt, 107.5);
+        assert_close(response.summary.reverse.captured_above_fee_notional_usdt, 0.0);
+        let final_point = response.points.last().unwrap();
+        assert_close(final_point.positive_gross_pnl_usdt, -3.0);
+        assert_close(final_point.reverse_gross_pnl_usdt, 6.0);
+        assert_close(final_point.reverse_fee_after_pnl_usdt, -4.0);
+        assert_close(
+            final_point.positive_gross_pnl_usdt + final_point.reverse_gross_pnl_usdt,
+            response.summary.gross_pnl_usdt,
         );
     }
 }

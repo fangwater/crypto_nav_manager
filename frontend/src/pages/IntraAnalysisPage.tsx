@@ -5,7 +5,6 @@ import {
   CircleAlert,
   Database,
   FlaskConical,
-  GitCompareArrows,
   Layers3,
   LoaderCircle,
   RefreshCw,
@@ -40,8 +39,10 @@ import {
 } from '../analysisLatencyChart'
 import type {
   IntraAnalysis,
+  IntraAnalysisSummary,
   IntraArbDirection,
   IntraClosedMatch,
+  IntraDirectionSlice,
   IntraFeeMode,
   IntraSymbolAnalysis,
   Strategy,
@@ -103,14 +104,6 @@ function bps(value: number, signed = false) {
   return (value < 0 ? '-' : '') + formatted
 }
 
-function optionalBps(value: number | null) {
-  return value === null ? '--' : bps(value, true)
-}
-
-function optionalMoney(value: number | null) {
-  return value === null ? '--' : money(value, true)
-}
-
 function percentage(value: number) {
   return (value * 100).toLocaleString('en-US', {
     minimumFractionDigits: 1,
@@ -167,6 +160,73 @@ function feeModeImpactLabel(mode: IntraFeeMode) {
   return 'Fee 影响'
 }
 
+interface CaptureBuckets {
+  aboveShare: number
+  belowShare: number
+  uncapturedShare: number
+  aboveNotional: number
+  belowNotional: number
+  uncapturedNotional: number
+}
+
+function captureBuckets(slice: IntraDirectionSlice, mode: IntraFeeMode): CaptureBuckets {
+  if (mode === 'actual') {
+    return {
+      aboveShare: slice.capturedAboveFeeShare,
+      belowShare: slice.capturedBelowFeeShare,
+      uncapturedShare: slice.uncapturedShare,
+      aboveNotional: slice.capturedAboveFeeNotionalUsdt,
+      belowNotional: slice.capturedBelowFeeNotionalUsdt,
+      uncapturedNotional: slice.uncapturedNotionalUsdt,
+    }
+  }
+  if (mode === 'reference') {
+    return {
+      aboveShare: slice.capturedAboveReferenceFeeShare,
+      belowShare: slice.capturedBelowReferenceFeeShare,
+      uncapturedShare: slice.uncapturedShare,
+      aboveNotional: slice.capturedAboveReferenceFeeNotionalUsdt,
+      belowNotional: slice.capturedBelowReferenceFeeNotionalUsdt,
+      uncapturedNotional: slice.uncapturedNotionalUsdt,
+    }
+  }
+  return {
+    aboveShare: slice.capturedPositiveShare,
+    belowShare: 0,
+    uncapturedShare: slice.uncapturedShare,
+    aboveNotional: slice.capturedPositiveNotionalUsdt,
+    belowNotional: 0,
+    uncapturedNotional: slice.uncapturedNotionalUsdt,
+  }
+}
+
+function combinedCapture(summary: IntraAnalysisSummary, mode: IntraFeeMode): CaptureBuckets {
+  const positive = captureBuckets(summary.positive, mode)
+  const reverse = captureBuckets(summary.reverse, mode)
+  const notional = summary.matchedNotionalUsdt
+  const aboveNotional = positive.aboveNotional + reverse.aboveNotional
+  const belowNotional = positive.belowNotional + reverse.belowNotional
+  const uncapturedNotional = positive.uncapturedNotional + reverse.uncapturedNotional
+  if (Math.abs(notional) <= PNL_EPSILON) {
+    return {
+      aboveShare: 0,
+      belowShare: 0,
+      uncapturedShare: 0,
+      aboveNotional,
+      belowNotional,
+      uncapturedNotional,
+    }
+  }
+  return {
+    aboveShare: aboveNotional / notional,
+    belowShare: belowNotional / notional,
+    uncapturedShare: uncapturedNotional / notional,
+    aboveNotional,
+    belowNotional,
+    uncapturedNotional,
+  }
+}
+
 function matchFeeModePnl(row: IntraClosedMatch, mode: IntraFeeMode) {
   if (mode === 'actual') return row.feeAfterPnlUsdt
   if (mode === 'reference') return row.referenceFeeAfterPnlUsdt
@@ -184,8 +244,28 @@ function matchFeeModeReturnBps(row: IntraClosedMatch, mode: IntraFeeMode) {
   return matchedNotional === 0 ? 0 : matchFeeModePnl(row, mode) / matchedNotional * 10_000
 }
 
-function directionLabel(direction: IntraArbDirection) {
-  return direction === 'positive' ? '正套' : '反套'
+function pairLabel(direction: IntraArbDirection) {
+  return direction === 'positive' ? '正 → 反' : '反 → 正'
+}
+
+function pendingDirectionLabel(direction: IntraArbDirection) {
+  return direction === 'positive' ? '正套待平' : '反套待平'
+}
+
+function unpairedNotional(summary: IntraAnalysisSummary) {
+  return summary.positiveOpenNotionalUsdt + summary.reverseOpenNotionalUsdt
+}
+
+function unpairedQuantity(summary: IntraAnalysisSummary) {
+  return summary.positiveOpenQuantity + summary.reverseOpenQuantity
+}
+
+function hasWindowActivity(row: IntraAnalysisSummary) {
+  return (
+    row.closedMatchCount > 0 ||
+    unpairedNotional(row) > PNL_EPSILON ||
+    unpairedQuantity(row) > PNL_EPSILON
+  )
 }
 
 function exchangeBadge(exchange: Strategy['exchange']) {
@@ -359,17 +439,12 @@ function SymbolRow({
           </td>
         </>
       )}
-      <td className={valueClass(row.marketPnlUsdt)}>
-        <strong>{money(row.marketPnlUsdt, true)}</strong>
-        <small>{bps(row.marketReturnBps, true)} bps</small>
-      </td>
-      <td className={valueClass(row.executionPnlUsdt)}>
-        <strong>{money(row.executionPnlUsdt, true)}</strong>
-        <small>{bps(row.executionReturnBps, true)} bps</small>
-      </td>
       <td>
-        <strong>{percentage(row.premiumCoverage)}</strong>
-        <small>{compactNumber(row.decomposedMatchCount)} closes</small>
+        <strong>{percentage(combinedCapture(row, feeMode).aboveShare)}</strong>
+        <small>
+          不够 {percentage(combinedCapture(row, feeMode).belowShare)} · 没兑现{' '}
+          {percentage(combinedCapture(row, feeMode).uncapturedShare)}
+        </small>
       </td>
     </tr>
   )
@@ -468,7 +543,7 @@ export function IntraAnalysisPage() {
   const availableClosedSymbols = useMemo(
     () =>
       analysis?.symbols
-        .filter((row) => row.closedMatchCount > 0)
+        .filter((row) => hasWindowActivity(row))
         .map((row) => row.symbol) ?? [],
     [analysis],
   )
@@ -481,7 +556,7 @@ export function IntraAnalysisPage() {
       ? analysis.symbols.filter((row) => row.symbol === symbol)
       : analysis.symbols
     return scoped
-      .filter((row) => row.closedMatchCount > 0)
+      .filter((row) => hasWindowActivity(row))
       .sort((left, right) =>
         feeModePnl(right, feeMode) - feeModePnl(left, feeMode) ||
         left.symbol.localeCompare(right.symbol),
@@ -690,6 +765,10 @@ export function IntraAnalysisPage() {
   }
 
   const summary = analysis?.summary
+  const capture = summary ? combinedCapture(summary, feeMode) : null
+  const visiblePendingLots = (analysis?.pendingLots ?? []).filter(
+    (lot) => !symbol || lot.symbol === symbol,
+  )
   const chartTotal = summary
     ? chartMode === 'portfolio'
       ? feeModePnl(summary, feeMode)
@@ -723,7 +802,7 @@ export function IntraAnalysisPage() {
               {exchangeBadge(strategy.exchange)}
             </span>
             <div>
-              <p>组合 FIFO 研究</p>
+              <p>正反配对 FIFO</p>
               <h1>{strategy.displayName}</h1>
             </div>
           </div>
@@ -735,11 +814,11 @@ export function IntraAnalysisPage() {
             <span
               title={
                 includeClosedCarry
-                  ? '只统计 FIFO 已闭环数量；包含归属到闭环数量的 Funding 与 Interest'
-                  : '只统计 FIFO 已闭环数量；研究口径不含闭环 Funding / Interest'
+                  ? '只有开、平都在选定区间内的正反配对才计入；区间内单边进待配对。闭环数量上还摊 Funding 与 Interest'
+                  : '只有开、平都在选定区间内的正反配对才计入；区间内单边进待配对，不计算收益'
               }
             >
-              Closed FIFO only
+              开平都在区间内 · 单边待配对
             </span>
           </div>
         </div>
@@ -832,13 +911,8 @@ export function IntraAnalysisPage() {
         <section className="analysis-scope" aria-label="组合统计口径">
           <div>
             <Layers3 size={16} />
-            <span>正套</span>
-            <strong>Spot Buy / Futures Sell</strong>
-          </div>
-          <div>
-            <GitCompareArrows size={16} />
-            <span>反套</span>
-            <strong>Spot Sell / Futures Buy</strong>
+            <span>记账</span>
+            <strong>开、平都在选定区间才计入；单边进待配对</strong>
           </div>
           <div>
             <Database size={16} />
@@ -846,15 +920,13 @@ export function IntraAnalysisPage() {
             <strong>
               {includeClosedCarry
                 ? '交易价差 + Funding - Interest - Fee'
-                : '交易价差 - Fee'}
+                : 'FIFO 成交价差 - Fee'}
             </strong>
           </div>
           <div>
             <Database size={16} />
             <span>基准</span>
-            <strong>
-              Main FKey Hedge · {strategy.exchange === 'bybit' ? 'Bybit' : 'Binance'} Premium 1m close
-            </strong>
+            <strong>Main FKey Hedge · 成交基差 (fut − spot)</strong>
           </div>
         </section>
 
@@ -888,8 +960,8 @@ export function IntraAnalysisPage() {
           </div>
           <span>
             {includeClosedCarry
-              ? 'Funding 与 Interest 按事件时开放本金分配，随 FIFO 闭环数量释放；Fee 按闭环四腿本金分摊'
-              : '研究口径不含闭环 Funding / Interest；Fee 按闭环四腿本金分摊'}
+              ? '只有开、平都在选定区间内的配对才计入；Funding 与 Interest 随闭环数量释放；区间内单边进待配对'
+              : '只有开、平都在选定区间内的配对才计入；跨区间或未配对的单边挂在待配对，不计算收益'}
           </span>
         </section>
 
@@ -939,28 +1011,29 @@ export function IntraAnalysisPage() {
             </>
           )}
           <div className="analysis-metric">
-            <span>选币基差收益</span>
-            <strong className={valueClass(summary?.marketPnlUsdt ?? 0)}>
-              {summary ? money(summary.marketPnlUsdt, true) : '--'}
-            </strong>
-            <small>{summary ? bps(summary.marketReturnBps, true) : '--'} bps</small>
-          </div>
-          <div className="analysis-metric">
-            <span>闭环两腿执行</span>
-            <strong className={valueClass(summary?.executionPnlUsdt ?? 0)}>
-              {summary ? money(summary.executionPnlUsdt, true) : '--'}
-            </strong>
-            <small>{summary ? bps(summary.executionReturnBps, true) : '--'} bps</small>
-          </div>
-          <div className="analysis-metric">
-            <span>Premium 覆盖</span>
-            <strong>{summary ? percentage(summary.premiumCoverage) : '--'}</strong>
-            <small>{summary ? compactNumber(summary.decomposedMatchCount) : '--'} closes</small>
+            <span>{feeMode === 'gross' ? '兑现占比' : '过费兑现'}</span>
+            <strong>{capture ? percentage(capture.aboveShare) : '--'}</strong>
+            <small>
+              {capture
+                ? feeMode === 'gross'
+                  ? `${percentage(capture.uncapturedShare)} 没兑现`
+                  : `不够 ${percentage(capture.belowShare)} · 没兑现 ${percentage(capture.uncapturedShare)}`
+                : '--'}
+            </small>
           </div>
           <div className="analysis-metric">
             <span>FIFO 闭环</span>
             <strong>{summary ? compactNumber(summary.closedMatchCount) : '--'}</strong>
             <small>{summary ? percentage(summary.winRate) : '--'} win rate</small>
+          </div>
+          <div className="analysis-metric">
+            <span>待配对</span>
+            <strong>{summary ? money(unpairedNotional(summary)) : '--'}</strong>
+            <small>
+              {summary
+                ? `${quantity(unpairedQuantity(summary))} 剩余 · 不计入收益`
+                : '--'}
+            </small>
           </div>
         </section>
 
@@ -970,8 +1043,8 @@ export function IntraAnalysisPage() {
         >
           <div className="chart-panel__header">
             <div>
-              <p className="eyebrow">TRADE DECOMPOSITION</p>
-              <h2>{chartMode === 'portfolio' ? '累计收益根因' : '分币累计收益'}</h2>
+              <p className="eyebrow">FIFO FILL SPREAD</p>
+              <h2>{chartMode === 'portfolio' ? '累计成交价差' : '分币累计成交价差'}</h2>
             </div>
             <div className="analysis-chart-controls">
               <div className="segmented segmented--compact analysis-chart-mode" aria-label="图表视图">
@@ -1092,7 +1165,10 @@ export function IntraAnalysisPage() {
           </div>
           {analysis && (
             <div className="chart-foot">
-              <span>{compactNumber(analysis.summary.closedMatchCount)} FIFO closes</span>
+              <span>{compactNumber(analysis.summary.closedMatchCount)} 开平都在区间内的闭环</span>
+              <span>
+                {money(unpairedNotional(analysis.summary))} 待配对不计入
+              </span>
               <span>
                 {compactNumber(
                   chartMode === 'portfolio'
@@ -1105,7 +1181,10 @@ export function IntraAnalysisPage() {
                   ? chartSymbolRows.length
                   : selectedChartSymbols.length} symbols
               </span>
-              <span>{percentage(analysis.summary.premiumCoverage)} closed premium</span>
+              <span>
+                {percentage(combinedCapture(analysis.summary, feeMode).aboveShare)}{' '}
+                {feeMode === 'gross' ? '兑现' : '过费兑现'}
+              </span>
               <span>
                 {percentage(analysis.summary.actualFeeCoverage)} actual fee coverage ·{' '}
                 {compactNumber(analysis.source.windowFeeTradeRows)} fills
@@ -1234,9 +1313,7 @@ export function IntraAnalysisPage() {
                       <th>闭环 Interest</th>
                     </>
                   )}
-                  <th>选币基差</th>
-                  <th>闭环两腿执行</th>
-                  <th>闭环 k 覆盖</th>
+                  <th>过费兑现</th>
                 </tr>
               </thead>
               <tbody>
@@ -1250,8 +1327,67 @@ export function IntraAnalysisPage() {
                 ))}
                 {!loading && visibleSymbols.length === 0 && (
                   <tr>
-                    <td className="analysis-empty" colSpan={includeClosedCarry ? 10 : 8}>
-                      暂无闭环数据
+                    <td className="analysis-empty" colSpan={includeClosedCarry ? 8 : 6}>
+                      暂无闭环或待配对数据
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="analysis-table-panel">
+          <div className="analysis-table-header">
+            <div>
+              <p className="eyebrow">PENDING UNPAIRED LOTS</p>
+              <h2>待配对</h2>
+            </div>
+            <span>
+              {visiblePendingLots.length}
+              {!symbol
+                && analysis
+                && analysis.source.returnedPendingLots > visiblePendingLots.length
+                ? ` / ${analysis.source.returnedPendingLots}`
+                : ''}{' '}
+              lots · 不计入收益
+            </span>
+          </div>
+          <div className="analysis-table-wrap">
+            <table className="analysis-table analysis-pending-table">
+              <thead>
+                <tr>
+                  <th>进入时间</th>
+                  <th>Symbol</th>
+                  <th>方向</th>
+                  <th>成交基差 bps</th>
+                  <th>数量</th>
+                  <th>名义</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visiblePendingLots.map((lot) => (
+                  <tr key={`${lot.symbol}-${lot.fkey}`}>
+                    <td>{new Date(lot.openedAtMs).toLocaleString()}</td>
+                    <td><strong>{lot.symbol}</strong></td>
+                    <td>
+                      <span className={'analysis-direction analysis-direction--' + lot.direction}>
+                        {pendingDirectionLabel(lot.direction)}
+                      </span>
+                    </td>
+                    <td
+                      title={`spot ${lot.spotPrice} / futures ${lot.futuresPrice}`}
+                    >
+                      {bps(lot.basisBps, true)}
+                    </td>
+                    <td>{quantity(lot.quantity)}</td>
+                    <td>{money(lot.notionalUsdt)}</td>
+                  </tr>
+                ))}
+                {!loading && visiblePendingLots.length === 0 && (
+                  <tr>
+                    <td className="analysis-empty" colSpan={6}>
+                      当前范围没有待配对单边
                     </td>
                   </tr>
                 )}
@@ -1274,15 +1410,10 @@ export function IntraAnalysisPage() {
                 <tr>
                   <th>闭环时间</th>
                   <th>Symbol</th>
-                  <th>开仓方向</th>
-                  <th>实际基差 bps</th>
-                  <th>市场 k bps</th>
-                  <th>执行边际 bps</th>
+                  <th>配对</th>
+                  <th>成交基差 bps</th>
                   <th>数量</th>
                   <th>持有</th>
-                  <th>选币基差</th>
-                  <th>开仓腿执行</th>
-                  <th>平仓腿执行</th>
                   {includeClosedCarry && (
                     <>
                       <th>闭环 Funding</th>
@@ -1300,7 +1431,7 @@ export function IntraAnalysisPage() {
                     <td><strong>{row.symbol}</strong></td>
                     <td>
                       <span className={'analysis-direction analysis-direction--' + row.openDirection}>
-                        {directionLabel(row.openDirection)}
+                        {pairLabel(row.openDirection)}
                       </span>
                     </td>
                     <td
@@ -1315,33 +1446,8 @@ export function IntraAnalysisPage() {
                         {bps(row.exitBasisBps, true)}
                       </span>
                     </td>
-                    <td
-                      title={`${strategy.exchange === 'bybit' ? 'Bybit' : 'Binance'} premium-index 1m close`}
-                    >
-                      <span className="analysis-basis-move">
-                        {optionalBps(row.entryPremiumBps)}
-                        <ArrowRight size={12} />
-                        {optionalBps(row.exitPremiumBps)}
-                      </span>
-                    </td>
-                    <td title="实际成交基差减去同分钟 premium-index close">
-                      <span className="analysis-basis-move">
-                        {optionalBps(row.entryExecutionEdgeBps)}
-                        <ArrowRight size={12} />
-                        {optionalBps(row.exitExecutionEdgeBps)}
-                      </span>
-                    </td>
                     <td>{quantity(row.quantity)}</td>
                     <td>{duration(row.holdingMs)}</td>
-                    <td className={valueClass(row.marketPnlUsdt ?? 0)}>
-                      <strong>{optionalMoney(row.marketPnlUsdt)}</strong>
-                    </td>
-                    <td className={valueClass(row.entryExecutionPnlUsdt ?? 0)}>
-                      <strong>{optionalMoney(row.entryExecutionPnlUsdt)}</strong>
-                    </td>
-                    <td className={valueClass(row.exitExecutionPnlUsdt ?? 0)}>
-                      <strong>{optionalMoney(row.exitExecutionPnlUsdt)}</strong>
-                    </td>
                     {includeClosedCarry && (
                       <>
                         <td className={valueClass(row.fundingPnlUsdt)}>
@@ -1363,7 +1469,7 @@ export function IntraAnalysisPage() {
                 ))}
                 {!loading && analysis?.matches.length === 0 && (
                   <tr>
-                    <td className="analysis-empty" colSpan={includeClosedCarry ? 15 : 13}>
+                    <td className="analysis-empty" colSpan={includeClosedCarry ? 10 : 8}>
                       当前范围没有 FIFO 闭环
                     </td>
                   </tr>

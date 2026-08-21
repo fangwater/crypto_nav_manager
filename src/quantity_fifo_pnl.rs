@@ -1,4 +1,4 @@
-//! Quantity-based FIFO PnL matching for intra spot/futures strategies.
+//! Quantity-based FIFO PnL matching for intra and funding-rate spot/futures.
 //! Open lots are matched in base-asset units so price differences cannot
 //! create a synthetic residual position.
 use crate::fifo_pnl::{FifoPnlError, Side};

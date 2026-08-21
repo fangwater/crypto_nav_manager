@@ -285,6 +285,36 @@ export interface StrategyPnl {
 
 export type IntraArbDirection = 'positive' | 'reverse'
 
+export interface IntraDirectionSlice {
+  closedMatchCount: number
+  winningMatchCount: number
+  winRate: number
+  matchedNotionalUsdt: number
+  grossPnlUsdt: number
+  grossReturnBps: number
+  tradingFeeUsdt: number
+  feeAfterPnlUsdt: number
+  feeAfterReturnBps: number
+  referenceTradingFeeUsdt: number
+  referenceFeeAfterPnlUsdt: number
+  referenceFeeAfterReturnBps: number
+  averageHoldingMs: number
+  averageEntryBasisBps: number
+  averageExitBasisBps: number
+  capturedPositiveNotionalUsdt: number
+  capturedAboveFeeNotionalUsdt: number
+  capturedBelowFeeNotionalUsdt: number
+  uncapturedNotionalUsdt: number
+  capturedAboveReferenceFeeNotionalUsdt: number
+  capturedBelowReferenceFeeNotionalUsdt: number
+  capturedPositiveShare: number
+  capturedAboveFeeShare: number
+  capturedBelowFeeShare: number
+  uncapturedShare: number
+  capturedAboveReferenceFeeShare: number
+  capturedBelowReferenceFeeShare: number
+}
+
 export interface IntraAnalysisSummary {
   closedMatchCount: number
   winningMatchCount: number
@@ -326,6 +356,8 @@ export interface IntraAnalysisSummary {
   reverseOpenNotionalUsdt: number
   positiveAverageBasisBps: number
   reverseAverageBasisBps: number
+  positive: IntraDirectionSlice
+  reverse: IntraDirectionSlice
 }
 
 export interface IntraSymbolAnalysis extends IntraAnalysisSummary {
@@ -344,6 +376,12 @@ export interface IntraAnalysisPoint {
   referenceFeeAfterPnlUsdt: number
   marketPnlUsdt: number
   executionPnlUsdt: number
+  positiveGrossPnlUsdt: number
+  reverseGrossPnlUsdt: number
+  positiveFeeAfterPnlUsdt: number
+  reverseFeeAfterPnlUsdt: number
+  positiveReferenceFeeAfterPnlUsdt: number
+  reverseReferenceFeeAfterPnlUsdt: number
   matchedNotionalUsdt: number
   closedMatchCount: number
   decomposedMatchCount: number
@@ -396,6 +434,18 @@ export interface IntraClosedMatch {
   returnBps: number
 }
 
+export interface IntraPendingLot {
+  symbol: string
+  direction: IntraArbDirection
+  fkey: number
+  openedAtMs: number
+  quantity: number
+  spotPrice: number
+  futuresPrice: number
+  basisBps: number
+  notionalUsdt: number
+}
+
 export interface IntraAnalysisSource {
   adapter: string
   hedgePriceAdapter: string
@@ -418,6 +468,8 @@ export interface IntraAnalysisSource {
   returnedPoints: number
   returnedSymbolPoints: number
   returnedMatches: number
+  returnedPendingLots: number
+  pairingRule: string
   sampled: boolean
   feesIncluded: boolean
   fundingIncluded: boolean
@@ -437,6 +489,7 @@ export interface IntraAnalysis {
   points: IntraAnalysisPoint[]
   symbolPoints: IntraSymbolSeries[]
   matches: IntraClosedMatch[]
+  pendingLots: IntraPendingLot[]
   source: IntraAnalysisSource
 }
 

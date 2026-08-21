@@ -4474,6 +4474,7 @@
 .analysis-metric small {
   color: var(--subtle);
   font-size: 9px;
+  line-height: 1.35;
   font-variant-numeric: tabular-nums;
 }
 
@@ -4790,8 +4791,17 @@
   min-width: 1540px;
 }
 
+.analysis-pending-table {
+  min-width: 860px;
+}
+
+.analysis-pending-table th:nth-child(2),
+.analysis-pending-table td:nth-child(2) {
+  text-align: left;
+}
+
 .analysis-direction {
-  min-width: 36px;
+  min-width: 52px;
   min-height: 22px;
   padding: 0 6px;
   display: inline-flex;
@@ -4802,6 +4812,7 @@
   background: #edf4fb;
   font-size: 9px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .analysis-direction--reverse {

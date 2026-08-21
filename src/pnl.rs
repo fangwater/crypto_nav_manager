@@ -303,8 +303,10 @@ impl Default for VenueFifo {
 impl VenueFifo {
     fn for_source(source: PnlSourceKind) -> Self {
         match source {
-            PnlSourceKind::Intra => Self::Quantity(QuantityFifoPnl::default()),
-            PnlSourceKind::FundingRate | PnlSourceKind::MarketMaking => Self::default(),
+            PnlSourceKind::Intra | PnlSourceKind::FundingRate => {
+                Self::Quantity(QuantityFifoPnl::default())
+            }
+            PnlSourceKind::MarketMaking => Self::default(),
         }
     }
 
@@ -464,7 +466,7 @@ impl SymbolState {
                     quantity_delta.abs(),
                     0.0,
                 )
-                .context("apply intra spot quantity adjustment to venue FIFO")?;
+                .context("apply spot quantity adjustment to venue FIFO")?;
             self.mark_price = Some(conversion_price);
             self.spot_snapshot = Some(
                 self.spot_fifo
@@ -1239,7 +1241,7 @@ async fn load_binance_intra_inputs(
     })
 }
 
-fn binance_intra_fee_usdt(
+pub(crate) fn binance_intra_fee_usdt(
     market: &str,
     liquidity_role: &str,
     amount_u: f64,
@@ -1765,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn intra_uses_quantity_fifo_without_changing_funding_rate_matching() {
+    fn funding_rate_uses_quantity_fifo_like_intra() {
         let inputs = PnlInputs {
             trades: vec![
                 trade(
@@ -1812,8 +1814,8 @@ mod tests {
         assert!((intra.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
 
         assert!((funding_rate.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
-        assert!((funding_rate.summary.floating_pnl_usdt + 50.0).abs() < 1e-9);
-        assert!((funding_rate.summary.total_pnl_usdt - 50.0).abs() < 1e-9);
+        assert_eq!(funding_rate.summary.floating_pnl_usdt, 0.0);
+        assert!((funding_rate.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2022,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn intra_interest_quantity_adjustment_updates_quantity_fifo_only() {
+    fn interest_quantity_adjustment_updates_quantity_fifo_for_intra_and_funding_rate() {
         let inputs = PnlInputs {
             interest: vec![InterestEvent {
                 symbol: "BTCUSDT".to_string(),
@@ -2045,14 +2047,12 @@ mod tests {
         funding_rate_request.source = PnlSourceKind::FundingRate;
         let funding_rate = calculate(inputs, funding_rate_request).unwrap();
 
-        assert_eq!(intra.points.last().unwrap().spot_position_qty, 9.0);
-        assert_eq!(intra.summary.fee_before_pnl_usdt, 10.0);
-        assert_eq!(intra.summary.floating_pnl_usdt, 90.0);
-        assert_eq!(intra.summary.total_pnl_usdt, -10.0);
-
-        assert_eq!(funding_rate.summary.fee_before_pnl_usdt, 0.0);
-        assert_eq!(funding_rate.summary.floating_pnl_usdt, 0.0);
-        assert_eq!(funding_rate.summary.total_pnl_usdt, -110.0);
+        for response in [&intra, &funding_rate] {
+            assert_eq!(response.points.last().unwrap().spot_position_qty, 9.0);
+            assert_eq!(response.summary.fee_before_pnl_usdt, 10.0);
+            assert_eq!(response.summary.floating_pnl_usdt, 90.0);
+            assert_eq!(response.summary.total_pnl_usdt, -10.0);
+        }
     }
 
     #[test]

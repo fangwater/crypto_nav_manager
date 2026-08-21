@@ -166,6 +166,8 @@ struct IntraAnalysisFeeRecord {
     symbol: String,
     ts: i64,
     notional_usdt: f64,
+    market: String,
+    liquidity_role: String,
     fee_usdt: Option<f64>,
 }
 
@@ -1027,7 +1029,7 @@ async fn get_intra_analysis(
            ORDER BY event_ts_us,fkey"#,
         strategy.db_schema, adapter.premium_table
     );
-    let load_start_us = strategy.st_ms.saturating_mul(1_000);
+    let load_start_us = start_ms.saturating_mul(1_000);
     let load_end_us = end_ms.saturating_add(1).saturating_mul(1_000);
     let rows = sqlx::query_as::<_, IntraAnalysisOrderRecord>(sqlx::AssertSqlSafe(order_sql))
         .bind(load_start_us)
@@ -1077,6 +1079,8 @@ async fn get_intra_analysis(
     let fee_sql = format!(
         r#"SELECT upper(symbol) AS symbol,event_time_ms AS ts,
                   COALESCE(quote_quantity,price * quantity)::float8 AS notional_usdt,
+                  COALESCE(market,'') AS market,
+                  COALESCE(liquidity_role,'') AS liquidity_role,
                   CASE
                     WHEN upper(COALESCE(fee_asset,'')) IN ('USD','USDC','USDT')
                       THEN fee_amount::float8
@@ -1100,7 +1104,13 @@ async fn get_intra_analysis(
             symbol: row.symbol,
             ts: row.ts,
             notional_usdt: row.notional_usdt,
-            fee_usdt: row.fee_usdt,
+            fee_usdt: intra_analysis_fee_usdt(
+                &strategy,
+                &row.market,
+                &row.liquidity_role,
+                row.notional_usdt,
+                row.fee_usdt,
+            ),
         })
         .collect::<Vec<_>>();
     let funding_events = if include_closed_carry {
@@ -1299,6 +1309,20 @@ async fn get_intra_hourly_latency(
         points,
     })
     .into_response())
+}
+
+fn intra_analysis_fee_usdt(
+    strategy: &IntraAnalysisStrategyRecord,
+    market: &str,
+    liquidity_role: &str,
+    notional_usdt: f64,
+    observed_fee_usdt: Option<f64>,
+) -> Option<f64> {
+    if strategy.exchange == "binance" && strategy.strategy_kind == "intra_exchange" {
+        pnl::binance_intra_fee_usdt(market, liquidity_role, notional_usdt, observed_fee_usdt)
+    } else {
+        observed_fee_usdt
+    }
 }
 
 fn intra_analysis_adapter(strategy: &IntraAnalysisStrategyRecord) -> Option<IntraAnalysisAdapter> {
@@ -2243,8 +2267,8 @@ async fn shutdown_signal() {
 mod tests {
     use super::{
         IntraAnalysisStrategyRecord, assigned_env_keys, expected_history_datasets,
-        intra_analysis_adapter, is_default_bybit_instrument, parse_initial_positions,
-        snapshot_source_url, valid_schema,
+        intra_analysis_adapter, intra_analysis_fee_usdt, is_default_bybit_instrument,
+        parse_initial_positions, snapshot_source_url, valid_schema,
     };
     use crate::{intra_analysis, intra_latency};
 
@@ -2310,6 +2334,43 @@ mod tests {
         assert!(!intra_latency::supports_hourly_latency("bybit-intra-arb02"));
         assert!(!intra_analysis::includes_closed_carry("binance-intra-arb01"));
         assert!(intra_analysis::includes_closed_carry("bybit-intra-arb01"));
+    }
+
+    #[test]
+    fn binance_intra_analysis_fees_use_spot_maker_rebate_patch() {
+        let binance = IntraAnalysisStrategyRecord {
+            slug: "binance-intra-arb01".to_string(),
+            alias: None,
+            db_schema: "binance_intra_arb01".to_string(),
+            st_ms: 1,
+            exchange: "binance".to_string(),
+            strategy_kind: "intra_exchange".to_string(),
+        };
+        let bybit = IntraAnalysisStrategyRecord {
+            slug: "bybit-intra-arb01".to_string(),
+            alias: None,
+            db_schema: "bybit_intra_arb01".to_string(),
+            st_ms: 1,
+            exchange: "bybit".to_string(),
+            strategy_kind: "intra_exchange".to_string(),
+        };
+
+        assert_eq!(
+            intra_analysis_fee_usdt(&binance, "spot", "maker", 2_500.0, Some(0.0)),
+            Some(-0.1)
+        );
+        assert_eq!(
+            intra_analysis_fee_usdt(&binance, "spot", "taker", 2_500.0, Some(0.25)),
+            Some(0.25)
+        );
+        assert_eq!(
+            intra_analysis_fee_usdt(&binance, "usdm_futures", "taker", 2_500.0, Some(0.365)),
+            Some(0.365)
+        );
+        assert_eq!(
+            intra_analysis_fee_usdt(&bybit, "spot", "maker", 2_500.0, Some(0.0)),
+            Some(0.0)
+        );
     }
 
     #[test]

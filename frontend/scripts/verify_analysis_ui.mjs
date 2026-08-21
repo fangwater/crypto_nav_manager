@@ -36,10 +36,10 @@ export function verifyHelper() {
     '闭环 Interest',
     '当前口径收益',
     'Fee 影响',
-    '选币基差收益',
-    '闭环两腿执行',
-    'Premium 覆盖',
+    '过费兑现',
+    '成交基差',
     'FIFO 闭环',
+    '待配对',
     'Margin NEW − create',
     'Futures NEW − create',
     '现货信号行情延迟',
@@ -69,6 +69,17 @@ export function verifyHelper() {
   const page = read('src/pages/IntraAnalysisPage.tsx')
   assert.match(page, /<AnalysisMetricHelper items=\{analysisMetricHelpForStrategy\(slug\)\} \/>/)
   assert.match(page, /intraAnalysisIncludesClosedCarry\(slug\)/)
+  assert.match(page, /过费兑现/)
+  assert.match(page, /待配对/)
+  assert.match(page, /开、平都在选定区间/)
+  assert.match(page, /正 → 反/)
+  assert.equal(page.includes('正套 FIFO'), false)
+  assert.equal(page.includes('反套 FIFO'), false)
+  assert.equal(page.includes('选币基差收益'), false)
+  const chartSource = read('src/components/IntraFifoChart.tsx')
+  assert.equal(chartSource.includes("name: '正套'"), false)
+  assert.equal(chartSource.includes("name: '反套'"), false)
+  assert.equal(chartSource.includes('选币基差'), false)
   const binanceHelp = help.analysisMetricHelpForStrategy('binance-intra-arb01')
   const bybitHelp = help.analysisMetricHelpForStrategy('bybit-intra-arb01')
   assert.equal(

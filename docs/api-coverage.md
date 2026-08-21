@@ -49,8 +49,10 @@ Binance FR 的 CSV 首次导入完成后，`sync_history --dataset trades` 以�
 `/margin/marginInterestHistory`；`binance-intra-arb01` 这类 USD-M 标准账户走 sapi
 `/margin/interestHistory`，与历史 CSV 导入脚本一致。历史 GET 使用 60 秒 `recvWindow`，仅对本地
 权重等待、传输/响应体解码失败和 Binance `-1021` 做有限的幂等重试。
-Binance intra PnL 对 Spot Maker 使用固定 `-0.4 bps` 手续费成本补丁，模拟下一小时入账的
-MM2 返佣；不会再把 `rebates` 表重复加入 PnL。可用
+Binance intra 账户 PnL 与 `/api/analysis/binance-intra-arb01/intra-fifo` 对 Spot Maker
+使用同一套固定 `-0.4 bps` 手续费成本补丁，模拟下一小时入账的 MM2 返佣；成交表里 maker
+commission 记为 0，分析页若直接用成交费会把现货成本算成 0。不会再把 `rebates` 表重复加入
+PnL 或 FIFO。可用
 `scripts/estimate_binance_intra_rebate_rate.py --hour <UTC hour>` 从整点成交和下一小时入账复核费率。
 
 ## Bybit UTA v5
