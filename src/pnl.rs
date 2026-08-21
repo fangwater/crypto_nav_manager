@@ -439,8 +439,18 @@ impl SymbolState {
                         .filter(|cost| cost.is_finite() && *cost > 0.0)
                         .map(|cost| cost / quantity_delta.abs())
                 })
-                .or(self.mark_price)
-                .context("missing conversion price for intra spot quantity adjustment")?;
+                .or(self.mark_price);
+            let Some(conversion_price) = conversion_price else {
+                // Dust interest on symbols with no in-window trades or marks
+                // (e.g. previously flattened names) cannot adjust quantity FIFO.
+                // Keep FIFO and qty aligned; still account for a known USDT cost.
+                if let Some(cost) = interest.cost_usdt {
+                    self.interest_cost_usdt += cost;
+                } else {
+                    self.unconverted_interest_count += 1;
+                }
+                return Ok(());
+            };
             let side = if quantity_delta > 0.0 {
                 Side::Buy
             } else {
@@ -2043,6 +2053,43 @@ mod tests {
         assert_eq!(funding_rate.summary.fee_before_pnl_usdt, 0.0);
         assert_eq!(funding_rate.summary.floating_pnl_usdt, 0.0);
         assert_eq!(funding_rate.summary.total_pnl_usdt, -110.0);
+    }
+
+    #[test]
+    fn interest_without_conversion_price_is_skipped_instead_of_failing() {
+        let inputs = PnlInputs {
+            trades: vec![trade(
+                "BTCUSDT",
+                PositionLeg::Spot,
+                Side::Buy,
+                100.0,
+                1_000.0,
+                10.0,
+                0.0,
+                1_100,
+            )],
+            interest: vec![InterestEvent {
+                symbol: "BRETTUSDT".to_string(),
+                cost_usdt: None,
+                conversion_price: None,
+                spot_quantity_delta: -0.01,
+                ts: 1_200,
+            }],
+            ..PnlInputs::default()
+        };
+
+        let response = calculate(inputs, request(1_000, 1_300)).unwrap();
+        assert_eq!(response.summary.unconverted_interest_count, 1);
+        assert_eq!(response.summary.interest_cost_usdt, 0.0);
+        // BTC trade position is unchanged; BRETT dust interest is not applied to qty.
+        assert_eq!(response.points.last().unwrap().spot_position_qty, 10.0);
+        let brett = response
+            .symbols
+            .iter()
+            .find(|row| row.symbol == "BRETTUSDT")
+            .expect("interest-only symbol remains listed");
+        assert_eq!(brett.pnl.unconverted_interest_count, 1);
+        assert_eq!(brett.pnl.total_pnl_usdt, 0.0);
     }
 
     #[test]
