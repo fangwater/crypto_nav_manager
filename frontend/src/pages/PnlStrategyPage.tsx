@@ -47,9 +47,16 @@ import type {
 const rangeOptions = [
   { key: 'ALL', days: null },
   { key: '1D', days: 1 },
+  { key: '3D', days: 3 },
   { key: '7D', days: 7 },
   { key: '30D', days: 30 },
 ] as const
+
+const DAY_MS = 86_400_000
+const DEFAULT_RANGE_DAYS = 3
+const PNL_EPSILON = 1e-9
+
+type PnlSymbolSelection = 'all' | 'positive' | 'negative' | 'custom'
 
 const seriesOptions: Array<{
   key: PnlSeriesKey
@@ -177,6 +184,62 @@ function SymbolRow({
   )
 }
 
+function PnlSymbolPool({
+  title,
+  tone,
+  rows,
+  selectedSymbols,
+  onToggle,
+  onToggleAll,
+}: {
+  title: string
+  tone: 'positive' | 'negative'
+  rows: SymbolPnlSummary[]
+  selectedSymbols: ReadonlySet<string>
+  onToggle: (symbol: string) => void
+  onToggleAll: (symbols: string[]) => void
+}) {
+  const selectedCount = rows.filter((row) => selectedSymbols.has(row.symbol)).length
+  const allSelected = rows.length > 0 && selectedCount === rows.length
+
+  return (
+    <section className={'pnl-symbol-pool pnl-symbol-pool--' + tone}>
+      <label className="pnl-symbol-pool__header">
+        <input
+          type="checkbox"
+          checked={allSelected}
+          disabled={rows.length === 0}
+          onChange={() => onToggleAll(rows.map((row) => row.symbol))}
+        />
+        <span>{title}</span>
+        <small>{selectedCount} / {rows.length}</small>
+      </label>
+      <div className="pnl-symbol-pool__list">
+        {rows.map((row) => (
+          <label
+            className={
+              'pnl-symbol-option' +
+              (selectedSymbols.has(row.symbol) ? ' is-selected' : '')
+            }
+            key={row.symbol}
+          >
+            <input
+              type="checkbox"
+              checked={selectedSymbols.has(row.symbol)}
+              onChange={() => onToggle(row.symbol)}
+            />
+            <strong>{row.symbol}</strong>
+            <span className={valueClass(row.totalPnlUsdt)}>
+              {money(row.totalPnlUsdt, true)}
+            </span>
+          </label>
+        ))}
+        {rows.length === 0 && <span className="pnl-symbol-pool__empty">暂无币种</span>}
+      </div>
+    </section>
+  )
+}
+
 export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
   const { slug = '' } = useParams()
   const [strategy, setStrategy] = useState<Strategy | null>(null)
@@ -190,6 +253,8 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
   const [startMs, setStartMs] = useState<number | null>(null)
   const [endMs, setEndMs] = useState<number | null>(null)
   const [selectedSymbols, setSelectedSymbols] = useState<string[] | null>(null)
+  const [symbolSelection, setSymbolSelection] =
+    useState<PnlSymbolSelection>('all')
   const [visibleSeries, setVisibleSeries] = useState<PnlSeriesKey[]>([
     'totalPnlUsdt',
     'feeAfterPnlUsdt',
@@ -235,11 +300,16 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
         setSnapshotHistory(snapshots)
         setInitialSnapshotState(selectedSnapshot)
         setSelectedSnapshotTs(selectedSnapshot?.snapshotTsMs ?? snapshots[0]?.snapshotTsMs ?? null)
-        setStartInput(toDatetimeLocal(effectiveStart))
+        const defaultStart = Math.max(
+          effectiveStart,
+          now - DEFAULT_RANGE_DAYS * DAY_MS,
+        )
+        setStartInput(toDatetimeLocal(defaultStart))
         setEndInput(toDatetimeLocal(now))
-        setStartMs(effectiveStart)
+        setStartMs(defaultStart)
         setEndMs(now)
         setSelectedSymbols(null)
+        setSymbolSelection('all')
       })
       .catch((reason: unknown) => {
         setStrategyError(reason instanceof Error ? reason.message : String(reason))
@@ -313,7 +383,56 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
       : pnl.symbols
   }, [pnl, symbolSearch])
 
+  const positiveSymbols = useMemo(
+    () =>
+      (pnl?.symbols ?? [])
+        .filter((row) => row.totalPnlUsdt >= -PNL_EPSILON)
+        .sort(
+          (left, right) =>
+            right.totalPnlUsdt - left.totalPnlUsdt ||
+            left.symbol.localeCompare(right.symbol),
+        ),
+    [pnl],
+  )
+  const negativeSymbols = useMemo(
+    () =>
+      (pnl?.symbols ?? [])
+        .filter((row) => row.totalPnlUsdt < -PNL_EPSILON)
+        .sort(
+          (left, right) =>
+            left.totalPnlUsdt - right.totalPnlUsdt ||
+            left.symbol.localeCompare(right.symbol),
+        ),
+    [pnl],
+  )
+
+  useEffect(() => {
+    if (!pnl || symbolSelection === 'all' || symbolSelection === 'custom') return
+    const rows = symbolSelection === 'positive' ? positiveSymbols : negativeSymbols
+    const next = rows.map((row) => row.symbol).sort()
+    const normalized =
+      next.length === pnl.availableSymbols.length ? null : next
+    setSelectedSymbols((current) => {
+      if (current === null || normalized === null) {
+        return current === normalized ? current : normalized
+      }
+      return current.length === normalized.length &&
+        current.every((item, index) => item === normalized[index])
+        ? current
+        : normalized
+    })
+  }, [negativeSymbols, pnl, positiveSymbols, symbolSelection])
+
   const effectiveStartMs = initialSnapshot?.snapshotTsMs ?? strategy?.stMs ?? 0
+
+  const activeRangeKey = rangeOptions.find((option) => {
+    if (startMs === null || endMs === null) return false
+    const expectedStart =
+      option.days === null
+        ? effectiveStartMs
+        : Math.max(effectiveStartMs, endMs - option.days * DAY_MS)
+    return Math.abs(startMs - expectedStart) < 60_000
+  })?.key
 
   function applyRange() {
     if (!strategy) return
@@ -329,6 +448,10 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
     }
     setStartMs(nextStart)
     setEndMs(nextEnd)
+    if (selectedSymbols?.length === 0) {
+      setSymbolSelection('all')
+      setSelectedSymbols(null)
+    }
   }
 
   function selectRange(days: number | null) {
@@ -337,11 +460,15 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
     const nextStart =
       days === null
         ? effectiveStartMs
-        : Math.max(effectiveStartMs, nextEnd - days * 86_400_000)
+        : Math.max(effectiveStartMs, nextEnd - days * DAY_MS)
     setStartInput(toDatetimeLocal(nextStart))
     setEndInput(toDatetimeLocal(nextEnd))
     setStartMs(nextStart)
     setEndMs(nextEnd)
+    if (selectedSymbols?.length === 0) {
+      setSymbolSelection('all')
+      setSelectedSymbols(null)
+    }
   }
 
   async function applyInitialSnapshot() {
@@ -354,6 +481,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
       setStartInput(toDatetimeLocal(selected.snapshotTsMs))
       setStartMs(selected.snapshotTsMs)
       setSelectedSymbols(null)
+      setSymbolSelection('all')
       setPnl(null)
     } catch (reason: unknown) {
       setPnlError(reason instanceof Error ? reason.message : String(reason))
@@ -372,6 +500,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
       setStartInput(toDatetimeLocal(strategy.stMs))
       setStartMs(strategy.stMs)
       setSelectedSymbols(null)
+      setSymbolSelection('all')
       setPnl(null)
     } catch (reason: unknown) {
       setPnlError(reason instanceof Error ? reason.message : String(reason))
@@ -382,6 +511,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
 
   function toggleSymbol(symbol: string) {
     if (!pnl) return
+    setSymbolSelection('custom')
     if (selectedSymbols === null) {
       const next = pnl.availableSymbols.filter((item) => item !== symbol)
       if (next.length) setSelectedSymbols(next)
@@ -393,6 +523,37 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
       : [...selectedSymbols, symbol].sort()
     setSelectedSymbols(
       next.length === pnl.availableSymbols.length ? null : next,
+    )
+  }
+
+  function selectSymbolGroup(
+    selection: Exclude<PnlSymbolSelection, 'custom'>,
+  ) {
+    if (!pnl) return
+    setSymbolSelection(selection)
+    if (selection === 'all') {
+      setSelectedSymbols(null)
+      return
+    }
+    const rows = selection === 'positive' ? positiveSymbols : negativeSymbols
+    const next = rows.map((row) => row.symbol).sort()
+    setSelectedSymbols(
+      next.length === pnl.availableSymbols.length ? null : next,
+    )
+  }
+
+  function toggleSymbolPool(symbols: string[]) {
+    if (!pnl || symbols.length === 0) return
+    setSymbolSelection('custom')
+    const next = new Set(selectedSet)
+    const allSelected = symbols.every((symbol) => next.has(symbol))
+    for (const symbol of symbols) {
+      if (allSelected) next.delete(symbol)
+      else next.add(symbol)
+    }
+    const ordered = pnl.availableSymbols.filter((symbol) => next.has(symbol))
+    setSelectedSymbols(
+      ordered.length === pnl.availableSymbols.length ? null : ordered,
     )
   }
 
@@ -534,6 +695,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
               <button
                 key={option.key}
                 type="button"
+                className={activeRangeKey === option.key ? 'is-active' : ''}
                 onClick={() => selectRange(option.days)}
               >
                 {option.key}
@@ -753,37 +915,58 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                 </div>
               </aside>
             ) : pnl ? (
-              <aside className="symbol-curve-picker" aria-label="分币曲线选择">
-                <div className="symbol-curve-picker__header">
-                  <strong>币种</strong>
-                  <div className="symbol-curve-picker__actions">
+              <aside className="pnl-symbol-selector" aria-label="分币曲线选择">
+                <div className="pnl-symbol-selector__header">
+                  <div>
+                    <span>币种曲线</span>
+                    <strong>{selectedSet.size} / {pnl.availableSymbols.length}</strong>
+                  </div>
+                  <div
+                    className="segmented segmented--compact pnl-symbol-filter"
+                    aria-label="按 Total PnL 筛选币种"
+                  >
                     <button
                       type="button"
-                      onClick={() => setSelectedSymbols(null)}
-                      disabled={selectedSymbols === null}
+                      className={symbolSelection === 'all' ? 'is-active' : ''}
+                      onClick={() => selectSymbolGroup('all')}
                     >
-                      全选
+                      全部
                     </button>
                     <button
                       type="button"
-                      onClick={() => setSelectedSymbols([])}
-                      disabled={selectedSymbols?.length === 0}
+                      className={symbolSelection === 'positive' ? 'is-active' : ''}
+                      disabled={positiveSymbols.length === 0}
+                      onClick={() => selectSymbolGroup('positive')}
                     >
-                      全不选
+                      盈利
+                    </button>
+                    <button
+                      type="button"
+                      className={symbolSelection === 'negative' ? 'is-active' : ''}
+                      disabled={negativeSymbols.length === 0}
+                      onClick={() => selectSymbolGroup('negative')}
+                    >
+                      亏损
                     </button>
                   </div>
                 </div>
-                <div className="symbol-curve-picker__list">
-                  {pnl.availableSymbols.map((symbol) => (
-                    <label key={symbol}>
-                      <input
-                        type="checkbox"
-                        checked={selectedSet.has(symbol)}
-                        onChange={() => toggleSymbol(symbol)}
-                      />
-                      <span>{symbol}</span>
-                    </label>
-                  ))}
+                <div className="pnl-symbol-pools">
+                  <PnlSymbolPool
+                    title="盈利 / 持平"
+                    tone="positive"
+                    rows={positiveSymbols}
+                    selectedSymbols={selectedSet}
+                    onToggle={toggleSymbol}
+                    onToggleAll={toggleSymbolPool}
+                  />
+                  <PnlSymbolPool
+                    title="亏损"
+                    tone="negative"
+                    rows={negativeSymbols}
+                    selectedSymbols={selectedSet}
+                    onToggle={toggleSymbol}
+                    onToggleAll={toggleSymbolPool}
+                  />
                 </div>
               </aside>
             ) : null}
@@ -965,14 +1148,17 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                     <div className="symbol-curve-picker__actions">
                       <button
                         type="button"
-                        onClick={() => setSelectedSymbols(null)}
+                        onClick={() => selectSymbolGroup('all')}
                         disabled={selectedSymbols === null}
                       >
                         全选
                       </button>
                       <button
                         type="button"
-                        onClick={() => setSelectedSymbols([])}
+                        onClick={() => {
+                          setSymbolSelection('custom')
+                          setSelectedSymbols([])
+                        }}
                         disabled={selectedSymbols?.length === 0}
                       >
                         全不选
@@ -1037,7 +1223,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
               <button
                 type="button"
                 className="all-symbols-button"
-                onClick={() => setSelectedSymbols(null)}
+                onClick={() => selectSymbolGroup('all')}
                 disabled={selectedSymbols === null}
               >
                 全部币种

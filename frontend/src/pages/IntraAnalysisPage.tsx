@@ -51,10 +51,13 @@ import type {
 const rangeOptions = [
   { key: 'ALL', days: null },
   { key: '1D', days: 1 },
+  { key: '3D', days: 3 },
   { key: '7D', days: 7 },
   { key: '30D', days: 30 },
 ] as const
 
+const DAY_MS = 86_400_000
+const DEFAULT_RANGE_DAYS = 3
 const PNL_EPSILON = 1e-9
 
 type ChartSymbolSelection = 'all' | 'positive' | 'negative' | 'custom'
@@ -489,10 +492,14 @@ export function IntraAnalysisPage() {
       .then((nextStrategy) => {
         if (!active) return
         const now = Date.now()
+        const defaultStart = Math.max(
+          nextStrategy.stMs,
+          now - DEFAULT_RANGE_DAYS * DAY_MS,
+        )
         setStrategy(nextStrategy)
-        setStartInput(toDatetimeLocal(nextStrategy.stMs))
+        setStartInput(toDatetimeLocal(defaultStart))
         setEndInput(toDatetimeLocal(now))
-        setStartMs(nextStrategy.stMs)
+        setStartMs(defaultStart)
         setEndMs(now)
       })
       .catch((reason: unknown) => {
@@ -641,6 +648,14 @@ export function IntraAnalysisPage() {
     [selectedLatencyKeys],
   )
   const latencyLineFilter = latencyLineFilterFromKeys(selectedLatencyKeys)
+  const activeRangeKey = rangeOptions.find((option) => {
+    if (!strategy || startMs === null || endMs === null) return false
+    const expectedStart =
+      option.days === null
+        ? strategy.stMs
+        : Math.max(strategy.stMs, endMs - option.days * DAY_MS)
+    return Math.abs(startMs - expectedStart) < 60_000
+  })?.key
 
   function applyRange() {
     if (!strategy) return
@@ -665,7 +680,7 @@ export function IntraAnalysisPage() {
     const nextStart =
       days === null
         ? strategy.stMs
-        : Math.max(strategy.stMs, nextEnd - days * 86_400_000)
+        : Math.max(strategy.stMs, nextEnd - days * DAY_MS)
     setStartInput(toDatetimeLocal(nextStart))
     setEndInput(toDatetimeLocal(nextEnd))
     setStartMs(nextStart)
@@ -899,6 +914,7 @@ export function IntraAnalysisPage() {
                 <button
                   key={option.key}
                   type="button"
+                  className={activeRangeKey === option.key ? 'is-active' : ''}
                   onClick={() => selectRange(option.days)}
                 >
                   {option.key}
