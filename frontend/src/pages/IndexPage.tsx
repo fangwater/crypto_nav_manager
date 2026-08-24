@@ -36,13 +36,19 @@ import type {
   Strategy,
 } from '../types'
 
-type Filter = 'all' | 'funding_rate' | 'intra_exchange' | 'market_making'
+type Filter =
+  | 'all'
+  | 'funding_rate'
+  | 'intra_exchange'
+  | 'market_making'
+  | 'cta'
 
 const filters: Array<{ value: Filter; label: string }> = [
   { value: 'all', label: '全部' },
   { value: 'funding_rate', label: '资金费' },
   { value: 'intra_exchange', label: '所内套利' },
   { value: 'market_making', label: '做市' },
+  { value: 'cta', label: 'CTA' },
 ]
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1_000
@@ -71,12 +77,14 @@ function modeLabel(mode: string) {
 function kindLabel(kind: Strategy['strategyKind']) {
   if (kind === 'funding_rate') return '资金费套利'
   if (kind === 'market_making') return '做市'
+  if (kind === 'cta') return 'CTA'
   return '所内套利'
 }
 
 function usesUniMmr(strategy: Strategy) {
   return (
     strategy.strategyKind !== 'market_making' &&
+    strategy.strategyKind !== 'cta' &&
     strategy.accountMode !== 'usdm_futures'
   )
 }
@@ -381,7 +389,7 @@ export function IndexPage() {
 
         <section className="retired-notice" aria-label="已停用盘子">
           <Ban size={16} />
-          <strong>binance nova01 / nova02</strong>
+          <strong>binance nova01 / nova02 / mm alpha</strong>
           <span>已停用，不再拉取</span>
         </section>
 

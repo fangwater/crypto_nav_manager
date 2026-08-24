@@ -537,7 +537,7 @@ pub async fn run() -> Result<()> {
                WHERE enabled
                  AND host = 'local'
                  AND account_mode IN ('portfolio_margin','unified')
-                 AND strategy_kind <> 'market_making'
+                 AND strategy_kind NOT IN ('market_making','cta')
                ORDER BY sort_order,slug"#,
         )
         .fetch_all(&pool)
@@ -1360,7 +1360,9 @@ fn expected_history_datasets(
         || matches!(
             slug,
             "binance_mm_alpha"
+                | "binance_exec_trade01"
                 | "bybit_mm_alpha"
+                | "okex_mm_alpha"
                 | "binance-intra-arb01"
                 | "bybit-intra-arb01"
                 | "bybit-intra-arb02"
@@ -1377,7 +1379,7 @@ fn expected_history_datasets(
         ("bitget", "funding_rate") => Some(BITGET_FR),
         ("binance", "intra_exchange") => Some(BINANCE_INTRA),
         ("bybit", "intra_exchange") => Some(BYBIT_INTRA),
-        ("binance" | "bybit", "market_making") => Some(MM),
+        ("binance", "market_making" | "cta") | ("bybit" | "okx", "market_making") => Some(MM),
         _ => None,
     }
 }
@@ -2456,6 +2458,14 @@ mod tests {
         );
         assert_eq!(
             expected_history_datasets("bybit_mm_alpha", "sg", "bybit", "market_making"),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("binance_exec_trade01", "local", "binance", "cta"),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("okex_mm_alpha", "local", "okx", "market_making"),
             Some(["trades"].as_slice())
         );
     }

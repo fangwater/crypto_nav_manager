@@ -836,7 +836,7 @@ async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
     let class = match kind.as_str() {
         "funding_rate" => StrategyClass::Fr,
         "intra_exchange" => StrategyClass::Intra,
-        "market_making" => StrategyClass::Mm,
+        "market_making" | "cta" => StrategyClass::Mm,
         value => bail!("unsupported strategy kind for {slug}: {value}"),
     };
     Ok(Strategy {
@@ -1110,13 +1110,19 @@ fn bitget_fee(raw: &Value) -> (String, String) {
 
 fn normalize_okx_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
     let exec_type = optional_text(&raw, &["execType"]).unwrap_or_default();
+    let instrument = text_field(&raw, &["instId"])?;
+    let symbol = if leg == Leg::Derivative {
+        instrument.trim_end_matches("-SWAP")
+    } else {
+        instrument.as_str()
+    };
     // OKX reports charges as negative and rebates as positive. Internally fees
     // are signed costs, so paid fees are positive and rebates are negative.
     let fee_amount = negate_decimal(&number_field(&raw, &["fee"]).unwrap_or_else(|_| "0".into()))?;
     make_trade(
         leg,
         if leg == Leg::Spot { "margin" } else { "swap" },
-        normalize_symbol(&text_field(&raw, &["instId"])?),
+        normalize_symbol(symbol),
         text_field(&raw, &["tradeId"])?,
         optional_text(&raw, &["ordId"]).unwrap_or_default(),
         lower_side(&text_field(&raw, &["side"])?),
@@ -2496,6 +2502,30 @@ mod tests {
         assert_eq!(normalize("-0.10"), "0.10");
         assert_eq!(normalize("0.05"), "-0.05");
         assert_eq!(normalize("0"), "0");
+    }
+
+    #[test]
+    fn okx_swap_trade_uses_underlying_symbol_for_multiplier_lookup() {
+        let row = normalize_okx_trade(
+            Leg::Derivative,
+            serde_json::json!({
+                "instId": "XRP-USDT-SWAP",
+                "tradeId": "1",
+                "ordId": "2",
+                "side": "sell",
+                "execType": "T",
+                "fillPx": "1",
+                "fillSz": "10",
+                "fee": "0",
+                "feeCcy": "USDT",
+                "ts": "1750141421721"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(row.symbol, "XRPUSDT");
+        assert_eq!(row.market, "swap");
+        assert_eq!(row.role, "taker");
     }
 
     #[test]

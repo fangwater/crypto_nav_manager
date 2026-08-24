@@ -70,7 +70,7 @@ struct Strategy {
 
 impl Strategy {
     fn includes_spot(&self) -> bool {
-        self.strategy_kind != "market_making"
+        !matches!(self.strategy_kind.as_str(), "market_making" | "cta")
     }
 }
 
@@ -158,7 +158,7 @@ async fn load_strategies(pool: &PgPool, selected: &[String]) -> Result<Vec<Strat
         }
         if !matches!(
             strategy_kind.as_str(),
-            "funding_rate" | "intra_exchange" | "market_making"
+            "funding_rate" | "intra_exchange" | "market_making" | "cta"
         ) {
             bail!("unsupported strategy kind for {slug}: {strategy_kind}");
         }
@@ -199,7 +199,9 @@ async fn sync_strategy(
 ) -> Result<()> {
     ensure_fee_rate_table(pool, &strategy.schema).await?;
     let symbols = if override_symbols.is_empty() {
-        if strategy.exchange == "binance" && strategy.strategy_kind == "market_making" {
+        if strategy.exchange == "binance"
+            && matches!(strategy.strategy_kind.as_str(), "market_making" | "cta")
+        {
             BINANCE_MM_SYMBOLS.into_iter().map(str::to_string).collect()
         } else {
             load_active_symbols(pool, strategy, active_days, fallback_symbol).await?
@@ -686,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn market_plan_excludes_spot_only_for_market_making() {
+    fn futures_only_plan_excludes_spot_for_market_making_and_cta() {
         let strategy = Strategy {
             slug: "mm".to_string(),
             schema: "mm".to_string(),
@@ -701,6 +703,13 @@ mod tests {
         assert!(
             Strategy {
                 strategy_kind: "intra_exchange".to_string(),
+                ..strategy.clone()
+            }
+            .includes_spot()
+        );
+        assert!(
+            !Strategy {
+                strategy_kind: "cta".to_string(),
                 ..strategy
             }
             .includes_spot()

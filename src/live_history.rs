@@ -285,7 +285,9 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                OR slug IN (
                  'binance-intra-arb01',
                  'binance_mm_alpha',
+                 'binance_exec_trade01',
                  'bybit_mm_alpha',
+                 'okex_mm_alpha',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
                  'bitget_fr_arb02',
@@ -434,7 +436,8 @@ fn order_synthesis_enabled(slug: &str) -> bool {
 }
 
 fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
-    strategy.exchange == "binance" && strategy.strategy_kind != "market_making"
+    strategy.exchange == "binance"
+        && !matches!(strategy.strategy_kind.as_str(), "market_making" | "cta")
 }
 
 fn run_alignment_check(config: &LiveHistoryConfig, slug: &str) -> Result<String> {
@@ -850,11 +853,16 @@ mod tests {
     }
 
     #[test]
-    fn market_making_uses_symbols_already_stored_in_postgres() {
+    fn futures_only_strategies_use_symbols_already_stored_in_postgres() {
         assert!(!uses_online_symbols(&strategy(
             "binance_mm_alpha",
             "binance",
             "market_making"
+        )));
+        assert!(!uses_online_symbols(&strategy(
+            "binance_exec_trade01",
+            "binance",
+            "cta"
         )));
         assert!(uses_online_symbols(&strategy(
             "binance-intra-arb01",

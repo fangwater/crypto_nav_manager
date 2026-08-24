@@ -95,16 +95,20 @@ export function StrategyPage() {
                   ? '资金费套利'
                   : strategy.strategyKind === 'market_making'
                     ? '做市'
+                    : strategy.strategyKind === 'cta'
+                      ? 'CTA'
                     : '所内套利'}
               </p>
               <h1>{strategy.displayName}</h1>
             </div>
           </div>
-          <a className="config-button" href={strategy.configUrl}>
-            <Settings size={17} />
-            配置
-            <ExternalLink size={14} />
-          </a>
+          {strategy.strategyKind !== 'cta' && (
+            <a className="config-button" href={strategy.configUrl}>
+              <Settings size={17} />
+              配置
+              <ExternalLink size={14} />
+            </a>
+          )}
         </div>
       </header>
 
@@ -164,4 +168,3 @@ export function StrategyPage() {
     </>
   )
 }
-

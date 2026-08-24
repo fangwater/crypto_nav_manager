@@ -13,12 +13,13 @@ use hmac::{Hmac, Mac};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 const EXCHANGE: &str = "okx";
 const LIQUIDATION_CLOSE_TYPES: [&str; 2] = ["3", "4"];
 const BASE: &str = "https://www.okx.com";
 const PAGE_LIMIT: usize = 100;
+const HISTORY_PAGE_INTERVAL: Duration = Duration::from_millis(250);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -156,6 +157,7 @@ impl OkxClient {
                 break;
             }
             after = next;
+            tokio::time::sleep(HISTORY_PAGE_INTERVAL).await;
         }
         dedup(&mut rows, &["instType", "instId", "tradeId"]);
         sort_by_ts(&mut rows);

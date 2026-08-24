@@ -93,6 +93,7 @@ const marketMakingPositionSeriesOptions = positionSeriesOptions
 function kindLabel(kind: Strategy['strategyKind']) {
   if (kind === 'funding_rate') return '资金费套利'
   if (kind === 'market_making') return '做市'
+  if (kind === 'cta') return 'CTA'
   return '所内套利'
 }
 
@@ -606,16 +607,17 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
   }
 
   const summary = pnl?.summary
-  const isMarketMaking = strategy.strategyKind === 'market_making'
+  const isFuturesOnly =
+    strategy.strategyKind === 'market_making' || strategy.strategyKind === 'cta'
   const analysisLink = strategySurfaceAnalysisLink(strategy.slug)
   const activePositionSeries: PositionSeriesKey[] =
     positionDisplayMode === 'exposure'
       ? ['exposureUsdt']
-      : isMarketMaking
+      : isFuturesOnly
         ? ['futuresPositionUsdt']
         : visiblePositionSeries.filter((key) => key !== 'exposureUsdt')
   const activePositionOptions = (
-    isMarketMaking ? marketMakingPositionSeriesOptions : positionSeriesOptions
+    isFuturesOnly ? marketMakingPositionSeriesOptions : positionSeriesOptions
   ).filter((option) => option.key !== 'exposureUsdt')
 
   return (
@@ -652,11 +654,13 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                 <span>{analysisLink.label}</span>
               </Link>
             )}
-            <a className="config-button" href={strategy.configUrl}>
-              <Settings size={17} />
-              配置
-              <ExternalLink size={14} />
-            </a>
+            {strategy.strategyKind !== 'cta' && (
+              <a className="config-button" href={strategy.configUrl}>
+                <Settings size={17} />
+                配置
+                <ExternalLink size={14} />
+              </a>
+            )}
           </div>
         </div>
       </header>
@@ -1001,7 +1005,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
 
         {(strategy.strategyKind === 'funding_rate' ||
           strategy.strategyKind === 'intra_exchange' ||
-          isMarketMaking) && (
+          isFuturesOnly) && (
           <section className="chart-panel pnl-chart-panel">
             <div className="chart-panel__header pnl-chart-header">
               <div>
@@ -1009,7 +1013,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                 <h2>
                   {positionDisplayMode === 'exposure'
                     ? '净敞口'
-                    : isMarketMaking
+                    : isFuturesOnly
                       ? '合约仓位'
                       : 'Spot / Swap 仓位'}
                 </h2>
@@ -1116,7 +1120,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                           <input
                             type="checkbox"
                             checked={visiblePositionSeries.includes(option.key)}
-                            disabled={isMarketMaking}
+                            disabled={isFuturesOnly}
                             onChange={() => togglePositionSeries(option.key)}
                           />
                           <span

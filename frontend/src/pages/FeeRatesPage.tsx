@@ -55,6 +55,7 @@ function exchangeBadge(exchange: Strategy['exchange']) {
 function kindLabel(kind: Strategy['strategyKind']) {
   if (kind === 'funding_rate') return '资金费套利'
   if (kind === 'market_making') return '做市'
+  if (kind === 'cta') return 'CTA'
   return '所内套利'
 }
 

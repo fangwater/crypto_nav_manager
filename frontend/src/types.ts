@@ -80,7 +80,7 @@ export interface OpsTradingBlock {
 export interface OpsEnvironment {
   strategySlug: string
   host: string
-  profile: 'funding_rate' | 'intra_exchange' | 'market_making'
+  profile: 'funding_rate' | 'intra_exchange' | 'market_making' | 'cta'
   status: OpsHealth
   components: OpsComponent[]
   tradingBlocks: OpsTradingBlock[]
@@ -97,7 +97,7 @@ export interface Strategy {
   displayName: string
   dbSchema: string
   host: string
-  strategyKind: 'funding_rate' | 'intra_exchange' | 'market_making'
+  strategyKind: 'funding_rate' | 'intra_exchange' | 'market_making' | 'cta'
   exchange: 'binance' | 'bybit' | 'gate' | 'bitget' | 'okx'
   accountMode: string
   envPath: string

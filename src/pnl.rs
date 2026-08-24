@@ -33,6 +33,7 @@ impl PnlSourceKind {
             | ("funding_rate", "bybit" | "gate" | "bitget", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
+            ("cta", "binance", "usdm_futures") => Some(Self::MarketMaking),
             _ => None,
         }
     }
@@ -2395,6 +2396,10 @@ mod tests {
         assert_eq!(
             PnlSourceKind::for_strategy("funding_rate", "bitget", "unified"),
             Some(PnlSourceKind::FundingRate)
+        );
+        assert_eq!(
+            PnlSourceKind::for_strategy("cta", "binance", "usdm_futures"),
+            Some(PnlSourceKind::MarketMaking)
         );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
     }
