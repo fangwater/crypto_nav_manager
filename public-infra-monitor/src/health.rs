@@ -13,7 +13,7 @@ pub fn assess(
     let mut status = HealthStatus::Ok;
     let mut reasons = Vec::new();
 
-    if candidates == 0 || process.is_none() {
+    if candidates == 0 {
         return (
             HealthStatus::Critical,
             vec!["target process is missing".to_owned()],
@@ -26,7 +26,12 @@ pub fn assess(
         );
     }
 
-    let process = process.expect("checked above");
+    let Some(process) = process else {
+        return (
+            HealthStatus::Critical,
+            vec!["target process is missing".to_owned()],
+        );
+    };
     if process.affinity != [expected_cpu] {
         raise(
             &mut status,
@@ -267,6 +272,20 @@ mod tests {
         };
         let (status, _) = assess(Some(&process), 1, 8, &network, &Thresholds::default());
         assert_eq!(status, HealthStatus::Critical);
+    }
+
+    #[test]
+    fn multiple_candidates_are_reported_as_duplicates() {
+        let (status, reasons) = assess(
+            None,
+            2,
+            8,
+            &NetworkWindow::default(),
+            &Thresholds::default(),
+        );
+
+        assert_eq!(status, HealthStatus::Critical);
+        assert_eq!(reasons, ["2 matching processes found"]);
     }
 
     #[test]

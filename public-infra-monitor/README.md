@@ -7,8 +7,10 @@ C eBPF is reserved for low-frequency retransmit and socket-state events.
 
 ## Data paths
 
-- `/proc`: exact executable plus `--venue` process discovery, PID, cwd,
-  affinity, current CPU, uptime and window CPU usage.
+- `/proc`: exact executable plus `--venue` and optional contiguous `match_args`
+  process discovery, PID, cwd, affinity, current CPU, uptime and window CPU
+  usage. Targets may share a venue only when each has distinct non-empty
+  `match_args`.
 - `NETLINK_SOCK_DIAG`: tuple, state, queues, RTT, RTO, cwnd, last receive,
   bytes, retransmits and socket drops. Socket inode is joined against
   `/proc/<pid>/fd`; `/proc/<pid>/net/tcp` is not used as ownership data.

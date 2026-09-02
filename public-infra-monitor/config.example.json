@@ -34,9 +34,16 @@
       "expected_cpu": 8
     },
     {
-      "name": "spp_bn_fu",
+      "name": "spp_bn_fu_market",
       "venue": "binance-futures",
-      "expected_cpu": 9
+      "expected_cpu": 14,
+      "match_args": ["--binance-futures-role", "market"]
+    },
+    {
+      "name": "spp_bn_fu_bookticker",
+      "venue": "binance-futures",
+      "expected_cpu": 9,
+      "match_args": ["--binance-futures-role", "bookticker"]
     },
     {
       "name": "spp_gt_bo",

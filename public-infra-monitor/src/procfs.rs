@@ -51,11 +51,20 @@ pub fn discover(
         if !venues.contains(venue) {
             continue;
         }
-        let Some(target) = targets.iter().find(|target| target.venue == venue) else {
+        let matching_targets: Vec<&TargetConfig> = targets
+            .iter()
+            .filter(|target| target.venue == venue && matches_args(&args, &target.match_args))
+            .collect();
+        if matching_targets.is_empty() {
             continue;
-        };
+        }
         if let Ok(sample) = sample_process(pid, &root, &args, proc_uptime) {
-            found.entry(target.name.clone()).or_default().push(sample);
+            for target in matching_targets {
+                found
+                    .entry(target.name.clone())
+                    .or_default()
+                    .push(sample.clone());
+            }
         }
     }
 
@@ -146,6 +155,13 @@ fn option_value<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
+fn matches_args(args: &[String], required: &[String]) -> bool {
+    required.is_empty()
+        || args
+            .windows(required.len())
+            .any(|window| window == required)
+}
+
 fn read_proc_uptime() -> Result<f64> {
     fs::read_to_string("/proc/uptime")?
         .split_whitespace()
@@ -213,5 +229,25 @@ mod tests {
             "gate-both".to_owned(),
         ];
         assert_eq!(option_value(&args, "--venue"), Some("gate-both"));
+    }
+
+    #[test]
+    fn matches_contiguous_target_arguments() {
+        let args = vec![
+            "spread_pbs".to_owned(),
+            "--venue".to_owned(),
+            "binance-futures".to_owned(),
+            "--binance-futures-role".to_owned(),
+            "market".to_owned(),
+        ];
+
+        assert!(matches_args(
+            &args,
+            &["--binance-futures-role".to_owned(), "market".to_owned()]
+        ));
+        assert!(!matches_args(
+            &args,
+            &["--binance-futures-role".to_owned(), "bookticker".to_owned()]
+        ));
     }
 }

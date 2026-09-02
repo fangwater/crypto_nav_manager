@@ -1,4 +1,7 @@
-use std::{collections::HashSet, net::SocketAddr};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,8 @@ pub struct TargetConfig {
     pub name: String,
     pub venue: String,
     pub expected_cpu: u32,
+    #[serde(default)]
+    pub match_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,13 +141,28 @@ impl MonitorConfig {
             }
         }
 
-        let mut venues = HashSet::new();
+        let mut venues: HashMap<&str, Vec<&TargetConfig>> = HashMap::new();
         for target in &self.targets {
             if !names.insert(&target.name) {
                 bail!("duplicate target name {}", target.name);
             }
-            if !venues.insert(&target.venue) {
-                bail!("duplicate target venue {}", target.venue);
+            if target.match_args.iter().any(String::is_empty) {
+                bail!("target {} has an empty match argument", target.name);
+            }
+            venues.entry(&target.venue).or_default().push(target);
+        }
+        for (venue, targets) in venues {
+            if targets.len() == 1 {
+                continue;
+            }
+            let mut selectors = HashSet::new();
+            for target in targets {
+                if target.match_args.is_empty() {
+                    bail!("targets sharing venue {venue} must define match_args");
+                }
+                if !selectors.insert(&target.match_args) {
+                    bail!("duplicate match_args for venue {venue}");
+                }
             }
         }
         Ok(())
@@ -170,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_duplicate_venues() {
+    fn rejects_duplicate_venues_without_match_args() {
         let config = MonitorConfig {
             listen: default_listen(),
             sample_interval_secs: 10,
@@ -184,15 +204,55 @@ mod tests {
                     name: "a".to_owned(),
                     venue: "same".to_owned(),
                     expected_cpu: 1,
+                    match_args: Vec::new(),
                 },
                 TargetConfig {
                     name: "b".to_owned(),
                     venue: "same".to_owned(),
                     expected_cpu: 2,
+                    match_args: Vec::new(),
                 },
             ],
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_duplicate_venues_with_distinct_match_args() {
+        let mut config: MonitorConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        config
+            .targets
+            .retain(|target| target.venue == "binance-futures");
+
+        assert_eq!(config.targets.len(), 2);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_venue_selectors() {
+        let mut config: MonitorConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        let duplicate = config
+            .targets
+            .iter()
+            .find(|target| target.name == "spp_bn_fu_market")
+            .unwrap()
+            .clone();
+        config.targets.push(TargetConfig {
+            name: "duplicate".to_owned(),
+            ..duplicate
+        });
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn example_config_validates() {
+        let config: MonitorConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+
+        config.validate().unwrap();
     }
 
     #[test]

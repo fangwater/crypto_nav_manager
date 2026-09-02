@@ -26,7 +26,8 @@ echarts.use([
 
 const TARGET_ORDER = [
   'spp_bn_mg',
-  'spp_bn_fu',
+  'spp_bn_fu_market',
+  'spp_bn_fu_bookticker',
   'spp_gt_bo',
   'spp_bg_bo',
   'spp_ok_bo',
