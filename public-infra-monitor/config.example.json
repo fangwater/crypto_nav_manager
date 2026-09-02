@@ -43,7 +43,8 @@
       "name": "spp_bn_fu_bookticker",
       "venue": "binance-futures",
       "expected_cpu": 9,
-      "match_args": ["--binance-futures-role", "bookticker"]
+      "match_args": ["--binance-futures-role", "bookticker"],
+      "no_established_alert_samples": 3
     },
     {
       "name": "spp_gt_bo",

@@ -109,7 +109,7 @@ async fn run_daemon(config: MonitorConfig, history_path: PathBuf) -> Result<()> 
     let listen = config.listen.clone();
     let interval = Duration::from_secs(config.sample_interval_secs);
     let (mut notification_manager, notification_stats) =
-        NotificationManager::new(config.notifications.clone())?;
+        NotificationManager::new(config.notifications.clone(), &config.targets)?;
     let history_store = match HistoryStore::load(history_path.clone()) {
         Ok(history) => history,
         Err(error) => {

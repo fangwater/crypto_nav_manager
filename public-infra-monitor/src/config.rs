@@ -33,6 +33,8 @@ pub struct TargetConfig {
     pub expected_cpu: u32,
     #[serde(default)]
     pub match_args: Vec<String>,
+    #[serde(default = "default_no_established_alert_samples")]
+    pub no_established_alert_samples: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +151,12 @@ impl MonitorConfig {
             if target.match_args.iter().any(String::is_empty) {
                 bail!("target {} has an empty match argument", target.name);
             }
+            if !(1..=100).contains(&target.no_established_alert_samples) {
+                bail!(
+                    "target {} no_established_alert_samples must be in [1, 100]",
+                    target.name
+                );
+            }
             venues.entry(&target.venue).or_default().push(target);
         }
         for (venue, targets) in venues {
@@ -185,6 +193,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_no_established_alert_samples() -> u32 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,12 +217,14 @@ mod tests {
                     venue: "same".to_owned(),
                     expected_cpu: 1,
                     match_args: Vec::new(),
+                    no_established_alert_samples: 1,
                 },
                 TargetConfig {
                     name: "b".to_owned(),
                     venue: "same".to_owned(),
                     expected_cpu: 2,
                     match_args: Vec::new(),
+                    no_established_alert_samples: 1,
                 },
             ],
         };
@@ -253,6 +267,33 @@ mod tests {
             serde_json::from_str(include_str!("../config.example.json")).unwrap();
 
         config.validate().unwrap();
+        assert_eq!(
+            config
+                .targets
+                .iter()
+                .find(|target| target.name == "spp_bn_fu_bookticker")
+                .unwrap()
+                .no_established_alert_samples,
+            3
+        );
+        assert_eq!(
+            config
+                .targets
+                .iter()
+                .find(|target| target.name == "spp_bn_mg")
+                .unwrap()
+                .no_established_alert_samples,
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_no_established_alert_samples() {
+        let mut config: MonitorConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        config.targets[0].no_established_alert_samples = 0;
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

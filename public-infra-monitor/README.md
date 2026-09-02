@@ -71,11 +71,16 @@ to `POST /v1/notify` on `127.0.0.1:18100`; configuration rejects non-loopback
 addresses. Sampling never waits for delivery. Queue saturation and delivery
 failures are exposed by the `public_infra_notifications_*_total` metrics.
 
-Missing processes, missing established sockets and sustained RX silence notify
-immediately. Queue, retransmit, drop, reconnect and host-network degradation must
-persist for three consecutive windows. Escalation is immediate, an unchanged
+Missing processes and sustained RX silence notify immediately. Missing
+established sockets also notify immediately by default; a target can set
+`no_established_alert_samples` to require that many consecutive zero-connection
+windows first. The Binance Futures bookticker target uses three 10-second
+windows, giving short reconnects about 30 seconds to recover. Queue,
+retransmit, drop, reconnect and host-network degradation must persist for three
+consecutive windows. Other severity escalations are immediate; a configured
+zero-connection gate must be satisfied before that escalation. An unchanged
 fault repeats after 15 minutes, and recovery requires six consecutive healthy
-windows. A recovered non-immediate incident cannot re-arm for 15 minutes.
+windows. A recovered ordinary threshold incident cannot re-arm for 15 minutes.
 Isolated disconnects remain visible in history but do not notify.
 CPU-affinity-only warnings do not notify.
 

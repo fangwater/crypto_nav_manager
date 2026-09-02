@@ -17,7 +17,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::{
-    config::NotificationConfig,
+    config::{NotificationConfig, TargetConfig},
     model::{HealthStatus, Snapshot, SystemObservation, TargetObservation},
 };
 
@@ -58,10 +58,14 @@ pub struct NotificationManager {
     stats: Arc<NotificationStats>,
     active: HashMap<String, ActiveAlert>,
     last_incident_closed_at: HashMap<String, u64>,
+    no_established_alert_samples: HashMap<String, u32>,
 }
 
 impl NotificationManager {
-    pub fn new(config: NotificationConfig) -> Result<(Self, Arc<NotificationStats>)> {
+    pub fn new(
+        config: NotificationConfig,
+        targets: &[TargetConfig],
+    ) -> Result<(Self, Arc<NotificationStats>)> {
         let stats = Arc::new(NotificationStats::default());
         let sender = if config.enabled {
             let address = config.socket_address()?;
@@ -105,6 +109,10 @@ impl NotificationManager {
             stats: Arc::clone(&stats),
             active: HashMap::new(),
             last_incident_closed_at: HashMap::new(),
+            no_established_alert_samples: targets
+                .iter()
+                .map(|target| (target.name.clone(), target.no_established_alert_samples))
+                .collect(),
         };
         Ok((manager, stats))
     }
@@ -115,7 +123,12 @@ impl NotificationManager {
         }
 
         for target in &snapshot.targets {
-            let condition = target_condition(target);
+            let no_established_alert_samples = self
+                .no_established_alert_samples
+                .get(&target.name)
+                .copied()
+                .unwrap_or(1);
+            let condition = target_condition(target, no_established_alert_samples);
             let key = format!("target:{}", target.name);
             if let Some(action) =
                 self.next_state_action(&key, condition, snapshot.timestamp_unix_ms)
@@ -158,8 +171,9 @@ impl NotificationManager {
                     },
                 )
             }
-            AlertCondition::Alert { level, immediate } => {
-                let rearm_blocked = !immediate
+            AlertCondition::Alert { level, gate } => {
+                let required_samples = gate.required_samples(self.config.alert_samples);
+                let rearm_blocked = !gate.bypasses_rearm()
                     && self.last_incident_closed_at.get(key).is_some_and(|last| {
                         now_unix_ms.saturating_sub(*last)
                             < self.config.repeat_interval_secs.saturating_mul(1_000)
@@ -170,16 +184,24 @@ impl NotificationManager {
                     last_sent_at_unix_ms: None,
                     healthy_samples: 0,
                     fault_samples: 0,
+                    gate,
                 });
+                if state.gate != gate {
+                    state.gate = gate;
+                    state.fault_samples = 0;
+                    if state.last_sent_at_unix_ms.is_none() {
+                        state.opened_at_unix_ms = now_unix_ms;
+                    }
+                }
                 let escalated = state.last_sent_at_unix_ms.is_some()
                     && level_rank(level) > level_rank(state.level);
-                if state.last_sent_at_unix_ms.is_none() || escalated {
+                if state.last_sent_at_unix_ms.is_none() {
                     state.level = level;
                 }
                 state.healthy_samples = 0;
                 state.fault_samples = state.fault_samples.saturating_add(1);
 
-                if !immediate && state.fault_samples < self.config.alert_samples {
+                if state.fault_samples < required_samples {
                     return None;
                 }
 
@@ -202,8 +224,9 @@ impl NotificationManager {
 
     fn mark_state_action_delivered(&mut self, key: &str, action: StateAction, now_unix_ms: u64) {
         match action {
-            StateAction::Alert { .. } => {
+            StateAction::Alert { level, .. } => {
                 if let Some(state) = self.active.get_mut(key) {
+                    state.level = level;
                     state.last_sent_at_unix_ms = Some(now_unix_ms);
                 }
             }
@@ -246,6 +269,7 @@ impl NotificationManager {
     #[cfg(test)]
     fn test_instance(
         mut config: NotificationConfig,
+        no_established_alert_samples: u32,
     ) -> (Self, Receiver<NotifyRequest>, Arc<NotificationStats>) {
         config.enabled = true;
         let stats = Arc::new(NotificationStats::default());
@@ -257,6 +281,10 @@ impl NotificationManager {
                 stats: Arc::clone(&stats),
                 active: HashMap::new(),
                 last_incident_closed_at: HashMap::new(),
+                no_established_alert_samples: HashMap::from([(
+                    "spp_test".to_owned(),
+                    no_established_alert_samples,
+                )]),
             },
             receiver,
             stats,
@@ -271,13 +299,35 @@ struct ActiveAlert {
     last_sent_at_unix_ms: Option<u64>,
     healthy_samples: u32,
     fault_samples: u32,
+    gate: AlertGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AlertCondition {
     Unknown,
     Healthy,
-    Alert { level: AlertLevel, immediate: bool },
+    Alert { level: AlertLevel, gate: AlertGate },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlertGate {
+    Immediate,
+    Default,
+    NoEstablished { required_samples: u32 },
+}
+
+impl AlertGate {
+    const fn required_samples(self, default_samples: u32) -> u32 {
+        match self {
+            Self::Immediate => 1,
+            Self::Default => default_samples,
+            Self::NoEstablished { required_samples } => required_samples,
+        }
+    }
+
+    const fn bypasses_rearm(self) -> bool {
+        matches!(self, Self::Immediate | Self::NoEstablished { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +365,10 @@ enum StateAction {
     Recovery { opened_at_unix_ms: u64 },
 }
 
-fn target_condition(target: &TargetObservation) -> AlertCondition {
+fn target_condition(
+    target: &TargetObservation,
+    no_established_alert_samples: u32,
+) -> AlertCondition {
     if target.status == HealthStatus::Unknown {
         return AlertCondition::Unknown;
     }
@@ -332,20 +385,33 @@ fn target_condition(target: &TargetObservation) -> AlertCondition {
     if !has_network_reason {
         return AlertCondition::Healthy;
     }
-    let immediate = target.reasons.iter().any(|reason| {
+    let has_immediate_reason = target.reasons.iter().any(|reason| {
         reason == "target process is missing"
             || reason.ends_with("matching processes found")
             || reason.starts_with("RX has remained zero")
-            || reason == "no established TCP socket"
     });
+    let has_no_established = target
+        .reasons
+        .iter()
+        .any(|reason| reason == "no established TCP socket");
+    let gate = if has_immediate_reason || (has_no_established && no_established_alert_samples == 1)
+    {
+        AlertGate::Immediate
+    } else if has_no_established {
+        AlertGate::NoEstablished {
+            required_samples: no_established_alert_samples,
+        }
+    } else {
+        AlertGate::Default
+    };
     match target.status {
         HealthStatus::Critical => AlertCondition::Alert {
             level: AlertLevel::Critical,
-            immediate,
+            gate,
         },
         HealthStatus::Warn => AlertCondition::Alert {
             level: AlertLevel::Warning,
-            immediate,
+            gate,
         },
         HealthStatus::Ok => AlertCondition::Healthy,
         HealthStatus::Unknown => AlertCondition::Unknown,
@@ -357,11 +423,11 @@ const fn system_condition(system: &SystemObservation) -> AlertCondition {
         HealthStatus::Ok => AlertCondition::Healthy,
         HealthStatus::Warn => AlertCondition::Alert {
             level: AlertLevel::Warning,
-            immediate: false,
+            gate: AlertGate::Default,
         },
         HealthStatus::Critical => AlertCondition::Alert {
             level: AlertLevel::Critical,
-            immediate: false,
+            gate: AlertGate::Default,
         },
         HealthStatus::Unknown => AlertCondition::Unknown,
     }
@@ -701,6 +767,16 @@ mod tests {
         Receiver<NotifyRequest>,
         Arc<NotificationStats>,
     ) {
+        test_manager_with_no_established_alert_samples(1)
+    }
+
+    fn test_manager_with_no_established_alert_samples(
+        no_established_alert_samples: u32,
+    ) -> (
+        NotificationManager,
+        Receiver<NotifyRequest>,
+        Arc<NotificationStats>,
+    ) {
         let config = NotificationConfig {
             queue_capacity: 16,
             repeat_interval_secs: 60,
@@ -708,7 +784,7 @@ mod tests {
             recovery_samples: 2,
             ..NotificationConfig::default()
         };
-        NotificationManager::test_instance(config)
+        NotificationManager::test_instance(config, no_established_alert_samples)
     }
 
     #[test]
@@ -805,6 +881,86 @@ mod tests {
             vec!["no established TCP socket".to_owned()],
             0,
         ));
+        assert!(receiver.try_recv().unwrap().title.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn socket_failure_can_require_consecutive_samples() {
+        let (mut manager, receiver, _) = test_manager_with_no_established_alert_samples(3);
+
+        manager.observe(&snapshot(
+            1_000,
+            HealthStatus::Warn,
+            vec!["reconnects: 2".to_owned()],
+            0,
+        ));
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        for timestamp in [2_000, 3_000] {
+            manager.observe(&snapshot(
+                timestamp,
+                HealthStatus::Critical,
+                vec!["no established TCP socket".to_owned()],
+                0,
+            ));
+            assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+        }
+
+        manager.observe(&snapshot(
+            4_000,
+            HealthStatus::Critical,
+            vec!["no established TCP socket".to_owned()],
+            0,
+        ));
+        assert!(receiver.try_recv().unwrap().title.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn socket_failure_grace_applies_before_escalating_an_active_warning() {
+        let (mut manager, receiver, _) = test_manager_with_no_established_alert_samples(3);
+
+        for timestamp in [1_000, 2_000] {
+            manager.observe(&snapshot(
+                timestamp,
+                HealthStatus::Warn,
+                vec!["reconnects: 2".to_owned()],
+                0,
+            ));
+        }
+        assert!(receiver.try_recv().unwrap().title.contains("WARN"));
+
+        for timestamp in [3_000, 4_000] {
+            manager.observe(&snapshot(
+                timestamp,
+                HealthStatus::Critical,
+                vec!["no established TCP socket".to_owned()],
+                0,
+            ));
+            assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+        }
+
+        manager.observe(&snapshot(
+            5_000,
+            HealthStatus::Critical,
+            vec!["no established TCP socket".to_owned()],
+            0,
+        ));
+        assert!(receiver.try_recv().unwrap().title.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn process_failure_remains_immediate_with_socket_grace() {
+        let (mut manager, receiver, _) = test_manager_with_no_established_alert_samples(3);
+        manager.observe(&snapshot(
+            1_000,
+            HealthStatus::Critical,
+            vec![
+                "target process is missing".to_owned(),
+                "no established TCP socket".to_owned(),
+            ],
+            0,
+        ));
+
         assert!(receiver.try_recv().unwrap().title.contains("CRITICAL"));
     }
 
