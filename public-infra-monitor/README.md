@@ -76,13 +76,14 @@ established sockets also notify immediately by default; a target can set
 `no_established_alert_samples` to require that many consecutive zero-connection
 windows first. The Binance Futures bookticker target uses three 10-second
 windows, giving short reconnects about 30 seconds to recover. Queue,
-retransmit, drop, reconnect and host-network degradation must persist for three
-consecutive windows. Other severity escalations are immediate; a configured
-zero-connection gate must be satisfied before that escalation. An unchanged
-fault repeats after 15 minutes, and recovery requires six consecutive healthy
-windows. A recovered ordinary threshold incident cannot re-arm for 15 minutes.
-Isolated disconnects remain visible in history but do not notify.
-CPU-affinity-only warnings do not notify.
+retransmit and host-network degradation must persist for three consecutive
+windows. Other severity escalations are immediate; a configured zero-connection
+gate must be satisfied before that escalation. An unchanged fault repeats after
+15 minutes, and recovery requires six consecutive healthy windows. A recovered
+ordinary threshold incident cannot re-arm for 15 minutes. Disconnect, reconnect
+and per-socket drop counters remain visible as diagnostic data but do not raise
+the target health state or notify while the process has established connections
+and continues receiving market data. CPU-affinity-only warnings do not notify.
 
 If the local notification API requires authentication, provide its bearer token
 as `PUBLIC_INFRA_NOTIFICATION_TOKEN` in the monitor service environment. Do not

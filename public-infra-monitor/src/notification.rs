@@ -379,8 +379,6 @@ fn target_condition(
             || reason == "no established TCP socket"
             || reason.starts_with("receive queue")
             || reason.starts_with("TCP retransmissions")
-            || reason.starts_with("socket drops")
-            || reason.starts_with("reconnects")
     });
     if !has_network_reason {
         return AlertCondition::Healthy;
@@ -479,7 +477,7 @@ fn target_state_request(
             fields.insert("incident_duration_s".to_owned(), duration_secs.to_string());
             (
                 format!("Market data network recovered: {}", target.name),
-                "Network health returned below all alert thresholds.".to_owned(),
+                "Market data flow returned below all notification thresholds.".to_owned(),
                 NotificationSeverity::Info,
             )
         }
@@ -793,7 +791,7 @@ mod tests {
         manager.observe(&snapshot(
             1_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -801,7 +799,7 @@ mod tests {
         manager.observe(&snapshot(
             2_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         let first = receiver.try_recv().unwrap();
@@ -810,7 +808,7 @@ mod tests {
         manager.observe(&snapshot(
             20_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -818,7 +816,7 @@ mod tests {
         manager.observe(&snapshot(
             62_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         let repeated = receiver.try_recv().unwrap();
@@ -827,14 +825,14 @@ mod tests {
         manager.observe(&snapshot(
             70_000,
             HealthStatus::Ok,
-            vec!["process, affinity, sockets and window counters are healthy".to_owned()],
+            vec!["process, affinity and market data flow are healthy".to_owned()],
             0,
         ));
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
         manager.observe(&snapshot(
             80_000,
             HealthStatus::Ok,
-            vec!["process, affinity, sockets and window counters are healthy".to_owned()],
+            vec!["process, affinity and market data flow are healthy".to_owned()],
             0,
         ));
         let recovery = receiver.try_recv().unwrap();
@@ -845,7 +843,7 @@ mod tests {
             manager.observe(&snapshot(
                 timestamp,
                 HealthStatus::Warn,
-                vec!["reconnects: 2".to_owned()],
+                vec!["TCP retransmissions: 2".to_owned()],
                 0,
             ));
         }
@@ -854,7 +852,7 @@ mod tests {
         manager.observe(&snapshot(
             141_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         assert!(receiver.try_recv().unwrap().title.contains("WARN"));
@@ -866,9 +864,36 @@ mod tests {
         manager.observe(&snapshot(
             1_000,
             HealthStatus::Ok,
-            vec!["process, affinity, sockets and window counters are healthy".to_owned()],
+            vec!["process, affinity and market data flow are healthy".to_owned()],
             1,
         ));
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn active_flow_reconnects_and_socket_drops_are_timeline_only() {
+        let (mut manager, receiver, _) = test_manager();
+
+        for (timestamp, status, reasons) in [
+            (
+                1_000,
+                HealthStatus::Warn,
+                vec!["socket drops: 3".to_owned()],
+            ),
+            (
+                2_000,
+                HealthStatus::Critical,
+                vec!["reconnects: 18".to_owned(), "socket drops: 42".to_owned()],
+            ),
+            (
+                3_000,
+                HealthStatus::Critical,
+                vec!["socket drops: 16".to_owned()],
+            ),
+        ] {
+            manager.observe(&snapshot(timestamp, status, reasons, 0));
+        }
+
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
@@ -891,7 +916,7 @@ mod tests {
         manager.observe(&snapshot(
             1_000,
             HealthStatus::Warn,
-            vec!["reconnects: 2".to_owned()],
+            vec!["TCP retransmissions: 2".to_owned()],
             0,
         ));
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -923,7 +948,7 @@ mod tests {
             manager.observe(&snapshot(
                 timestamp,
                 HealthStatus::Warn,
-                vec!["reconnects: 2".to_owned()],
+                vec!["TCP retransmissions: 2".to_owned()],
                 0,
             ));
         }

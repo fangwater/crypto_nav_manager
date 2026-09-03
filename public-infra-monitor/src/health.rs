@@ -113,25 +113,9 @@ pub fn assess(
         &mut status,
         &mut reasons,
     );
-    check_counter(
-        network.socket_drops,
-        thresholds.socket_drop_warn,
-        thresholds.socket_drop_critical,
-        "socket drops",
-        &mut status,
-        &mut reasons,
-    );
-    check_counter(
-        network.reconnects,
-        thresholds.reconnect_warn,
-        thresholds.reconnect_critical,
-        "reconnects",
-        &mut status,
-        &mut reasons,
-    );
 
     if reasons.is_empty() {
-        reasons.push("process, affinity, sockets and window counters are healthy".to_owned());
+        reasons.push("process, affinity and market data flow are healthy".to_owned());
     }
     (status, reasons)
 }
@@ -272,6 +256,41 @@ mod tests {
         };
         let (status, _) = assess(Some(&process), 1, 8, &network, &Thresholds::default());
         assert_eq!(status, HealthStatus::Critical);
+    }
+
+    #[test]
+    fn active_flow_keeps_socket_churn_as_diagnostic_data() {
+        let process = ProcessObservation {
+            pid: 1,
+            executable: "spread_pbs".to_owned(),
+            cmdline: "spread_pbs --venue test".to_owned(),
+            cwd: None,
+            affinity: vec![8],
+            current_cpu: Some(8),
+            uptime_secs: Some(10.0),
+            cpu_percent: Some(1.0),
+        };
+        let network = NetworkWindow {
+            socket_count: 40,
+            established_count: 40,
+            rx_bytes: Some(50_000_000),
+            rx_idle_secs: Some(0.0),
+            socket_drops: Some(100),
+            reconnects: Some(18),
+            disconnects: Some(18),
+            ..NetworkWindow::default()
+        };
+
+        let (status, reasons) = assess(Some(&process), 1, 8, &network, &Thresholds::default());
+
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(
+            reasons,
+            ["process, affinity and market data flow are healthy"]
+        );
+        assert_eq!(network.socket_drops, Some(100));
+        assert_eq!(network.reconnects, Some(18));
+        assert_eq!(network.disconnects, Some(18));
     }
 
     #[test]

@@ -43,8 +43,6 @@ function feedLevel(target: MarketDataTarget): FeedLevel {
     network.established_count === 0 ||
     (network.rx_idle_secs ?? 0) >= 120 ||
     valueOrZero(network.retransmits) >= 10 ||
-    valueOrZero(network.socket_drops) >= 10 ||
-    valueOrZero(network.reconnects) >= 10 ||
     network.recv_queue_bytes >= 1_048_576
   ) {
     return 'critical'
@@ -53,9 +51,6 @@ function feedLevel(target: MarketDataTarget): FeedLevel {
   if (
     (network.rx_idle_secs ?? 0) >= 30 ||
     valueOrZero(network.retransmits) > 0 ||
-    valueOrZero(network.socket_drops) > 0 ||
-    valueOrZero(network.reconnects) >= 2 ||
-    valueOrZero(network.disconnects) > 0 ||
     network.recv_queue_bytes >= 65_536
   ) {
     return 'warn'
@@ -68,14 +63,9 @@ function feedLabel(target: MarketDataTarget, level: FeedLevel) {
   if (target.process_candidates !== 1) return '进程重复'
   if (target.network.established_count === 0) return '行情断开'
   if ((target.network.rx_idle_secs ?? 0) >= 120) return '行情中断'
-  if (valueOrZero(target.network.reconnects) >= 2) return '频繁重连'
-  if (valueOrZero(target.network.disconnects) > 0) return '连接切换'
-  if (
-    valueOrZero(target.network.retransmits) > 0 ||
-    valueOrZero(target.network.socket_drops) > 0
-  ) {
-    return '网络抖动'
-  }
+  if ((target.network.rx_idle_secs ?? 0) >= 30) return '接收延迟'
+  if (target.network.recv_queue_bytes >= 65_536) return '接收积压'
+  if (valueOrZero(target.network.retransmits) > 0) return '网络抖动'
   if (level === 'unknown') return '采样中'
   if (target.network.rx_bytes === 0) return '等待行情'
   return '持续接收'
@@ -108,8 +98,8 @@ function feedReason(target: MarketDataTarget) {
   if (reason === 'no established TCP socket') return 'TCP 行情连接已断开'
   if (reason.includes('receive queue')) return '接收队列正在积压'
   if (reason.startsWith('TCP retransmissions')) return 'TCP 重传达到告警阈值'
-  if (reason.startsWith('socket drops')) return 'Socket 丢包达到告警阈值'
-  if (reason.startsWith('reconnects')) return '重连频率达到告警阈值'
+  if (reason.startsWith('socket drops')) return '窗口内记录到 Socket drop'
+  if (reason.startsWith('reconnects')) return '窗口内记录到连接切换'
   if (reason === 'no completed sampling window') return '等待首个采样窗口'
   return reason
 }
@@ -337,7 +327,7 @@ export function MarketDataNetworkPage() {
         {snapshot && allClear && !stale && (
           <div className="market-network-all-clear">
             <CheckCircle2 size={16} />
-            所有行情通道持续接收，当前窗口未见断流或频繁重连。
+            所有行情通道持续接收，当前窗口未见断流、积压或 TCP 重传。
           </div>
         )}
 
@@ -349,9 +339,9 @@ export function MarketDataNetworkPage() {
           <div className="market-feed-list">
             {rows.map(({ target, level }) => {
               const network = target.network
+              const retransmits = valueOrZero(network.retransmits)
               const eventCount =
-                valueOrZero(network.retransmits) +
-                valueOrZero(network.socket_drops)
+                retransmits + valueOrZero(network.socket_drops)
               const reason = feedReason(target)
               return (
                 <div className="market-feed-row" key={target.name}>
@@ -405,17 +395,17 @@ export function MarketDataNetworkPage() {
                   </div>
 
                   <div className="market-feed-reading market-feed-events">
-                    <span>网络异常</span>
-                    <strong className={eventCount > 0 ? 'is-warning' : ''}>
+                    <span>传输事件</span>
+                    <strong className={retransmits > 0 ? 'is-warning' : ''}>
                       {eventCount > 0 ? eventCount : '无'}
                     </strong>
                     <small>
                       {eventCount > 0
                         ? '重传 ' +
-                          valueOrZero(network.retransmits) +
-                          ' · 丢包 ' +
+                          retransmits +
+                          ' · Socket drop ' +
                           valueOrZero(network.socket_drops)
-                        : '未见重传或丢包'}
+                        : '未见重传或 Socket drop'}
                     </small>
                   </div>
                 </div>
