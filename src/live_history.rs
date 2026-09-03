@@ -290,6 +290,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'okex_mm_alpha',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
+                 'bitget_fr_arb01',
                  'bitget_fr_arb02',
                  'gate_fr_arb01',
                  'gate_fr_arb02'
@@ -827,6 +828,10 @@ mod tests {
         assert_eq!(
             account_datasets(&strategy("gate_fr_arb01", "gate", "funding_rate")),
             ["funding", "interest", "liquidations"]
+        );
+        assert_eq!(
+            account_datasets(&strategy("bitget_fr_arb01", "bitget", "funding_rate")),
+            ["funding", "interest"]
         );
         assert_eq!(
             account_datasets(&strategy("bitget_fr_arb02", "bitget", "funding_rate")),

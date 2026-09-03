@@ -1366,6 +1366,7 @@ fn expected_history_datasets(
                 | "binance-intra-arb01"
                 | "bybit-intra-arb01"
                 | "bybit-intra-arb02"
+                | "bitget_fr_arb01"
                 | "bitget_fr_arb02"
                 | "gate_fr_arb01"
                 | "gate_fr_arb02"
@@ -2334,7 +2335,9 @@ mod tests {
         ));
         assert!(intra_latency::supports_hourly_latency("bybit-intra-arb01"));
         assert!(!intra_latency::supports_hourly_latency("bybit-intra-arb02"));
-        assert!(!intra_analysis::includes_closed_carry("binance-intra-arb01"));
+        assert!(!intra_analysis::includes_closed_carry(
+            "binance-intra-arb01"
+        ));
         assert!(intra_analysis::includes_closed_carry("bybit-intra-arb01"));
     }
 
@@ -2400,6 +2403,14 @@ mod tests {
             "http://47.131.162.78:4191/intra/bybit-intra-arb01/snapshot"
         );
         assert!(snapshot_source_url("sg", "/intra/bybit-intra-arb01/config").is_err());
+    }
+
+    #[test]
+    fn schedules_bitget_fr_arb01_history_datasets() {
+        assert_eq!(
+            expected_history_datasets("bitget_fr_arb01", "local", "bitget", "funding_rate",),
+            Some(&["trades", "funding", "interest"][..])
+        );
     }
 
     #[test]
