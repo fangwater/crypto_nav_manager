@@ -2147,6 +2147,12 @@ async fn get_strategy_pnl(
     if let Some(parsed) = parsed_initial.as_ref() {
         inputs.initial_positions = parsed.positions.clone();
     }
+    let principal_usdt = state
+        .account_risks
+        .snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.strategy_slug == slug)
+        .and_then(|snapshot| snapshot.actual_equity_usd.or(snapshot.adjusted_equity_usd));
     let response = pnl::calculate(
         inputs,
         PnlCalculation {
@@ -2162,6 +2168,7 @@ async fn get_strategy_pnl(
                 .as_ref()
                 .map(|parsed| parsed.skipped_count)
                 .unwrap_or_default(),
+            principal_usdt,
         },
     )?;
 

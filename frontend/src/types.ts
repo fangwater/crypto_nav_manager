@@ -256,6 +256,23 @@ export interface SymbolPnlSeries {
   points: PnlPoint[]
 }
 
+export interface RollingWindowPnl {
+  windowMs: number
+  coveredMs: number
+  pnlUsdt: number
+  annualizedReturn: number | null
+}
+
+export interface PnlPerformance {
+  principalUsdt: number | null
+  rolling7d: RollingWindowPnl | null
+  rolling30d: RollingWindowPnl | null
+  maxDrawdownUsdt: number
+  maxDrawdownRatio: number | null
+  currentDrawdownUsdt: number
+  currentDrawdownRatio: number | null
+}
+
 export interface PnlSourceInfo {
   adapter: string
   loadedTradeRows: number
@@ -281,6 +298,7 @@ export interface StrategyPnl {
   points: PnlPoint[]
   symbolPoints: SymbolPnlSeries[]
   source: PnlSourceInfo
+  performance?: PnlPerformance
 }
 
 export type IntraArbDirection = 'positive' | 'reverse'
@@ -500,6 +518,8 @@ export type PnlSeriesKey =
   | 'fundingPnlUsdt'
   | 'interestCostUsdt'
   | 'floatingPnlUsdt'
+  | 'returnOnPrincipalPct'
+  | 'drawdownPct'
 
 export type PositionSeriesKey =
   | 'spotPositionUsdt'

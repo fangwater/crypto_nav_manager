@@ -11,6 +11,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const PNL_TICK_INTERVAL_MS: i64 = 15 * 60 * 1_000;
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+const YEAR_MS: f64 = 365.0 * DAY_MS as f64;
+const ROLLING_WINDOWS_MS: [i64; 2] = [7 * DAY_MS, 30 * DAY_MS];
 
 const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
 // Binance records Spot MM2 maker commission as zero and settles the rebate
@@ -120,6 +123,8 @@ pub struct PnlCalculation {
     pub max_points: usize,
     pub initial_snapshot_ts_ms: Option<i64>,
     pub skipped_initial_position_count: usize,
+    /// Latest account equity used as the principal for return/drawdown ratios.
+    pub principal_usdt: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -135,6 +140,35 @@ pub struct PnlResponse {
     pub points: Vec<PnlPoint>,
     pub symbol_points: Vec<SymbolPnlSeries>,
     pub source: PnlSourceInfo,
+    pub performance: PnlPerformance,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollingWindowPnl {
+    /// Nominal trailing window length.
+    pub window_ms: i64,
+    /// Span actually covered by strategy history inside the window.
+    pub covered_ms: i64,
+    /// Total PnL earned inside the window.
+    pub pnl_usdt: f64,
+    /// Window return (pnl/principal) annualized linearly over the covered span.
+    pub annualized_return: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlPerformance {
+    /// Latest account equity used as the principal for ratio metrics.
+    pub principal_usdt: Option<f64>,
+    pub rolling_7d: Option<RollingWindowPnl>,
+    pub rolling_30d: Option<RollingWindowPnl>,
+    /// Largest peak-to-trough decline of the total-PnL curve inside the window.
+    pub max_drawdown_usdt: f64,
+    /// Max drawdown relative to the running peak NAV implied by the principal.
+    pub max_drawdown_ratio: Option<f64>,
+    pub current_drawdown_usdt: f64,
+    pub current_drawdown_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -678,9 +712,40 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
             .seed_position(position)?;
     }
 
+    // Absolute cumulative PnL snapshots at each rolling-window boundary. A
+    // boundary is captured just before the first event past it is applied, so
+    // the value reflects every event with ts <= boundary.
+    let mut rolling_boundaries = ROLLING_WINDOWS_MS
+        .iter()
+        .map(|window| request.end_ms - window)
+        .filter(|boundary| *boundary >= request.strategy_start_ms)
+        .collect::<Vec<_>>();
+    rolling_boundaries.sort_unstable();
+    rolling_boundaries.dedup();
+    let mut boundary_pnl = Vec::with_capacity(rolling_boundaries.len());
+    let mut next_boundary = 0usize;
+
     let split = events.partition_point(|event| event.ts() < request.start_ms);
     for event in &events[..split] {
+        while next_boundary < rolling_boundaries.len()
+            && rolling_boundaries[next_boundary] < event.ts()
+        {
+            boundary_pnl.push((
+                rolling_boundaries[next_boundary],
+                selected_total_pnl(&states, &selected_set),
+            ));
+            next_boundary += 1;
+        }
         apply_event(&mut states, event)?;
+    }
+    while next_boundary < rolling_boundaries.len()
+        && rolling_boundaries[next_boundary] < request.start_ms
+    {
+        boundary_pnl.push((
+            rolling_boundaries[next_boundary],
+            selected_total_pnl(&states, &selected_set),
+        ));
+        next_boundary += 1;
     }
     let baselines = states
         .iter()
@@ -711,6 +776,15 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
     for event in &events[split..] {
         if event.ts() > request.end_ms {
             break;
+        }
+        while next_boundary < rolling_boundaries.len()
+            && rolling_boundaries[next_boundary] < event.ts()
+        {
+            boundary_pnl.push((
+                rolling_boundaries[next_boundary],
+                selected_total_pnl(&states, &selected_set),
+            ));
+            next_boundary += 1;
         }
         apply_event(&mut states, event)?;
         if selected_set.contains(event.symbol()) {
@@ -785,6 +859,17 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
         .last()
         .map(|point| point.exposure_usdt)
         .unwrap_or_default();
+    // Boundaries not hit by an event timestamp have no events between them and
+    // end_ms, so the current state already reflects their value.
+    while next_boundary < rolling_boundaries.len() {
+        boundary_pnl.push((
+            rolling_boundaries[next_boundary],
+            selected_total_pnl(&states, &selected_set),
+        ));
+        next_boundary += 1;
+    }
+    let end_total_pnl = selected_total_pnl(&states, &selected_set);
+
     let points = resample_fixed_interval(
         points,
         request.start_ms,
@@ -792,6 +877,14 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
         PNL_TICK_INTERVAL_MS,
     );
     let original_points = points.len();
+    let performance = build_performance(
+        request.strategy_start_ms,
+        request.end_ms,
+        request.principal_usdt,
+        &points,
+        &boundary_pnl,
+        end_total_pnl,
+    );
     let points = downsample_extrema(points, request.max_points.max(2));
     let returned_points = points.len();
 
@@ -841,6 +934,7 @@ pub fn calculate(inputs: PnlInputs, request: PnlCalculation) -> Result<PnlRespon
             initial_position_count,
             skipped_initial_position_count: request.skipped_initial_position_count,
         },
+        performance,
     })
 }
 
@@ -935,6 +1029,90 @@ fn symbol_point(
         exposure_qty: clean_zero(
             source.exposure(current.spot_position_qty, current.futures_position_qty),
         ),
+    }
+}
+
+fn selected_total_pnl(states: &HashMap<String, SymbolState>, selected: &HashSet<String>) -> f64 {
+    selected
+        .iter()
+        .map(|symbol| {
+            states
+                .get(symbol)
+                .map(SymbolState::metrics)
+                .unwrap_or_default()
+                .total_pnl_usdt
+        })
+        .sum()
+}
+
+fn build_performance(
+    strategy_start_ms: i64,
+    end_ms: i64,
+    principal_usdt: Option<f64>,
+    points: &[PnlPoint],
+    boundary_pnl: &[(i64, f64)],
+    end_total_pnl: f64,
+) -> PnlPerformance {
+    let principal = principal_usdt.filter(|value| value.is_finite() && *value > 0.0);
+    let end_relative = points
+        .last()
+        .map(|point| point.total_pnl_usdt)
+        .unwrap_or_default();
+
+    let mut peak_relative = f64::NEG_INFINITY;
+    let mut max_drawdown_usdt = 0.0f64;
+    let mut max_drawdown_ratio = 0.0f64;
+    for point in points {
+        peak_relative = peak_relative.max(point.total_pnl_usdt);
+        let drawdown = peak_relative - point.total_pnl_usdt;
+        max_drawdown_usdt = max_drawdown_usdt.max(drawdown);
+        if let Some(principal) = principal {
+            let peak_nav = principal + peak_relative - end_relative;
+            if peak_nav > 0.0 {
+                max_drawdown_ratio = max_drawdown_ratio.max(drawdown / peak_nav);
+            }
+        }
+    }
+    let current_drawdown_usdt = (peak_relative - end_relative).max(0.0);
+    let current_drawdown_ratio = principal.and_then(|principal| {
+        let peak_nav = principal + peak_relative - end_relative;
+        (peak_nav > 0.0).then(|| current_drawdown_usdt / peak_nav)
+    });
+
+    let rolling = |window_ms: i64| -> Option<RollingWindowPnl> {
+        let boundary = end_ms - window_ms;
+        let covered_ms = end_ms - boundary.max(strategy_start_ms);
+        if covered_ms <= 0 {
+            return None;
+        }
+        let base_pnl = if boundary >= strategy_start_ms {
+            boundary_pnl
+                .iter()
+                .find(|(ts, _)| *ts == boundary)
+                .map(|(_, pnl)| *pnl)?
+        } else {
+            0.0
+        };
+        let pnl_usdt = clean_zero(end_total_pnl - base_pnl);
+        let annualized_return = principal
+            .map(|principal| pnl_usdt / principal * (YEAR_MS / covered_ms as f64))
+            .filter(|value| value.is_finite());
+        Some(RollingWindowPnl {
+            window_ms,
+            covered_ms,
+            pnl_usdt,
+            annualized_return,
+        })
+    };
+
+    PnlPerformance {
+        principal_usdt: principal,
+        rolling_7d: rolling(ROLLING_WINDOWS_MS[0]),
+        rolling_30d: rolling(ROLLING_WINDOWS_MS[1]),
+        max_drawdown_usdt: clean_zero(max_drawdown_usdt),
+        max_drawdown_ratio: principal.map(|_| clean_zero(max_drawdown_ratio)),
+        current_drawdown_usdt: clean_zero(current_drawdown_usdt),
+        current_drawdown_ratio: current_drawdown_ratio.map(clean_zero),
     }
 }
 
@@ -1683,7 +1861,217 @@ mod tests {
             max_points: 1_000,
             initial_snapshot_ts_ms: None,
             skipped_initial_position_count: 0,
+            principal_usdt: None,
         }
+    }
+
+    #[test]
+    fn rolling_windows_capture_pnl_before_the_displayed_start() {
+        // 40 days of history, displayed window covers only the last 3 days.
+        let end_ms = 1_000 + 40 * DAY_MS;
+        let inputs = PnlInputs {
+            trades: vec![
+                // +100 USDT earned on day 10, inside the 30d window only.
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    100.0,
+                    1_000.0,
+                    10.0,
+                    0.0,
+                    1_000 + 10 * DAY_MS,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    110.0,
+                    1_100.0,
+                    10.0,
+                    0.0,
+                    1_000 + 10 * DAY_MS + 1,
+                ),
+                // +50 USDT earned 2 days before the end, inside both windows.
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    200.0,
+                    2_000.0,
+                    10.0,
+                    0.0,
+                    1_000 + 38 * DAY_MS,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    205.0,
+                    2_050.0,
+                    10.0,
+                    0.0,
+                    1_000 + 38 * DAY_MS + 1,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+        let mut request = request(1_000 + 37 * DAY_MS, end_ms);
+        request.principal_usdt = Some(10_000.0);
+
+        let response = calculate(inputs, request).unwrap();
+        let performance = response.performance;
+
+        let rolling_7d = performance.rolling_7d.unwrap();
+        assert_eq!(rolling_7d.window_ms, 7 * DAY_MS);
+        assert_eq!(rolling_7d.covered_ms, 7 * DAY_MS);
+        assert!((rolling_7d.pnl_usdt - 50.0).abs() < 1e-9);
+        // 50/10000 over 7 days -> 0.5% * 365/7 ~= 26.07% annualized.
+        assert!((rolling_7d.annualized_return.unwrap() - 0.005 * (365.0 / 7.0)).abs() < 1e-9);
+
+        let rolling_30d = performance.rolling_30d.unwrap();
+        assert_eq!(rolling_30d.covered_ms, 30 * DAY_MS);
+        assert!((rolling_30d.pnl_usdt - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rolling_windows_cover_only_available_history() {
+        // Strategy started 3 days ago: the 7d window is partially covered and
+        // annualization uses the covered span, not the nominal window.
+        let end_ms = 1_000 + 3 * DAY_MS;
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    100.0,
+                    1_000.0,
+                    10.0,
+                    0.0,
+                    1_000 + DAY_MS,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    110.0,
+                    1_100.0,
+                    10.0,
+                    0.0,
+                    1_000 + DAY_MS + 1,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+        let mut request = request(1_000, end_ms);
+        request.principal_usdt = Some(10_000.0);
+
+        let response = calculate(inputs, request).unwrap();
+        let rolling_7d = response.performance.rolling_7d.unwrap();
+        assert_eq!(rolling_7d.covered_ms, 3 * DAY_MS);
+        assert!((rolling_7d.pnl_usdt - 100.0).abs() < 1e-9);
+        assert!((rolling_7d.annualized_return.unwrap() - 0.01 * (365.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn performance_reports_drawdown_and_handles_missing_principal() {
+        // Trades land on 15-minute resample ticks: +100 then -40 then +10 gives
+        // peak 100, trough 60, end 70 -> max drawdown 40, current drawdown 30.
+        let tick = PNL_TICK_INTERVAL_MS;
+        let inputs = PnlInputs {
+            trades: vec![
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    100.0,
+                    1_000.0,
+                    10.0,
+                    0.0,
+                    1_000 + tick,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    110.0,
+                    1_100.0,
+                    10.0,
+                    0.0,
+                    1_000 + tick,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    200.0,
+                    400.0,
+                    2.0,
+                    0.0,
+                    1_000 + 2 * tick,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    180.0,
+                    360.0,
+                    2.0,
+                    0.0,
+                    1_000 + 2 * tick,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Buy,
+                    300.0,
+                    300.0,
+                    1.0,
+                    0.0,
+                    1_000 + 3 * tick,
+                ),
+                trade(
+                    "BTCUSDT",
+                    PositionLeg::Spot,
+                    Side::Sell,
+                    310.0,
+                    310.0,
+                    1.0,
+                    0.0,
+                    1_000 + 3 * tick,
+                ),
+            ],
+            ..PnlInputs::default()
+        };
+
+        let with_principal = calculate(inputs.clone(), {
+            let mut request = request(1_000, 1_000 + 4 * tick);
+            request.principal_usdt = Some(10_000.0);
+            request
+        })
+        .unwrap()
+        .performance;
+        assert!((with_principal.max_drawdown_usdt - 40.0).abs() < 1e-9);
+        // NAV peaks at principal - end_pnl + peak = 10000 - 70 + 100 = 10030.
+        assert!((with_principal.max_drawdown_ratio.unwrap() - 40.0 / 10_030.0).abs() < 1e-9);
+        assert!((with_principal.current_drawdown_usdt - 30.0).abs() < 1e-9);
+        assert!((with_principal.current_drawdown_ratio.unwrap() - 30.0 / 10_030.0).abs() < 1e-9);
+
+        let without_principal = calculate(inputs, request(1_000, 1_000 + 4 * tick))
+            .unwrap()
+            .performance;
+        assert!(without_principal.principal_usdt.is_none());
+        assert!((without_principal.max_drawdown_usdt - 40.0).abs() < 1e-9);
+        assert!(without_principal.max_drawdown_ratio.is_none());
+        assert!(without_principal.current_drawdown_ratio.is_none());
+        assert!(
+            without_principal
+                .rolling_7d
+                .unwrap()
+                .annualized_return
+                .is_none()
+        );
     }
 
     #[test]

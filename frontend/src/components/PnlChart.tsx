@@ -24,6 +24,7 @@ interface PnlChartProps {
   symbolPoints: SymbolPnlSeries[]
   visibleSeries: PnlSeriesKey[]
   mode: 'portfolio' | 'symbols'
+  principalUsdt?: number | null
 }
 
 const symbolPalette = [
@@ -43,7 +44,14 @@ const symbolPalette = [
 
 const seriesMeta: Record<
   PnlSeriesKey,
-  { label: string; color: string; dashed?: boolean; negate?: boolean }
+  {
+    label: string
+    color: string
+    dashed?: boolean
+    negate?: boolean
+    percent?: boolean
+    area?: boolean
+  }
 > = {
   totalPnlUsdt: { label: 'Total PnL', color: '#176b5b' },
   feeBeforePnlUsdt: { label: 'Fee 前净值', color: '#2563a7' },
@@ -60,9 +68,35 @@ const seriesMeta: Record<
     color: '#4b6478',
     dashed: true,
   },
+  returnOnPrincipalPct: {
+    label: '本金收益率',
+    color: '#0e7490',
+    percent: true,
+  },
+  drawdownPct: {
+    label: '净值回撤',
+    color: '#b5473c',
+    percent: true,
+    area: true,
+  },
 }
 
-function portfolioSeriesValue(point: PnlPoint, key: PnlSeriesKey) {
+const percentSeriesLabels = new Set(
+  (Object.keys(seriesMeta) as PnlSeriesKey[])
+    .filter((key) => seriesMeta[key].percent)
+    .map((key) => seriesMeta[key].label),
+)
+
+function isPercentSeries(key: PnlSeriesKey) {
+  return seriesMeta[key].percent === true
+}
+
+type PortfolioPnlKey = Exclude<
+  PnlSeriesKey,
+  'returnOnPrincipalPct' | 'drawdownPct'
+>
+
+function portfolioSeriesValue(point: PnlPoint, key: PortfolioPnlKey) {
   if (key === 'feeBeforePnlUsdt' || key === 'feeAfterPnlUsdt') {
     return point[key] + point.floatingPnlUsdt
   }
@@ -90,6 +124,7 @@ export function PnlChart({
   symbolPoints,
   visibleSeries,
   mode,
+  principalUsdt,
 }: PnlChartProps) {
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -99,17 +134,55 @@ export function PnlChart({
     const chart = echarts.init(containerRef.current, undefined, {
       renderer: 'canvas',
     })
+    const principal =
+      typeof principalUsdt === 'number' &&
+      Number.isFinite(principalUsdt) &&
+      principalUsdt > 0
+        ? principalUsdt
+        : null
+    const endTotalPnl = points.length
+      ? points[points.length - 1].totalPnlUsdt
+      : 0
+    let peakPnl = Number.NEGATIVE_INFINITY
+    const derived = points.map((point) => {
+      peakPnl = Math.max(peakPnl, point.totalPnlUsdt)
+      const peakNav =
+        principal !== null ? principal + peakPnl - endTotalPnl : 0
+      return {
+        returnOnPrincipalPct:
+          principal !== null ? (point.totalPnlUsdt / principal) * 100 : null,
+        drawdownPct:
+          principal !== null && peakNav > 0
+            ? (-(peakPnl - point.totalPnlUsdt) / peakNav) * 100
+            : null,
+      }
+    })
+    const activeSeries =
+      principal !== null
+        ? visibleSeries
+        : visibleSeries.filter((key) => !isPercentSeries(key))
+    const hasPercentAxis =
+      mode === 'portfolio' && activeSeries.some(isPercentSeries)
     const series =
       mode === 'portfolio'
-        ? visibleSeries.map((key) => {
+        ? activeSeries.map((key) => {
             const meta = seriesMeta[key]
             return {
               name: meta.label,
               type: 'line' as const,
-              data: points.map((point) => [
-                point.ts,
-                (meta.negate ? -1 : 1) * portfolioSeriesValue(point, key),
-              ]),
+              yAxisIndex: meta.percent ? 1 : 0,
+              data: meta.percent
+                ? points.map((point, index) => [
+                    point.ts,
+                    key === 'returnOnPrincipalPct'
+                      ? derived[index].returnOnPrincipalPct
+                      : derived[index].drawdownPct,
+                  ])
+                : points.map((point) => [
+                    point.ts,
+                    (meta.negate ? -1 : 1) *
+                      portfolioSeriesValue(point, key as PortfolioPnlKey),
+                  ]),
               showSymbol: false,
               sampling: 'lttb' as const,
               connectNulls: true,
@@ -119,6 +192,9 @@ export function PnlChart({
                 type: meta.dashed ? ('dashed' as const) : ('solid' as const),
               },
               itemStyle: { color: meta.color },
+              areaStyle: meta.area
+                ? { opacity: 0.16, color: meta.color }
+                : undefined,
               emphasis: { focus: 'series' as const },
             }
           })
@@ -142,11 +218,11 @@ export function PnlChart({
         animation: false,
         color:
           mode === 'portfolio'
-            ? visibleSeries.map((key) => seriesMeta[key].color)
+            ? activeSeries.map((key) => seriesMeta[key].color)
             : symbolPalette,
         grid: {
           left: 70,
-          right: 24,
+          right: hasPercentAxis ? 62 : 24,
           top: mode === 'portfolio' ? 28 : 16,
           bottom: 74,
         },
@@ -165,8 +241,31 @@ export function PnlChart({
           backgroundColor: 'rgba(255,255,255,0.97)',
           borderColor: '#d7dbe2',
           textStyle: { color: '#20252d', fontSize: 12 },
-          valueFormatter: (value: unknown) =>
-            money(typeof value === 'number' ? value : Number(value)),
+          formatter: (params: unknown) => {
+            const items = (
+              Array.isArray(params) ? params : [params]
+            ) as Array<{
+              axisValue?: number
+              marker?: string
+              seriesName?: string
+              value?: [number, number | null]
+            }>
+            const title =
+              items[0]?.axisValue != null
+                ? chartTime(items[0].axisValue).replace('\n', ' ')
+                : ''
+            const lines = items.map((item) => {
+              const value = item.value?.[1]
+              const text =
+                value == null || !Number.isFinite(value)
+                  ? '--'
+                  : item.seriesName && percentSeriesLabels.has(item.seriesName)
+                    ? `${value.toFixed(2)}%`
+                    : money(value)
+              return `${item.marker ?? ''}${item.seriesName ?? ''}: ${text}`
+            })
+            return [title, ...lines].join('<br/>')
+          },
           axisPointer: {
             type: 'line',
             lineStyle: { color: '#8993a4', type: 'dashed' },
@@ -184,17 +283,32 @@ export function PnlChart({
           },
           splitLine: { show: false },
         },
-        yAxis: {
-          type: 'value',
-          scale: true,
-          axisLine: { show: false },
-          axisTick: { show: false },
-          axisLabel: {
-            color: '#697386',
-            formatter: (value: number) => money(value),
+        yAxis: [
+          {
+            type: 'value',
+            scale: true,
+            axisLine: { show: false },
+            axisTick: { show: false },
+            axisLabel: {
+              color: '#697386',
+              formatter: (value: number) => money(value),
+            },
+            splitLine: { lineStyle: { color: '#edf0f4' } },
           },
-          splitLine: { lineStyle: { color: '#edf0f4' } },
-        },
+          {
+            type: 'value',
+            scale: true,
+            position: 'right',
+            show: hasPercentAxis,
+            axisLine: { show: false },
+            axisTick: { show: false },
+            axisLabel: {
+              color: '#697386',
+              formatter: (value: number) => `${value.toFixed(1)}%`,
+            },
+            splitLine: { show: false },
+          },
+        ],
         dataZoom: [
           {
             type: 'inside',
@@ -232,7 +346,7 @@ export function PnlChart({
       observer.disconnect()
       chart.dispose()
     }
-  }, [mode, points, symbolPoints, visibleSeries])
+  }, [mode, points, symbolPoints, visibleSeries, principalUsdt])
 
   return (
     <div

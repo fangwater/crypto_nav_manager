@@ -1243,7 +1243,7 @@
 
 .pnl-metrics {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.55);
@@ -1260,6 +1260,14 @@
 
 .pnl-metric + .pnl-metric {
   border-left: 1px solid var(--line-soft);
+}
+
+.pnl-metric:nth-child(6) {
+  border-left: 0;
+}
+
+.pnl-metric:nth-child(n + 6) {
+  border-top: 1px solid var(--line-soft);
 }
 
 .pnl-metric span {
@@ -1875,7 +1883,7 @@
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
-  .pnl-metric:nth-child(5) {
+  .pnl-metric:nth-child(4n + 1) {
     border-left: 0;
   }
 

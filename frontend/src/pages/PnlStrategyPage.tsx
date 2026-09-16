@@ -62,6 +62,7 @@ const seriesOptions: Array<{
   key: PnlSeriesKey
   label: string
   color: string
+  requiresPrincipal?: boolean
 }> = [
   { key: 'totalPnlUsdt', label: 'Total', color: '#176b5b' },
   { key: 'feeBeforePnlUsdt', label: 'Fee 前净值', color: '#2563a7' },
@@ -69,6 +70,18 @@ const seriesOptions: Array<{
   { key: 'floatingPnlUsdt', label: '浮动盈亏', color: '#4b6478' },
   { key: 'fundingPnlUsdt', label: 'Funding', color: '#b7791f' },
   { key: 'interestCostUsdt', label: 'Interest', color: '#c2413b' },
+  {
+    key: 'returnOnPrincipalPct',
+    label: '本金收益率',
+    color: '#0e7490',
+    requiresPrincipal: true,
+  },
+  {
+    key: 'drawdownPct',
+    label: '净值回撤',
+    color: '#b5473c',
+    requiresPrincipal: true,
+  },
 ]
 
 const positionSeriesOptions: Array<{
@@ -114,6 +127,17 @@ function money(value: number, signed = false) {
   })
   if (signed && value !== 0) return (value > 0 ? '+' : '-') + formatted
   return (value < 0 ? '-' : '') + formatted
+}
+
+function percent(value: number) {
+  const formatted = (Math.abs(value) * 100).toFixed(2) + '%'
+  if (value > 0) return '+' + formatted
+  if (value < 0) return '-' + formatted
+  return formatted
+}
+
+function coveredDays(coveredMs: number) {
+  return (coveredMs / DAY_MS).toFixed(1).replace(/\.0$/, '')
 }
 
 function compactNumber(value: number) {
@@ -261,6 +285,8 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
     'feeAfterPnlUsdt',
     'fundingPnlUsdt',
     'interestCostUsdt',
+    'returnOnPrincipalPct',
+    'drawdownPct',
   ])
   const [chartMode, setChartMode] = useState<'portfolio' | 'symbols'>(
     'portfolio',
@@ -607,6 +633,14 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
   }
 
   const summary = pnl?.summary
+  const performance = pnl?.performance
+  const rolling7d = performance?.rolling7d ?? null
+  const rolling30d = performance?.rolling30d ?? null
+  const principalUsdt = performance?.principalUsdt ?? null
+  const hasPrincipal =
+    principalUsdt !== null &&
+    Number.isFinite(principalUsdt) &&
+    principalUsdt > 0
   const isFuturesOnly =
     strategy.strategyKind === 'market_making' || strategy.strategyKind === 'cta'
   const analysisLink = strategySurfaceAnalysisLink(strategy.slug)
@@ -845,6 +879,59 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
             </strong>
             <small>{pnl ? compactNumber(pnl.source.loadedInterestRows) : '--'} rows</small>
           </div>
+          <div className="pnl-metric" title="最近 7 天 PnL / 最新净值，按覆盖天数年化">
+            <span>近 7 日年化</span>
+            <strong className={valueClass(rolling7d?.annualizedReturn ?? 0)}>
+              {rolling7d?.annualizedReturn != null
+                ? percent(rolling7d.annualizedReturn)
+                : '--'}
+            </strong>
+            <small>
+              {rolling7d
+                ? money(rolling7d.pnlUsdt, true) +
+                  ' USDT' +
+                  (rolling7d.coveredMs < rolling7d.windowMs
+                    ? ` · 覆盖${coveredDays(rolling7d.coveredMs)}天`
+                    : '')
+                : '--'}
+            </small>
+          </div>
+          <div className="pnl-metric" title="最近 30 天 PnL / 最新净值，按覆盖天数年化">
+            <span>近 30 日年化</span>
+            <strong className={valueClass(rolling30d?.annualizedReturn ?? 0)}>
+              {rolling30d?.annualizedReturn != null
+                ? percent(rolling30d.annualizedReturn)
+                : '--'}
+            </strong>
+            <small>
+              {rolling30d
+                ? money(rolling30d.pnlUsdt, true) +
+                  ' USDT' +
+                  (rolling30d.coveredMs < rolling30d.windowMs
+                    ? ` · 覆盖${coveredDays(rolling30d.coveredMs)}天`
+                    : '')
+                : '--'}
+            </small>
+          </div>
+          <div className="pnl-metric" title="窗口内净值曲线自峰值的最大回落">
+            <span>最大回撤</span>
+            <strong
+              className={
+                (performance?.maxDrawdownUsdt ?? 0) > PNL_EPSILON
+                  ? 'is-negative'
+                  : ''
+              }
+            >
+              {performance ? money(-performance.maxDrawdownUsdt) : '--'}
+            </strong>
+            <small>
+              {performance
+                ? performance.maxDrawdownRatio != null
+                  ? `-${(performance.maxDrawdownRatio * 100).toFixed(2)}% NAV`
+                  : 'USDT'
+                : '--'}
+            </small>
+          </div>
         </section>
 
         <section className="chart-panel pnl-chart-panel">
@@ -887,6 +974,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                   }
                   visibleSeries={visibleSeries}
                   mode={chartMode}
+                  principalUsdt={principalUsdt}
                 />
               )}
               {loadingPnl && (
@@ -902,20 +990,30 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
                   <strong>PNL</strong>
                 </div>
                 <div className="symbol-curve-picker__list">
-                  {seriesOptions.map((option) => (
-                    <label key={option.key}>
-                      <input
-                        type="checkbox"
-                        checked={visibleSeries.includes(option.key)}
-                        onChange={() => toggleSeries(option.key)}
-                      />
-                      <span
-                        className="series-swatch"
-                        style={{ backgroundColor: option.color }}
-                      />
-                      <span>{option.label}</span>
-                    </label>
-                  ))}
+                  {seriesOptions.map((option) => {
+                    const unavailable =
+                      option.requiresPrincipal === true && !hasPrincipal
+                    return (
+                      <label
+                        key={option.key}
+                        title={
+                          unavailable ? '暂无账户净值，无法按比例计算' : undefined
+                        }
+                      >
+                        <input
+                          type="checkbox"
+                          checked={visibleSeries.includes(option.key)}
+                          disabled={unavailable}
+                          onChange={() => toggleSeries(option.key)}
+                        />
+                        <span
+                          className="series-swatch"
+                          style={{ backgroundColor: option.color }}
+                        />
+                        <span>{option.label}</span>
+                      </label>
+                    )
+                  })}
                 </div>
               </aside>
             ) : pnl ? (
