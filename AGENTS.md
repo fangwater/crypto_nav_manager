@@ -29,24 +29,37 @@ Frontend: /home/ubuntu/crypto_nav_manager/frontend/dist
 Gateway: Nginx on 4191 (`/nav/` and `/nav-api/`)
 ```
 
-Re-check the SSH destination, working directory, service status, and remote
-worktree before every deployment. The production worktree can contain operator
-changes. Never use `git reset`, `git clean`, a forced checkout, or an
-unreviewed pull to deploy, and never overwrite unrelated remote source files.
+All builds run on the local powerleader machine. The remote host only keeps
+its git worktree synchronized with `origin/master` and receives the built
+artifacts; do not run `cargo build`, `npm`, or Vite builds on the remote host.
+Both machines are currently Ubuntu 24.04 x86_64 (glibc 2.39), so locally built
+binaries are directly compatible — re-check `ldd --version` on both sides if
+either OS changes.
 
-For frontend-only changes, upload the required source to a uniquely named
-temporary directory on the remote host, install from the lockfile when needed,
-run the production build there, and switch `frontend/dist` only after the build
-succeeds. Preserve the previous dist as a rollback target until HTTP smoke
-checks pass, then remove only the exact temporary and rollback paths created by
-that deployment. Do not run Vite's development or preview server remotely.
+Before every deployment, re-check the SSH destination, working directory,
+service status, and remote worktree state. Commit and push local changes
+first, then sync the remote worktree to `origin/master` (fetch + switch). If
+the remote worktree ever contains uncommitted or unpushed operator changes,
+preserve them before aligning (e.g. `git stash -u`, a `backup/` branch, and a
+diff patch under `/tmp`) and never discard them silently.
+
+For frontend changes, run the production build locally (`npm ci` from the
+lockfile when needed, then `npm run build`), upload the resulting `dist` to a
+uniquely named temporary directory on the remote host, and switch
+`frontend/dist` only after the upload succeeds. Preserve the previous dist as
+a rollback target until HTTP smoke checks pass, then remove only the exact
+temporary and rollback paths created by that deployment. Do not run Vite's
+development or preview server remotely.
 
 Production Nginx serves `frontend/dist` at `/nav/` and proxies `/nav-api/` to
 the Rust API. A frontend-only dist switch should not restart either service.
-For Rust changes, build a release binary before replacing it, restart only
-`crypto-nav-manager.service`, and verify both the unit state and `/api/health`.
-Do not restart PostgreSQL, Nginx, trading processes, or unrelated services as
-part of this deployment.
+For Rust changes, run `cargo build --release` locally, upload the binary to a
+uniquely named temporary path on the remote host, atomically swap it into
+`target/release/crypto_nav_manager`, restart only
+`crypto-nav-manager.service`, and verify both the unit state and
+`/api/health`. Keep the previous binary as a rollback target until
+verification passes. Do not restart PostgreSQL, Nginx, trading processes, or
+unrelated services as part of this deployment.
 
 After deploying, verify `/nav/`, its emitted static assets, and
 `/nav-api/health` through the existing Nginx gateway on port 4191. Verify any
