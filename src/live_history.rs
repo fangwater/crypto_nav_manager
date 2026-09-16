@@ -26,6 +26,9 @@ const FR_ONLINE_LISTS: [&str; 5] = [
 ];
 const INTRA_ONLINE_LISTS: [&str; 3] = ["dump_symbols", "fwd_trade_symbols", "bwd_trade_symbols"];
 const RECENT_TRADE_SYMBOL_LOOKBACK_MS: i64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_CTA_MANAGER_URL: &str = "http://127.0.0.1:18201";
+const CTA_MANAGER_URL_ENV: &str = "CRYPTO_NAV_CTA_MANAGER_URL";
+const CTA_BACKFILL_LOOKBACK_MS: i64 = 15 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 struct LiveHistoryConfig {
@@ -37,6 +40,7 @@ struct LiveHistoryConfig {
     sync_history: PathBuf,
     alignment_check: PathBuf,
     order_synthesis: PathBuf,
+    cta_manager_url: String,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -46,6 +50,7 @@ struct LiveHistoryStrategy {
     env_path: String,
     exchange: String,
     strategy_kind: String,
+    st_ms: i64,
     schedule_offset_minutes: i64,
 }
 
@@ -119,6 +124,8 @@ impl LiveHistoryConfig {
             sync_history,
             alignment_check,
             order_synthesis,
+            cta_manager_url: env::var(CTA_MANAGER_URL_ENV)
+                .unwrap_or_else(|_| DEFAULT_CTA_MANAGER_URL.to_string()),
         }))
     }
 }
@@ -193,7 +200,15 @@ async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHis
                 }
             };
         let recent_symbols = if uses_online_symbols(&strategy) {
-            match load_recent_trade_symbols(&pool, &strategy.db_schema).await {
+            // CTA coverage uses the full stored symbol set, not just the recent
+            // window: symbols missing from it are treated as undiscovered and
+            // backfilled from their Manager-reported first fill.
+            let loaded = if strategy.strategy_kind == "cta" {
+                load_stored_trade_symbols(&pool, &strategy.db_schema).await
+            } else {
+                load_recent_trade_symbols(&pool, &strategy.db_schema).await
+            };
+            match loaded {
                 Ok(symbols) => symbols,
                 Err(error) => {
                     warn!(
@@ -274,7 +289,7 @@ async fn load_automatic_alignment_enabled(pool: &PgPool, slug: &str) -> Result<b
 
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     sqlx::query_as(
-        r#"SELECT s.slug, s.db_schema, s.env_path, s.exchange, s.strategy_kind,
+        r#"SELECT s.slug, s.db_schema, s.env_path, s.exchange, s.strategy_kind, s.st_ms,
                   (ROW_NUMBER() OVER (
                     PARTITION BY s.exchange ORDER BY s.sort_order, s.slug
                   ) - 1)::bigint AS schedule_offset_minutes
@@ -313,18 +328,47 @@ fn sync_strategy(
     let mut summaries = Vec::new();
     let needs_online_symbols = uses_online_symbols(&strategy);
     let symbols = if needs_online_symbols {
-        let online = match load_online_symbols(config, &strategy) {
-            Ok(symbols) => symbols,
-            Err(error) => {
-                warn!(
-                    strategy = %strategy.slug,
-                    error = ?error,
-                    "load online symbols failed"
-                );
-                Vec::new()
+        let online = if strategy.strategy_kind == "cta" {
+            match load_cta_manager_symbols(config, &strategy) {
+                Ok(entries) => {
+                    backfill_cta_symbols(
+                        config,
+                        &strategy,
+                        &entries,
+                        &recent_symbols,
+                        &mut summaries,
+                    );
+                    entries.into_iter().map(|entry| entry.symbol).collect()
+                }
+                Err(error) => {
+                    warn!(
+                        strategy = %strategy.slug,
+                        error = ?error,
+                        "load CTA Manager symbols failed"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            match load_online_symbols(config, &strategy) {
+                Ok(symbols) => symbols,
+                Err(error) => {
+                    warn!(
+                        strategy = %strategy.slug,
+                        error = ?error,
+                        "load online symbols failed"
+                    );
+                    Vec::new()
+                }
             }
         };
-        let symbols = merge_trade_symbols(online.iter().cloned(), recent_symbols);
+        let symbols = if strategy.strategy_kind == "cta" {
+            // Manager already reports canonical contract symbols; the online
+            // normalizer would corrupt non-ASCII names such as 牛来USDT.
+            merge_cta_symbols(online.iter().cloned(), recent_symbols.iter().cloned())
+        } else {
+            merge_trade_symbols(online.iter().cloned(), recent_symbols)
+        };
         if symbols.is_empty() {
             warn!(strategy = %strategy.slug, "online symbol union is empty; skip live trades");
         } else if symbols.len() > online.len() {
@@ -437,8 +481,157 @@ fn order_synthesis_enabled(slug: &str) -> bool {
 }
 
 fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
-    strategy.exchange == "binance"
-        && !matches!(strategy.strategy_kind.as_str(), "market_making" | "cta")
+    strategy.exchange == "binance" && strategy.strategy_kind != "market_making"
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CtaManagerSymbolsResponse {
+    #[serde(default)]
+    sources: Vec<CtaManagerSourceSymbols>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CtaManagerSourceSymbols {
+    source_id: String,
+    #[serde(default)]
+    symbols: Vec<CtaManagerSymbol>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CtaManagerSymbol {
+    symbol: String,
+    first_fill_ts_us: Option<i64>,
+}
+
+fn load_cta_manager_symbols(
+    config: &LiveHistoryConfig,
+    strategy: &LiveHistoryStrategy,
+) -> Result<Vec<CtaManagerSymbol>> {
+    let url = format!(
+        "{}/api/symbols?sourceIds={}",
+        config.cta_manager_url.trim_end_matches('/'),
+        strategy.slug
+    );
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build CTA Manager symbols client")?
+        .get(&url)
+        .send()
+        .with_context(|| format!("query CTA Manager symbols at {url}"))?
+        .error_for_status()
+        .with_context(|| format!("CTA Manager symbols at {url} failed"))?
+        .json::<CtaManagerSymbolsResponse>()
+        .with_context(|| format!("parse CTA Manager symbols from {url}"))?;
+    Ok(response
+        .sources
+        .into_iter()
+        .filter(|source| source.source_id == strategy.slug)
+        .flat_map(|source| source.symbols)
+        .collect())
+}
+
+fn backfill_cta_symbols(
+    config: &LiveHistoryConfig,
+    strategy: &LiveHistoryStrategy,
+    entries: &[CtaManagerSymbol],
+    stored_symbols: &[String],
+    summaries: &mut Vec<String>,
+) {
+    let stored = stored_symbols
+        .iter()
+        .map(|symbol| symbol.as_str())
+        .collect::<BTreeSet<_>>();
+    for entry in entries {
+        let symbol = entry.symbol.trim();
+        if symbol.is_empty() || stored.contains(symbol) {
+            continue;
+        }
+        match run_cta_symbol_backfill(config, strategy, symbol, entry.first_fill_ts_us) {
+            Ok(summary) => {
+                info!(
+                    strategy = %strategy.slug,
+                    symbol,
+                    "backfilled newly discovered CTA symbol"
+                );
+                summaries.push(format!("backfill {symbol}: {summary}"));
+            }
+            Err(error) => {
+                warn!(
+                    strategy = %strategy.slug,
+                    symbol,
+                    error = ?error,
+                    "CTA symbol backfill failed; retried while it remains unstored"
+                );
+            }
+        }
+    }
+}
+
+fn run_cta_symbol_backfill(
+    config: &LiveHistoryConfig,
+    strategy: &LiveHistoryStrategy,
+    symbol: &str,
+    first_fill_ts_us: Option<i64>,
+) -> Result<String> {
+    let mut command = Command::new(&config.sync_history);
+    command.args([
+        "--strategy",
+        &strategy.slug,
+        "--dataset",
+        "trades",
+        "--symbol",
+        symbol,
+    ]);
+    match first_fill_ts_us.filter(|ts| *ts > 0) {
+        Some(ts_us) => {
+            let start_ms = (ts_us / 1_000)
+                .saturating_sub(CTA_BACKFILL_LOOKBACK_MS)
+                .max(strategy.st_ms);
+            command.arg("--start-ms").arg(start_ms.to_string());
+        }
+        None => {
+            command.arg("--full");
+        }
+    }
+    let output = command.output().with_context(|| {
+        format!(
+            "run {} for {} CTA symbol {symbol}",
+            config.sync_history.display(),
+            strategy.slug
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} exited with {}: {}",
+            config.sync_history.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("completed")
+        .trim()
+        .to_string())
+}
+
+fn merge_cta_symbols(
+    online: impl IntoIterator<Item = String>,
+    stored: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut symbols = BTreeSet::new();
+    for symbol in online.into_iter().chain(stored) {
+        let trimmed = symbol.trim();
+        if !trimmed.is_empty() {
+            symbols.insert(trimmed.to_string());
+        }
+    }
+    symbols.into_iter().collect()
 }
 
 fn run_alignment_check(config: &LiveHistoryConfig, slug: &str) -> Result<String> {
@@ -618,6 +811,31 @@ fn merge_trade_symbols(
     symbols.into_iter().collect()
 }
 
+async fn load_stored_trade_symbols(pool: &PgPool, schema: &str) -> Result<Vec<String>> {
+    if !valid_schema(schema) {
+        bail!("invalid strategy schema: {schema}");
+    }
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema=$1 \
+           AND table_name IN ('trades','trade_fills','funding','funding_fees','liquidations')",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .context("detect stored symbol tables")?;
+    let mut symbols = BTreeSet::new();
+    for table in tables {
+        let sql = format!("SELECT DISTINCT symbol FROM {schema}.{table} WHERE symbol IS NOT NULL");
+        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(sql.as_str()))
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("load stored symbols from {schema}.{table}"))?;
+        symbols.extend(rows);
+    }
+    Ok(symbols.into_iter().collect())
+}
+
 fn valid_schema(schema: &str) -> bool {
     let mut characters = schema.chars();
     characters
@@ -753,9 +971,10 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
-        LiveHistoryStrategy, account_datasets, alignment_check_enabled, delay_until_next_slot,
-        merge_trade_symbols, normalize_online_symbol, online_symbol_keys, order_synthesis_enabled,
-        parse_redis_mget, uses_online_symbols,
+        CtaManagerSymbol, CtaManagerSymbolsResponse, LiveHistoryStrategy, account_datasets,
+        alignment_check_enabled, delay_until_next_slot, merge_cta_symbols, merge_trade_symbols,
+        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_redis_mget,
+        uses_online_symbols,
     };
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
@@ -765,6 +984,7 @@ mod tests {
             env_path: format!("/home/ubuntu/{slug}/env.sh"),
             exchange: exchange.to_string(),
             strategy_kind: strategy_kind.to_string(),
+            st_ms: 1_000,
             schedule_offset_minutes: 0,
         }
     }
@@ -858,13 +1078,13 @@ mod tests {
     }
 
     #[test]
-    fn futures_only_strategies_use_symbols_already_stored_in_postgres() {
+    fn futures_only_market_making_uses_symbols_already_stored_in_postgres() {
         assert!(!uses_online_symbols(&strategy(
             "binance_mm_alpha",
             "binance",
             "market_making"
         )));
-        assert!(!uses_online_symbols(&strategy(
+        assert!(uses_online_symbols(&strategy(
             "binance_exec_trade01",
             "binance",
             "cta"
@@ -874,6 +1094,54 @@ mod tests {
             "binance",
             "intra_exchange"
         )));
+    }
+
+    #[test]
+    fn parses_cta_manager_symbols_for_the_requested_source() {
+        let payload = r#"{
+            "generated_at_us": 1789526000457360,
+            "sources": [
+                {"source_id": "binance_exec_trade01", "symbols": [
+                    {"symbol": "BTCUSDT", "venue_code": 1, "venue": "BinanceFutures",
+                     "first_event_ts_us": 10, "first_fill_ts_us": 12, "last_fill_ts_us": 20},
+                    {"symbol": "牛来USDT", "venue_code": 1, "venue": "BinanceFutures",
+                     "first_event_ts_us": 30, "first_fill_ts_us": 31, "last_fill_ts_us": 40},
+                    {"symbol": "ANCHORONLY", "venue_code": 1, "venue": null,
+                     "first_event_ts_us": null, "first_fill_ts_us": null, "last_fill_ts_us": null}
+                ]},
+                {"source_id": "binance_exec_trade02", "symbols": [
+                    {"symbol": "OTHERUSDT", "venue_code": 1, "venue": "BinanceFutures",
+                     "first_event_ts_us": 1, "first_fill_ts_us": 2, "last_fill_ts_us": 3}
+                ]}
+            ]
+        }"#;
+        let response: CtaManagerSymbolsResponse = serde_json::from_str(payload).unwrap();
+        let strategy = strategy("binance_exec_trade01", "binance", "cta");
+        let entries: Vec<CtaManagerSymbol> = response
+            .sources
+            .into_iter()
+            .filter(|source| source.source_id == strategy.slug)
+            .flat_map(|source| source.symbols)
+            .collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].symbol, "BTCUSDT");
+        assert_eq!(entries[0].first_fill_ts_us, Some(12));
+        assert_eq!(entries[1].symbol, "牛来USDT");
+        assert_eq!(entries[2].first_fill_ts_us, None);
+    }
+
+    #[test]
+    fn merges_cta_symbols_without_corrupting_unicode_names() {
+        assert_eq!(
+            merge_cta_symbols(
+                ["BTCUSDT".to_string(), "牛来USDT".to_string()],
+                ["ethusdt".to_string(), "BTCUSDT".to_string()],
+            ),
+            vec!["BTCUSDT", "ethusdt", "牛来USDT"]
+        );
+        // The online-list normalizer strips non-ASCII and would corrupt the
+        // same input; CTA symbols must keep their canonical contract name.
+        assert_eq!(normalize_online_symbol("牛来USDT"), Some("USDTUSDT".into()));
     }
 
     #[test]
