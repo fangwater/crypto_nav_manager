@@ -14,15 +14,6 @@
       "profile": "market_making"
     },
     {
-      "slug": "binance-intra-arb01",
-      "host": "local",
-      "root": "/home/ubuntu/binance-intra-arb01",
-      "exchange": "binance",
-      "tag": "arb01",
-      "snapshotUrl": "http://127.0.0.1:4191/intra/binance-intra-arb01/snapshot",
-      "profile": "intra_exchange"
-    },
-    {
       "slug": "binance_fr_arb04",
       "host": "local",
       "root": "/home/ubuntu/binance_fr_arb04",
