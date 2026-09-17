@@ -66,6 +66,26 @@ After deploying, verify `/nav/`, its emitted static assets, and
 affected API or deep link that the gateway supports. If verification fails,
 restore the saved dist or binary atomically and report the failure.
 
+## Authentication And Permissions
+
+All `/api/*` endpoints except `/api/health` and `/api/auth/login` require the
+`nav_session` cookie (14-day DB-backed session in `nav_sessions`; in-memory on
+read-only instances). Users live in `nav_users` (`admin` / `user`); regular
+users only see strategies granted in `nav_user_strategy_grants` and all write
+plus `/api/admin/*` endpoints are admin-only. There is no self-registration.
+
+Create the first administrator directly in PostgreSQL:
+
+```sql
+INSERT INTO nav_users (username, password_hash, role)
+VALUES ('admin', crypt('<password>', gen_salt('bf', 10)), 'admin');
+```
+
+Passwords use pgcrypto `crypt()` bcrypt hashes, so SQL inserts and the
+`/api/admin/users` API produce identical rows. Admins manage users and
+per-user strategy grants from `/nav/` "用户" page; `/api/auth/password` lets
+any signed-in user rotate their own password (revoking other sessions).
+
 ## Worktree Safety
 
 Assume uncommitted and untracked files belong to the user or an operator.
