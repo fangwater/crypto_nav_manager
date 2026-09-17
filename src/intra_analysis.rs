@@ -1745,7 +1745,10 @@ mod tests {
             3.0 / 105.0 * 10_000.0,
         );
         assert_close(response.summary.positive.captured_above_fee_share, 1.0);
-        assert_close(response.points.last().unwrap().positive_gross_pnl_usdt, 14.0);
+        assert_close(
+            response.points.last().unwrap().positive_gross_pnl_usdt,
+            14.0,
+        );
         assert_close(response.points.last().unwrap().reverse_gross_pnl_usdt, 0.0);
     }
 
@@ -2311,10 +2314,19 @@ mod tests {
         assert_eq!(response.summary.reverse.closed_match_count, 1);
         assert_close(response.summary.positive.gross_pnl_usdt, -3.0);
         assert_close(response.summary.reverse.gross_pnl_usdt, 6.0);
-        assert_close(response.summary.positive.captured_above_fee_notional_usdt, 102.5);
+        assert_close(
+            response.summary.positive.captured_above_fee_notional_usdt,
+            102.5,
+        );
         assert_close(response.summary.positive.uncaptured_notional_usdt, 100.0);
-        assert_close(response.summary.reverse.captured_below_fee_notional_usdt, 107.5);
-        assert_close(response.summary.reverse.captured_above_fee_notional_usdt, 0.0);
+        assert_close(
+            response.summary.reverse.captured_below_fee_notional_usdt,
+            107.5,
+        );
+        assert_close(
+            response.summary.reverse.captured_above_fee_notional_usdt,
+            0.0,
+        );
         let final_point = response.points.last().unwrap();
         assert_close(final_point.positive_gross_pnl_usdt, -3.0);
         assert_close(final_point.reverse_gross_pnl_usdt, 6.0);

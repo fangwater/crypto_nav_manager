@@ -462,9 +462,7 @@ impl BinanceClient {
                 if let Some(asset) = asset {
                     params.push(("asset".to_string(), asset.to_string()));
                 }
-                let value = self
-                    .history_signed_get(base, path, params, 1)
-                    .await?;
+                let value = self.history_signed_get(base, path, params, 1).await?;
                 let page = value
                     .get("rows")
                     .and_then(Value::as_array)
@@ -826,9 +824,7 @@ fn history_retry_delay(error: &ExchangeError) -> Option<std::time::Duration> {
 
 fn margin_interest_endpoint(mode: BinanceAccountMode) -> (&'static str, &'static str) {
     match mode {
-        BinanceAccountMode::PortfolioMargin => {
-            (PAPI_BASE, "/papi/v1/margin/marginInterestHistory")
-        }
+        BinanceAccountMode::PortfolioMargin => (PAPI_BASE, "/papi/v1/margin/marginInterestHistory"),
         BinanceAccountMode::UsdmFutures => (API_BASE, "/sapi/v1/margin/interestHistory"),
     }
 }
