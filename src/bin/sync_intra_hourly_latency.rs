@@ -63,15 +63,16 @@ async fn main() -> Result<()> {
     if args.source_chunk_minutes <= 0 {
         bail!("--source-chunk-minutes must be positive");
     }
-    let strategies = if args.strategy.is_empty() {
+    let explicit = !args.strategy.is_empty();
+    let requested = if explicit {
+        args.strategy.clone()
+    } else {
         DEFAULT_STRATEGIES
             .iter()
             .map(|slug| slug.to_string())
             .collect::<Vec<_>>()
-    } else {
-        args.strategy.clone()
     };
-    for strategy in &strategies {
+    for strategy in &requested {
         if !intra_latency::supports_hourly_latency(strategy) {
             bail!("unsupported hourly latency strategy {strategy}");
         }
@@ -85,6 +86,22 @@ async fn main() -> Result<()> {
         .run(&pool)
         .await
         .context("run PostgreSQL migrations")?;
+
+    let strategies = if explicit {
+        requested
+    } else {
+        let enabled = sqlx::query_scalar::<_, String>(
+            "SELECT slug FROM strategy_envs WHERE enabled AND slug = ANY($1)",
+        )
+        .bind(&requested)
+        .fetch_all(&pool)
+        .await
+        .context("load enabled strategies")?;
+        requested
+            .into_iter()
+            .filter(|slug| enabled.contains(slug))
+            .collect::<Vec<_>>()
+    };
 
     let mut summaries = Vec::new();
     for strategy in strategies {

@@ -191,9 +191,8 @@ async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
 }
 
 async fn load_strategies(pool: &PgPool, requested: &[String]) -> Result<Vec<Strategy>> {
-    let slugs: Vec<String> = if requested.is_empty() {
-        SUPPORTED.iter().map(|value| value.to_string()).collect()
-    } else {
+    let explicit = !requested.is_empty();
+    let slugs: Vec<String> = if explicit {
         let unique = requested.iter().cloned().collect::<BTreeSet<_>>();
         for slug in &unique {
             if !SUPPORTED.contains(&slug.as_str()) {
@@ -204,17 +203,26 @@ async fn load_strategies(pool: &PgPool, requested: &[String]) -> Result<Vec<Stra
             }
         }
         unique.into_iter().collect()
+    } else {
+        SUPPORTED.iter().map(|value| value.to_string()).collect()
     };
 
     let mut strategies = Vec::with_capacity(slugs.len());
     for slug in slugs {
         let row =
-            sqlx::query("SELECT slug,alias,db_schema FROM strategy_envs WHERE enabled AND slug=$1")
+            sqlx::query("SELECT slug,alias,db_schema,enabled FROM strategy_envs WHERE slug=$1")
                 .bind(&slug)
                 .fetch_optional(pool)
                 .await
                 .with_context(|| format!("load strategy {slug}"))?
-                .with_context(|| format!("enabled strategy not found: {slug}"))?;
+                .with_context(|| format!("strategy not found: {slug}"))?;
+        if !row.try_get::<bool, _>("enabled")? {
+            if explicit {
+                bail!("strategy {slug} is disabled");
+            }
+            eprintln!("skipping disabled strategy {slug}");
+            continue;
+        }
         let schema: String = row.try_get("db_schema")?;
         validate_schema(&schema)?;
         let alias = row
