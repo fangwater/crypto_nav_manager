@@ -145,7 +145,8 @@ impl SessionStore {
                 }
                 let row = sqlx::query_as::<_, SessionRow>(
                     r#"SELECT s.user_id, u.username, u.role,
-                              EXTRACT(EPOCH FROM s.expires_at - CURRENT_TIMESTAMP) AS expires_in_secs
+                              EXTRACT(EPOCH FROM s.expires_at - CURRENT_TIMESTAMP)::float8
+                                  AS expires_in_secs
                        FROM nav_sessions s
                        JOIN nav_users u ON u.user_id = s.user_id
                        WHERE s.token_hash = $1"#,
