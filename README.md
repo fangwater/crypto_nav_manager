@@ -137,9 +137,10 @@ the `rebates` dataset; run `--dataset rebates --full` to backfill wallet
 distributions from the strategy's `st_ms`. Repeat `--strategy` to scan multiple
 accounts in one invocation.
 
-The API service continuously syncs the four local Binance FR accounts plus
-`binance-intra-arb01`, `bybit-intra-arb01`, `bybit-intra-arb02`,
-`gate_fr_arb01`, and `gate_fr_arb02`. Binance trade scans rebuild their symbol
+The API service continuously syncs every enabled strategy it supports: the
+local Binance funding-rate accounts plus the registered market-making, CTA,
+intra-exchange, and Bitget/Gate funding-rate profiles. Binance trade scans
+rebuild their symbol
 sets from the same Redis online lists used by `mkt_signal`; Bybit and Gate use
 their account-wide history APIs. Each strategy only requests the datasets its
 exchange and strategy type support. Binance intra rebates remain excluded from
