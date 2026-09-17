@@ -1,4 +1,5 @@
 pub mod account_risk;
+pub mod auth;
 pub mod binance_premium_index;
 pub mod bybit_premium_index;
 pub mod contract_multipliers;

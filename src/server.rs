@@ -1,5 +1,6 @@
 use crate::{
     account_risk::{AccountRiskCache, AccountRiskFeed, AccountRiskSnapshot},
+    auth::{self, AuthUser, SessionStore},
     binance_premium_index, bybit_premium_index, contract_multipliers,
     fr_position_limits::{FrLimitSource, FrPositionLimitMonitor, FrPositionLimitOverview},
     intra_analysis::{
@@ -15,11 +16,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware,
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +60,7 @@ struct IntraAnalysisAdapter {
 struct AppState {
     pool: PgPool,
     read_only: bool,
+    sessions: SessionStore,
     account_risks: AccountRiskCache,
     mark_prices: MarkPriceCache,
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
@@ -318,6 +321,70 @@ struct AlignmentAutomaticResponse {
     automatic_enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionResponse {
+    user_id: i64,
+    username: String,
+    role: &'static str,
+    admin: bool,
+    strategy_slugs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserResponse {
+    user_id: i64,
+    username: String,
+    role: String,
+    created_at_ms: i64,
+    strategy_slugs: Vec<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct AdminUserRecord {
+    user_id: i64,
+    username: String,
+    role: String,
+    created_at_ms: i64,
+    strategy_slugs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateUserRequest {
+    role: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetUserStrategiesRequest {
+    strategy_slugs: Vec<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct IntraMatchingStrategyRecord {
     slug: String,
@@ -556,9 +623,15 @@ pub async fn run() -> Result<()> {
         (account_risks, mark_prices)
     };
     let fr_position_limits = FrPositionLimitMonitor::new()?;
+    let sessions = if read_only {
+        SessionStore::volatile(pool.clone())
+    } else {
+        SessionStore::persistent(pool.clone())
+    };
 
-    let mut app = Router::new()
-        .route("/api/health", get(health))
+    let mut authed = Router::new()
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/logout", post(auth_logout))
         .route("/api/strategies", get(list_strategies))
         .route("/api/account-risks", get(list_account_risks))
         .route("/api/fr-position-limits", get(list_fr_position_limits))
@@ -585,18 +658,37 @@ pub async fn run() -> Result<()> {
         )
         .route("/api/strategies/{slug}/pnl", get(get_strategy_pnl));
     if !read_only {
-        app = app
+        authed = authed
+            .route("/api/auth/password", put(change_password))
             .route(
-                "/api/alignment-status/{slug}",
-                axum::routing::put(set_alignment_automatic),
+                "/api/admin/users",
+                get(list_nav_users).post(create_nav_user),
             )
+            .route(
+                "/api/admin/users/{id}",
+                put(update_nav_user).delete(delete_nav_user),
+            )
+            .route(
+                "/api/admin/users/{id}/strategies",
+                put(set_nav_user_strategies),
+            )
+            .route("/api/alignment-status/{slug}", put(set_alignment_automatic))
             .route("/api/fee-rates/{slug}/sync", post(sync_account_fee_rates))
             .route("/api/snapshots/sync", post(sync_snapshots))
             .route(
                 "/api/strategies/{slug}/initial-snapshot",
-                axum::routing::put(set_initial_snapshot).delete(clear_initial_snapshot),
+                put(set_initial_snapshot).delete(clear_initial_snapshot),
             );
     }
+    let authed = authed.route_layer(middleware::from_fn_with_state(
+        sessions.clone(),
+        auth::require_auth,
+    ));
+
+    let mut app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/auth/login", post(auth_login))
+        .merge(authed);
     if let Some(frontend_dir) = frontend_dir()? {
         let index = frontend_dir.join("index.html");
         info!(path = %frontend_dir.display(), "serving NAV frontend");
@@ -611,6 +703,7 @@ pub async fn run() -> Result<()> {
         .with_state(AppState {
             pool,
             read_only,
+            sessions,
             account_risks,
             mark_prices,
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
@@ -648,14 +741,402 @@ fn frontend_dir() -> Result<Option<PathBuf>> {
     Ok(Some(directory))
 }
 
-async fn list_account_risks(State(state): State<AppState>) -> Json<Vec<AccountRiskSnapshot>> {
-    Json(state.account_risks.snapshots())
+async fn visible_slugs(pool: &PgPool, user: &AuthUser) -> Result<Option<HashSet<String>>> {
+    if user.is_admin() {
+        return Ok(None);
+    }
+    let slugs = sqlx::query_scalar::<_, String>(
+        "SELECT strategy_slug FROM nav_user_strategy_grants WHERE user_id = $1",
+    )
+    .bind(user.user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(slugs.into_iter().collect()))
+}
+
+fn slug_visible(visible: &Option<HashSet<String>>, slug: &str) -> bool {
+    visible.as_ref().is_none_or(|slugs| slugs.contains(slug))
+}
+
+fn ensure_admin(user: &AuthUser) -> Result<(), Response> {
+    if user.is_admin() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "admin access required",
+            }),
+        )
+            .into_response())
+    }
+}
+
+fn bad_request(error: &'static str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+}
+
+fn not_found(error: &'static str) -> Response {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse { error })).into_response()
+}
+
+async fn session_response(pool: &PgPool, user: &AuthUser) -> Result<SessionResponse> {
+    Ok(SessionResponse {
+        user_id: user.user_id,
+        username: user.username.clone(),
+        role: user.role.as_str(),
+        admin: user.is_admin(),
+        strategy_slugs: visible_slugs(pool, user)
+            .await?
+            .map(|slugs| slugs.into_iter().collect()),
+    })
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let Some(user) =
+        auth::verify_password(&state.pool, &request.username, &request.password).await?
+    else {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid username or password",
+            }),
+        )
+            .into_response());
+    };
+    let token = state.sessions.create(&user).await?;
+    let mut response = Json(session_response(&state.pool, &user).await?).into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&auth::session_cookie_header(&token)) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(token) = auth::session_token(&headers) {
+        state.sessions.revoke(&token).await?;
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&auth::clear_cookie_header()) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
+}
+
+async fn auth_me(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    Ok(Json(session_response(&state.pool, &user).await?))
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(user): Extension<AuthUser>,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<Response, ApiError> {
+    if !auth::valid_password(&request.new_password) {
+        return Ok(bad_request("password must be 8-128 characters"));
+    }
+    let verified =
+        auth::verify_password(&state.pool, &user.username, &request.current_password).await?;
+    if verified.is_none() {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "current password is incorrect",
+            }),
+        )
+            .into_response());
+    }
+    sqlx::query(
+        r#"UPDATE nav_users
+           SET password_hash = crypt($2, gen_salt('bf', 10)),
+               updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = $1"#,
+    )
+    .bind(user.user_id)
+    .bind(&request.new_password)
+    .execute(&state.pool)
+    .await?;
+    let keep_token = auth::session_token(&headers);
+    state
+        .sessions
+        .revoke_user_sessions(user.user_id, keep_token.as_deref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn list_nav_users(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
+    let rows = sqlx::query_as::<_, AdminUserRecord>(
+        r#"SELECT u.user_id, u.username, u.role,
+                  (EXTRACT(EPOCH FROM u.created_at) * 1000)::bigint AS created_at_ms,
+                  COALESCE(
+                    array_agg(g.strategy_slug ORDER BY g.strategy_slug)
+                      FILTER (WHERE g.strategy_slug IS NOT NULL),
+                    '{}'
+                  ) AS strategy_slugs
+           FROM nav_users u
+           LEFT JOIN nav_user_strategy_grants g ON g.user_id = u.user_id
+           GROUP BY u.user_id, u.username, u.role, u.created_at
+           ORDER BY u.username"#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| AdminUserResponse {
+                user_id: row.user_id,
+                username: row.username,
+                role: row.role,
+                created_at_ms: row.created_at_ms,
+                strategy_slugs: row.strategy_slugs,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
+}
+
+async fn create_nav_user(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
+    let username = request.username.trim().to_string();
+    if !auth::valid_username(&username) {
+        return Ok(bad_request(
+            "username must be 1-64 characters of a-z, 0-9, '_', '.', '-'",
+        ));
+    }
+    if !auth::valid_password(&request.password) {
+        return Ok(bad_request("password must be 8-128 characters"));
+    }
+    let Some(role) = auth::Role::parse(&request.role) else {
+        return Ok(bad_request("role must be 'admin' or 'user'"));
+    };
+    let created = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO nav_users (username, password_hash, role)
+           VALUES ($1, crypt($2, gen_salt('bf', 10)), $3)
+           ON CONFLICT (username) DO NOTHING
+           RETURNING user_id"#,
+    )
+    .bind(&username)
+    .bind(&request.password)
+    .bind(role.as_str())
+    .fetch_optional(&state.pool)
+    .await?;
+    match created {
+        Some(user_id) => Ok((
+            StatusCode::CREATED,
+            Json(AdminUserResponse {
+                user_id,
+                username,
+                role: role.as_str().to_string(),
+                created_at_ms: chrono::Utc::now().timestamp_millis(),
+                strategy_slugs: Vec::new(),
+            }),
+        )
+            .into_response()),
+        None => Ok((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "username already exists",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct NavUserRow {
+    user_id: i64,
+    role: String,
+}
+
+async fn load_nav_user(pool: &PgPool, user_id: i64) -> Result<Option<NavUserRow>> {
+    sqlx::query_as::<_, NavUserRow>("SELECT user_id, role FROM nav_users WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .context("load nav user")
+}
+
+async fn admin_count(pool: &PgPool) -> Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM nav_users WHERE role = 'admin'")
+        .fetch_one(pool)
+        .await
+        .context("count nav admins")
+}
+
+async fn update_nav_user(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(user_id): AxumPath<i64>,
+    Json(request): Json<UpdateUserRequest>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
+    let Some(target) = load_nav_user(&state.pool, user_id).await? else {
+        return Ok(not_found("user not found"));
+    };
+    if let Some(role) = request.role.as_deref() {
+        let Some(role) = auth::Role::parse(role) else {
+            return Ok(bad_request("role must be 'admin' or 'user'"));
+        };
+        if target.user_id == user.user_id && role != auth::Role::Admin {
+            return Ok(bad_request("cannot change your own role"));
+        }
+        if target.role == "admin"
+            && role != auth::Role::Admin
+            && admin_count(&state.pool).await? <= 1
+        {
+            return Ok(bad_request("at least one admin account is required"));
+        }
+        sqlx::query(
+            "UPDATE nav_users SET role = $2, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1",
+        )
+        .bind(target.user_id)
+        .bind(role.as_str())
+        .execute(&state.pool)
+        .await?;
+        if role != auth::Role::Admin {
+            state
+                .sessions
+                .revoke_user_sessions(target.user_id, None)
+                .await?;
+        }
+    }
+    if let Some(password) = request.password.as_deref() {
+        if !auth::valid_password(password) {
+            return Ok(bad_request("password must be 8-128 characters"));
+        }
+        sqlx::query(
+            r#"UPDATE nav_users
+               SET password_hash = crypt($2, gen_salt('bf', 10)),
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE user_id = $1"#,
+        )
+        .bind(target.user_id)
+        .bind(password)
+        .execute(&state.pool)
+        .await?;
+        state
+            .sessions
+            .revoke_user_sessions(target.user_id, None)
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn delete_nav_user(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(user_id): AxumPath<i64>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
+    let Some(target) = load_nav_user(&state.pool, user_id).await? else {
+        return Ok(not_found("user not found"));
+    };
+    if target.user_id == user.user_id {
+        return Ok(bad_request("cannot delete your own account"));
+    }
+    if target.role == "admin" && admin_count(&state.pool).await? <= 1 {
+        return Ok(bad_request("at least one admin account is required"));
+    }
+    sqlx::query("DELETE FROM nav_users WHERE user_id = $1")
+        .bind(target.user_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn set_nav_user_strategies(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(user_id): AxumPath<i64>,
+    Json(request): Json<SetUserStrategiesRequest>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
+    let Some(target) = load_nav_user(&state.pool, user_id).await? else {
+        return Ok(not_found("user not found"));
+    };
+    if target.role != "user" {
+        return Ok(bad_request("strategy grants only apply to regular users"));
+    }
+    let slugs: Vec<String> = request
+        .strategy_slugs
+        .iter()
+        .map(|slug| slug.trim().to_string())
+        .filter(|slug| !slug.is_empty())
+        .collect();
+    let known: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT slug FROM strategy_envs")
+        .fetch_all(&state.pool)
+        .await?
+        .into_iter()
+        .collect();
+    if let Some(invalid) = slugs.iter().find(|slug| !known.contains(*slug)) {
+        warn!(%invalid, "rejected unknown strategy slug in grant update");
+        return Ok(bad_request("unknown strategy slug"));
+    }
+
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("DELETE FROM nav_user_strategy_grants WHERE user_id = $1")
+        .bind(target.user_id)
+        .execute(&mut *transaction)
+        .await?;
+    if !slugs.is_empty() {
+        sqlx::query(
+            r#"INSERT INTO nav_user_strategy_grants (user_id, strategy_slug)
+               SELECT $1, slug FROM unnest($2::text[]) AS slug"#,
+        )
+        .bind(target.user_id)
+        .bind(&slugs)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn list_account_risks(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<AccountRiskSnapshot>>, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut snapshots = state.account_risks.snapshots();
+    if visible.is_some() {
+        snapshots.retain(|snapshot| slug_visible(&visible, &snapshot.strategy_slug));
+    }
+    Ok(Json(snapshots))
 }
 
 async fn list_fr_position_limits(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<FrPositionLimitOverview>, ApiError> {
-    let strategies = sqlx::query_as::<_, FrLimitStrategyRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut strategies = sqlx::query_as::<_, FrLimitStrategyRecord>(
         r#"SELECT slug,host,env_path,config_url,exchange
            FROM strategy_envs
            WHERE enabled
@@ -675,6 +1156,9 @@ async fn list_fr_position_limits(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        strategies.retain(|strategy| slug_visible(&visible, &strategy.slug));
+    }
 
     let mut sources = Vec::with_capacity(strategies.len());
     for (sort_order, strategy) in strategies.into_iter().enumerate() {
@@ -693,8 +1177,10 @@ async fn list_fr_position_limits(
 
 async fn list_history_sync_status(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<HistorySyncStatusResponse>>, ApiError> {
-    let strategies = sqlx::query_as::<_, HistorySyncStrategyRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut strategies = sqlx::query_as::<_, HistorySyncStrategyRecord>(
         r#"SELECT slug,host,exchange,strategy_kind
            FROM strategy_envs
            WHERE enabled
@@ -702,6 +1188,9 @@ async fn list_history_sync_status(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        strategies.retain(|strategy| slug_visible(&visible, &strategy.slug));
+    }
     let watermarks = sqlx::query_as::<_, HistorySyncWatermarkRecord>(
         r#"SELECT strategy_slug,dataset,success_end_ms,
                   (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS fetched_at_ms
@@ -767,8 +1256,10 @@ async fn list_history_sync_status(
 
 async fn list_alignment_status(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<AlignmentStatusResponse>>, ApiError> {
-    let rows = sqlx::query_as::<_, AlignmentStatusResponse>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut rows = sqlx::query_as::<_, AlignmentStatusResponse>(
         r#"SELECT a.strategy_slug,a.state,a.phase,a.progress_percent,a.automatic_enabled,
                   (EXTRACT(EPOCH FROM a.started_at) * 1000)::bigint AS started_at_ms,
                   (EXTRACT(EPOCH FROM a.updated_at) * 1000)::bigint AS updated_at_ms,
@@ -782,14 +1273,21 @@ async fn list_alignment_status(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        rows.retain(|row| slug_visible(&visible, &row.strategy_slug));
+    }
     Ok(Json(rows))
 }
 
 async fn set_alignment_automatic(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
     Json(request): Json<SetAlignmentAutomaticRequest>,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
     let updated = sqlx::query_as::<_, (String, bool)>(
         r#"UPDATE rocksdb_alignment_status
            SET automatic_enabled=$2,automatic_updated_at=CURRENT_TIMESTAMP
@@ -819,8 +1317,10 @@ async fn set_alignment_automatic(
 
 async fn list_intra_matching(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<IntraMatchingSummaryResponse>>, ApiError> {
-    let strategies = sqlx::query_as::<_, IntraMatchingStrategyRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut strategies = sqlx::query_as::<_, IntraMatchingStrategyRecord>(
         r#"SELECT slug,alias,db_schema,exchange
            FROM strategy_envs
            WHERE enabled
@@ -833,6 +1333,9 @@ async fn list_intra_matching(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        strategies.retain(|strategy| slug_visible(&visible, &strategy.slug));
+    }
 
     let mut summaries = Vec::with_capacity(strategies.len());
     for strategy in strategies {
@@ -918,9 +1421,14 @@ async fn list_intra_matching(
 
 async fn get_intra_analysis(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
     Query(query): Query<IntraAnalysisQuery>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let strategy = sqlx::query_as::<_, IntraAnalysisStrategyRecord>(
         r#"SELECT slug,alias,db_schema,st_ms,exchange,strategy_kind
            FROM strategy_envs
@@ -1223,9 +1731,14 @@ async fn get_intra_analysis(
 
 async fn get_intra_hourly_latency(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
     Query(query): Query<IntraHourlyLatencyQuery>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     if !intra_latency::supports_hourly_latency(&slug) {
         return Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1385,7 +1898,13 @@ fn expected_history_datasets(
     }
 }
 
-async fn sync_snapshots(State(state): State<AppState>) -> Result<Response, ApiError> {
+async fn sync_snapshots(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
     let Ok(_guard) = state.snapshot_sync.try_lock() else {
         return Ok((
             StatusCode::CONFLICT,
@@ -1503,8 +2022,10 @@ fn snapshot_source_url(host: &str, config_url: &str) -> Result<String> {
 
 async fn list_latest_snapshots(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<SnapshotResponse>>, ApiError> {
-    let rows = sqlx::query_as::<_, SnapshotRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut rows = sqlx::query_as::<_, SnapshotRecord>(
         r#"SELECT DISTINCT ON (strategy_slug)
                strategy_slug,snapshot_ts_ms,
                (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
@@ -1514,13 +2035,21 @@ async fn list_latest_snapshots(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        rows.retain(|row| slug_visible(&visible, &row.strategy_slug));
+    }
     Ok(Json(rows.into_iter().map(snapshot_response).collect()))
 }
 
 async fn get_latest_snapshot(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let row = sqlx::query_as::<_, SnapshotRecord>(
         r#"SELECT strategy_slug,snapshot_ts_ms,
                   (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
@@ -1540,8 +2069,13 @@ async fn get_latest_snapshot(
 
 async fn list_strategy_snapshots(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Json<Vec<SnapshotSummaryResponse>>, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(Json(Vec::new()));
+    }
     let rows = sqlx::query_as::<_, SnapshotRecord>(
         r#"SELECT strategy_slug,snapshot_ts_ms,
                   (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
@@ -1560,17 +2094,26 @@ async fn list_strategy_snapshots(
 
 async fn get_initial_snapshot(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
-) -> Result<Json<Option<SnapshotSummaryResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let row = load_initial_snapshot(&state.pool, &slug).await?;
-    Ok(Json(row.map(snapshot_summary_response)))
+    Ok(Json(row.map(snapshot_summary_response)).into_response())
 }
 
 async fn set_initial_snapshot(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
     Json(request): Json<SetInitialSnapshotRequest>,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
     let strategy_start_ms =
         sqlx::query_scalar::<_, i64>("SELECT st_ms FROM strategy_envs WHERE enabled AND slug=$1")
             .bind(&slug)
@@ -1633,13 +2176,17 @@ async fn set_initial_snapshot(
 
 async fn clear_initial_snapshot(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
     sqlx::query("DELETE FROM strategy_initial_snapshots WHERE strategy_slug=$1")
         .bind(slug)
         .execute(&state.pool)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 fn snapshot_response(row: SnapshotRecord) -> SnapshotResponse {
@@ -1787,8 +2334,10 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
 
 async fn list_strategies(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<StrategyResponse>>, ApiError> {
-    let rows = sqlx::query_as::<_, StrategyRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut rows = sqlx::query_as::<_, StrategyRecord>(
         r#"
         SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
                st_ms, strategy_kind, exchange, account_mode, required_keys,
@@ -1800,6 +2349,9 @@ async fn list_strategies(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        rows.retain(|row| slug_visible(&visible, &row.slug));
+    }
 
     let mut tasks = JoinSet::new();
     for row in rows {
@@ -1819,8 +2371,10 @@ async fn list_strategies(
 
 async fn list_fee_rates(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<AccountFeeRatesResponse>>, ApiError> {
-    let strategies = sqlx::query_as::<_, StrategyRecord>(
+    let visible = visible_slugs(&state.pool, &user).await?;
+    let mut strategies = sqlx::query_as::<_, StrategyRecord>(
         r#"
         SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
                st_ms, strategy_kind, exchange, account_mode, required_keys,
@@ -1832,6 +2386,9 @@ async fn list_fee_rates(
     )
     .fetch_all(&state.pool)
     .await?;
+    if visible.is_some() {
+        strategies.retain(|strategy| slug_visible(&visible, &strategy.slug));
+    }
 
     let mut accounts = Vec::with_capacity(strategies.len());
     for strategy in strategies {
@@ -1844,8 +2401,13 @@ async fn list_fee_rates(
 
 async fn get_account_fee_rates(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let strategy = sqlx::query_as::<_, StrategyRecord>(
         r#"
         SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
@@ -1915,8 +2477,12 @@ fn is_default_bybit_instrument(instrument: &str) -> bool {
 
 async fn sync_account_fee_rates(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = ensure_admin(&user) {
+        return Ok(response);
+    }
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM strategy_envs WHERE enabled AND slug = $1)",
     )
@@ -2021,8 +2587,13 @@ async fn load_latest_fee_rates(pool: &PgPool, schema: &str) -> Result<Vec<FeeRat
 
 async fn get_strategy(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let row = sqlx::query_as::<_, StrategyRecord>(
         r#"
         SELECT slug, alias, db_schema, host, env_path, csv_output_dir,
@@ -2054,9 +2625,14 @@ async fn get_strategy(
 }
 async fn get_strategy_pnl(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(slug): AxumPath<String>,
     Query(query): Query<PnlQuery>,
 ) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
     let strategy = sqlx::query_as::<_, PnlStrategyRecord>(
         r#"
         SELECT db_schema, st_ms, exchange, account_mode, strategy_kind

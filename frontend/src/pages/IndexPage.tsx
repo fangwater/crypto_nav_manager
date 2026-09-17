@@ -9,10 +9,13 @@ import {
   FlaskConical,
   Gauge,
   GitCompareArrows,
+  LogOut,
   Percent,
   RadioTower,
   ShieldAlert,
   ShieldCheck,
+  UserRound,
+  Users,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -32,6 +35,7 @@ import { strategySurfaceAnalysisLink } from '../analysisNav'
 import type {
   AccountRisk,
   AlignmentStatus,
+  AuthSession,
   HistorySyncStatus,
   Strategy,
 } from '../types'
@@ -169,7 +173,13 @@ function syncStatusTitle(status: HistorySyncStatus | undefined) {
     .join('\n')
 }
 
-export function IndexPage() {
+export function IndexPage({
+  session,
+  onLogout,
+}: {
+  session: AuthSession
+  onLogout: () => void
+}) {
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [accountRisks, setAccountRisks] = useState<AccountRisk[]>([])
   const [syncStatuses, setSyncStatuses] = useState<HistorySyncStatus[]>([])
@@ -281,24 +291,28 @@ export function IndexPage() {
             </div>
           </div>
           <div className="header-actions">
-            <Link
-              className="header-nav-link"
-              to="/market-data"
-              aria-label="行情网络"
-              title="行情网络"
-            >
-              <RadioTower size={16} />
-              <span>行情网络</span>
-            </Link>
-            <Link
-              className="header-nav-link"
-              to="/monitor"
-              aria-label="安全监控"
-              title="安全监控"
-            >
-              <ShieldAlert size={16} />
-              <span>安全监控</span>
-            </Link>
+            {session.admin && (
+              <>
+                <Link
+                  className="header-nav-link"
+                  to="/market-data"
+                  aria-label="行情网络"
+                  title="行情网络"
+                >
+                  <RadioTower size={16} />
+                  <span>行情网络</span>
+                </Link>
+                <Link
+                  className="header-nav-link"
+                  to="/monitor"
+                  aria-label="安全监控"
+                  title="安全监控"
+                >
+                  <ShieldAlert size={16} />
+                  <span>安全监控</span>
+                </Link>
+              </>
+            )}
             <Link
               className="header-nav-link"
               to="/intra-matching"
@@ -326,10 +340,31 @@ export function IndexPage() {
               <Gauge size={16} />
               <span>FR 限仓</span>
             </Link>
-            <div className="system-state">
-              <span className="status-dot status-dot--ready" />
-              服务在线
+            {session.admin && (
+              <Link
+                className="header-nav-link"
+                to="/admin"
+                aria-label="用户管理"
+                title="用户管理"
+              >
+                <Users size={16} />
+                <span>用户</span>
+              </Link>
+            )}
+            <div className="system-state" title={session.username}>
+              <UserRound size={14} />
+              {session.username}
+              {session.admin && <em>管理员</em>}
             </div>
+            <button
+              className="header-nav-link"
+              type="button"
+              onClick={onLogout}
+              aria-label="退出登录"
+              title="退出登录"
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </div>
       </header>

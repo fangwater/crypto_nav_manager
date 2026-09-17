@@ -4,6 +4,24 @@ export interface Health {
   readOnly: boolean
 }
 
+export type NavRole = 'admin' | 'user'
+
+export interface AuthSession {
+  userId: number
+  username: string
+  role: NavRole
+  admin: boolean
+  strategySlugs: string[] | null
+}
+
+export interface ManagedUser {
+  userId: number
+  username: string
+  role: NavRole
+  createdAtMs: number
+  strategySlugs: string[]
+}
+
 export type OpsHealth = 'healthy' | 'warning' | 'critical'
 export type OpsComponentHealth =
   | 'online'
