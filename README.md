@@ -135,7 +135,10 @@ minutes and upsert with exchange-native record IDs. Market-making strategies
 do not query interest. Binance intra `all` scans include both `interest` and
 the `rebates` dataset; run `--dataset rebates --full` to backfill wallet
 distributions from the strategy's `st_ms`. Repeat `--strategy` to scan multiple
-accounts in one invocation.
+accounts in one invocation. Symbol-restricted repair scans accept
+`--no-advance-watermark` so they upsert their rows without claiming shared
+scan progress for the remaining symbols; the service uses it for single-symbol
+CTA backfills.
 
 The API service continuously syncs every enabled strategy it supports: the
 local Binance funding-rate accounts plus the registered market-making, CTA,

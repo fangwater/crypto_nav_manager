@@ -582,6 +582,9 @@ fn run_cta_symbol_backfill(
         "trades",
         "--symbol",
         symbol,
+        // A single-symbol backfill must not advance the shared trades
+        // watermark; the incremental scan would then skip other symbols.
+        "--no-advance-watermark",
     ]);
     match first_fill_ts_us.filter(|ts| *ts > 0) {
         Some(ts_us) => {

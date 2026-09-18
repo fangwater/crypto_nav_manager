@@ -85,6 +85,11 @@ struct Args {
     #[arg(long)]
     symbol: Vec<String>,
 
+    /// Do not advance the shared history watermark. Required for
+    /// symbol-restricted runs that must not claim progress for other symbols.
+    #[arg(long)]
+    no_advance_watermark: bool,
+
     /// Skip spot/margin fills when synchronizing trades.
     #[arg(long)]
     derivatives_only: bool,
@@ -319,6 +324,7 @@ async fn main() -> Result<()> {
                 overlap_ms,
                 end_ms,
                 args.derivatives_only,
+                !args.no_advance_watermark,
             )
             .await
             .with_context(|| format!("sync {} {}", strategy.slug, dataset.name()))?;
@@ -353,6 +359,7 @@ async fn sync_dataset(
     overlap_ms: i64,
     end_ms: i64,
     derivatives_only: bool,
+    advance_watermark: bool,
 ) -> Result<()> {
     let latest = latest_dataset_time(pool, strategy, dataset).await?;
     let watermark = watermark(pool, &strategy.slug, dataset).await?;
@@ -409,7 +416,8 @@ async fn sync_dataset(
                 ))
             });
             let storage = trade_storage(pool, &strategy.schema).await?;
-            let affected = commit_trades(pool, strategy, storage, &rows, end_ms).await?;
+            let affected =
+                commit_trades(pool, strategy, storage, &rows, end_ms, advance_watermark).await?;
             println!(
                 "trades complete: fetched={}, upserted={affected}",
                 rows.len()
@@ -422,7 +430,16 @@ async fn sync_dataset(
                 .map(|value| normalize_cash(&strategy.exchange, Dataset::Funding, value))
                 .collect::<Result<Vec<_>>>()?;
             let storage = cash_storage(pool, &strategy.schema, Dataset::Funding).await?;
-            let affected = commit_cash(pool, strategy, dataset, storage, &rows, end_ms).await?;
+            let affected = commit_cash(
+                pool,
+                strategy,
+                dataset,
+                storage,
+                &rows,
+                end_ms,
+                advance_watermark,
+            )
+            .await?;
             println!(
                 "funding complete: fetched={}, upserted={affected}",
                 rows.len()
@@ -435,7 +452,16 @@ async fn sync_dataset(
                 .map(|value| normalize_cash(&strategy.exchange, Dataset::Interest, value))
                 .collect::<Result<Vec<_>>>()?;
             let storage = cash_storage(pool, &strategy.schema, Dataset::Interest).await?;
-            let affected = commit_cash(pool, strategy, dataset, storage, &rows, end_ms).await?;
+            let affected = commit_cash(
+                pool,
+                strategy,
+                dataset,
+                storage,
+                &rows,
+                end_ms,
+                advance_watermark,
+            )
+            .await?;
             println!(
                 "interest complete: fetched={}, upserted={affected}",
                 rows.len()
@@ -448,7 +474,7 @@ async fn sync_dataset(
                 .map(normalize_binance_rebate)
                 .collect::<Result<Vec<_>>>()?;
             rows.sort_by_key(|row| row.event_time_ms);
-            let affected = commit_rebates(pool, strategy, &rows, end_ms).await?;
+            let affected = commit_rebates(pool, strategy, &rows, end_ms, advance_watermark).await?;
             println!(
                 "rebates complete: fetched={}, upserted={affected}",
                 rows.len()
@@ -464,7 +490,9 @@ async fn sync_dataset(
                         .map(|value| normalize_gate_liquidation(value, &multipliers))
                         .collect::<Result<Vec<_>>>()?;
                     rows.sort_by_key(|row| row.event_time_ms);
-                    let affected = commit_liquidations(pool, strategy, &rows, end_ms).await?;
+                    let affected =
+                        commit_liquidations(pool, strategy, &rows, end_ms, advance_watermark)
+                            .await?;
                     println!(
                         "liquidations complete: fetched={}, upserted={affected}",
                         rows.len()
@@ -476,8 +504,14 @@ async fn sync_dataset(
                         .map(normalize_binance_liquidation)
                         .collect::<Result<Vec<_>>>()?;
                     rows.sort_by_key(|row| row.event_time_ms);
-                    let affected =
-                        commit_binance_liquidations(pool, strategy, &rows, end_ms).await?;
+                    let affected = commit_binance_liquidations(
+                        pool,
+                        strategy,
+                        &rows,
+                        end_ms,
+                        advance_watermark,
+                    )
+                    .await?;
                     println!(
                         "liquidations complete: fetched={}, upserted={affected}",
                         rows.len()
@@ -1550,6 +1584,7 @@ async fn commit_trades(
     storage: TradeStorage,
     rows: &[TradeRow],
     end_ms: i64,
+    update_watermark: bool,
 ) -> Result<u64> {
     let mut transaction = pool.begin().await.context("begin trade sync transaction")?;
     let mut affected = 0;
@@ -1675,7 +1710,9 @@ async fn commit_trades(
             }
         }
     }
-    advance_watermark(&mut transaction, &strategy.slug, Dataset::Trades, end_ms).await?;
+    if update_watermark {
+        advance_watermark(&mut transaction, &strategy.slug, Dataset::Trades, end_ms).await?;
+    }
     transaction.commit().await.context("commit trade sync")?;
     Ok(affected)
 }
@@ -1686,6 +1723,7 @@ async fn commit_cash(
     storage: CashStorage,
     rows: &[CashRow],
     end_ms: i64,
+    update_watermark: bool,
 ) -> Result<u64> {
     let mut transaction = pool.begin().await.context("begin cash sync transaction")?;
     let mut affected = 0;
@@ -1818,7 +1856,9 @@ async fn commit_cash(
             }
         }
     }
-    advance_watermark(&mut transaction, &strategy.slug, dataset, end_ms).await?;
+    if update_watermark {
+        advance_watermark(&mut transaction, &strategy.slug, dataset, end_ms).await?;
+    }
     transaction.commit().await.context("commit cash sync")?;
     Ok(affected)
 }
@@ -1828,6 +1868,7 @@ async fn commit_rebates(
     strategy: &Strategy,
     rows: &[RebateRow],
     end_ms: i64,
+    update_watermark: bool,
 ) -> Result<u64> {
     let mut transaction = pool
         .begin()
@@ -1873,7 +1914,9 @@ async fn commit_rebates(
             .context("upsert Binance rebate batch")?
             .rows_affected();
     }
-    advance_watermark(&mut transaction, &strategy.slug, Dataset::Rebates, end_ms).await?;
+    if update_watermark {
+        advance_watermark(&mut transaction, &strategy.slug, Dataset::Rebates, end_ms).await?;
+    }
     transaction.commit().await.context("commit rebate sync")?;
     Ok(affected)
 }
@@ -1883,6 +1926,7 @@ async fn commit_liquidations(
     strategy: &Strategy,
     rows: &[LiquidationRow],
     end_ms: i64,
+    update_watermark: bool,
 ) -> Result<u64> {
     let mut transaction = pool
         .begin()
@@ -1942,13 +1986,15 @@ async fn commit_liquidations(
             .context("upsert Gate liquidation batch")?
             .rows_affected();
     }
-    advance_watermark(
-        &mut transaction,
-        &strategy.slug,
-        Dataset::Liquidations,
-        end_ms,
-    )
-    .await?;
+    if update_watermark {
+        advance_watermark(
+            &mut transaction,
+            &strategy.slug,
+            Dataset::Liquidations,
+            end_ms,
+        )
+        .await?;
+    }
     transaction
         .commit()
         .await
@@ -1961,6 +2007,7 @@ async fn commit_binance_liquidations(
     strategy: &Strategy,
     rows: &[BinanceLiquidationRow],
     end_ms: i64,
+    update_watermark: bool,
 ) -> Result<u64> {
     let mut transaction = pool
         .begin()
@@ -2021,13 +2068,15 @@ async fn commit_binance_liquidations(
             .context("upsert Binance liquidation batch")?
             .rows_affected();
     }
-    advance_watermark(
-        &mut transaction,
-        &strategy.slug,
-        Dataset::Liquidations,
-        end_ms,
-    )
-    .await?;
+    if update_watermark {
+        advance_watermark(
+            &mut transaction,
+            &strategy.slug,
+            Dataset::Liquidations,
+            end_ms,
+        )
+        .await?;
+    }
     transaction
         .commit()
         .await
@@ -2544,5 +2593,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(row.amount, "-0.125");
+    }
+
+    #[test]
+    fn no_advance_watermark_flag_defaults_off_and_parses() {
+        let default_args =
+            Args::try_parse_from(["sync_history", "--strategy", "binance_exec_trade01"]).unwrap();
+        assert!(!default_args.no_advance_watermark);
+
+        let backfill_args = Args::try_parse_from([
+            "sync_history",
+            "--strategy",
+            "binance_exec_trade01",
+            "--dataset",
+            "trades",
+            "--symbol",
+            "COTIUSDT",
+            "--no-advance-watermark",
+        ])
+        .unwrap();
+        assert!(backfill_args.no_advance_watermark);
+        assert_eq!(backfill_args.symbol, vec!["COTIUSDT".to_string()]);
     }
 }
