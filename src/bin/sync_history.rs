@@ -401,8 +401,33 @@ async fn sync_dataset(
     match dataset {
         Dataset::Trades => {
             let symbols = load_trade_symbols(pool, strategy, requested_symbols).await?;
-            let raw = fetch_trades(client, strategy, &symbols, range, derivatives_only).await?;
-            let multipliers = load_gate_multipliers(client).await?;
+            let mut raw = fetch_trades(client, strategy, &symbols, range, derivatives_only).await?;
+            let mut multipliers = load_gate_multipliers(client).await?;
+            if strategy.exchange == "gate" {
+                let contracts = raw
+                    .iter()
+                    .filter(|(leg, _)| *leg == Leg::Derivative)
+                    .filter_map(|(_, value)| optional_text(value, &["contract"]))
+                    .map(|contract| contract.to_ascii_uppercase())
+                    .collect::<BTreeSet<_>>();
+                let unresolved =
+                    resolve_gate_multipliers(client, contracts, &mut multipliers).await;
+                if !unresolved.is_empty() {
+                    let mut skipped = 0_u64;
+                    raw.retain(|(leg, value)| {
+                        let drop = *leg == Leg::Derivative
+                            && optional_text(value, &["contract"]).is_some_and(|contract| {
+                                unresolved.contains(&contract.to_ascii_uppercase())
+                            });
+                        skipped += u64::from(drop);
+                        !drop
+                    });
+                    println!(
+                        "trades warning: skipped {skipped} Gate fills on unresolvable contracts {}",
+                        unresolved.into_iter().collect::<Vec<_>>().join(",")
+                    );
+                }
+            }
             let mut rows = raw
                 .into_iter()
                 .map(|(leg, value)| normalize_trade(&strategy.exchange, leg, value, &multipliers))
@@ -484,11 +509,30 @@ async fn sync_dataset(
             let raw = fetch_liquidations(client, range).await?;
             match strategy.exchange.as_str() {
                 "gate" => {
-                    let multipliers = load_gate_multipliers(client).await?;
-                    let mut rows = raw
-                        .into_iter()
-                        .map(|value| normalize_gate_liquidation(value, &multipliers))
-                        .collect::<Result<Vec<_>>>()?;
+                    let mut multipliers = load_gate_multipliers(client).await?;
+                    let unresolved = resolve_gate_multipliers(
+                        client,
+                        gate_contract_names(&raw),
+                        &mut multipliers,
+                    )
+                    .await;
+                    let mut skipped = 0_u64;
+                    let mut rows = Vec::with_capacity(raw.len());
+                    for value in raw {
+                        if optional_text(&value, &["contract"]).is_some_and(|contract| {
+                            unresolved.contains(&contract.to_ascii_uppercase())
+                        }) {
+                            skipped += 1;
+                            continue;
+                        }
+                        rows.push(normalize_gate_liquidation(value, &multipliers)?);
+                    }
+                    if skipped > 0 {
+                        println!(
+                            "liquidations warning: skipped {skipped} Gate rows on unresolvable contracts {}",
+                            unresolved.into_iter().collect::<Vec<_>>().join(",")
+                        );
+                    }
                     rows.sort_by_key(|row| row.event_time_ms);
                     let affected =
                         commit_liquidations(pool, strategy, &rows, end_ms, advance_watermark)
@@ -763,15 +807,64 @@ async fn load_gate_multipliers(client: &ExchangeClient) -> Result<HashMap<String
     let mut values = HashMap::with_capacity(contracts.len());
     for row in contracts {
         let name = text_field(&row, &["name"])?;
-        let multiplier = number_field(&row, &["quanto_multiplier"])?
-            .parse::<f64>()
-            .context("parse Gate quanto_multiplier")?;
-        if !multiplier.is_finite() || multiplier <= 0.0 {
-            bail!("invalid Gate multiplier for {name}: {multiplier}");
-        }
+        let multiplier = gate_quanto_multiplier(&row)?;
         values.insert(name.to_ascii_uppercase(), multiplier);
     }
     Ok(values)
+}
+
+fn gate_quanto_multiplier(row: &Value) -> Result<f64> {
+    let name = text_field(row, &["name"])?;
+    let multiplier = number_field(row, &["quanto_multiplier"])?
+        .parse::<f64>()
+        .context("parse Gate quanto_multiplier")?;
+    if !multiplier.is_finite() || multiplier <= 0.0 {
+        bail!("invalid Gate multiplier for {name}: {multiplier}");
+    }
+    Ok(multiplier)
+}
+
+fn gate_contract_names(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .filter_map(|value| optional_text(value, &["contract"]))
+        .map(|contract| contract.to_ascii_uppercase())
+        .collect()
+}
+
+/// Looks up quanto multipliers for Gate contracts absent from the bulk
+/// list. Delisted contracts disappear from that endpoint but keep
+/// answering the single-contract endpoint while their fills remain in
+/// the account history. Returns contracts that could not be resolved.
+async fn resolve_gate_multipliers(
+    client: &ExchangeClient,
+    contracts: BTreeSet<String>,
+    multipliers: &mut HashMap<String, f64>,
+) -> BTreeSet<String> {
+    let ExchangeClient::Gate(client) = client else {
+        return BTreeSet::new();
+    };
+    let mut unresolved = BTreeSet::new();
+    for contract in contracts {
+        if multipliers.contains_key(&contract) {
+            continue;
+        }
+        match client.futures_contract(&contract).await {
+            Ok(row) => match gate_quanto_multiplier(&row) {
+                Ok(multiplier) => {
+                    multipliers.insert(contract, multiplier);
+                }
+                Err(error) => {
+                    eprintln!("gate contract {contract} multiplier unresolvable: {error:#}");
+                    unresolved.insert(contract);
+                }
+            },
+            Err(error) => {
+                eprintln!("gate contract lookup failed for {contract}: {error:#}");
+                unresolved.insert(contract);
+            }
+        }
+    }
+    unresolved
 }
 async fn build_client(
     pool: &PgPool,

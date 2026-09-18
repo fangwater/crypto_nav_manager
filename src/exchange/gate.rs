@@ -410,6 +410,18 @@ impl GateClient {
         )
     }
 
+    /// Queries a single USDT futures contract. Delisted contracts
+    /// disappear from the list endpoint but keep answering here while
+    /// their fills remain in the account history.
+    pub async fn futures_contract(&self, contract: &str) -> Result<Value, ExchangeError> {
+        self.public_get(
+            &format!("/futures/usdt/contracts/{contract}"),
+            Vec::new(),
+            1,
+        )
+        .await
+    }
+
     pub async fn spot_tickers(&self) -> Result<Vec<Value>, ExchangeError> {
         root_array(
             EXCHANGE,
