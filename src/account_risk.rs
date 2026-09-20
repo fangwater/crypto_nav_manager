@@ -456,6 +456,8 @@ fn decode_account_risk(data: &[u8]) -> Result<Option<AccountRiskReading>> {
     if reading.source_ts_ms <= 0 {
         bail!("account risk timestamp must be positive");
     }
+    // Unavailable amounts are NaN on the wire (serialized as null downstream);
+    // only infinities are rejected as corruption.
     for (name, value) in [
         ("adjusted_equity_usd", reading.adjusted_equity_usd),
         ("actual_equity_usd", reading.actual_equity_usd),
@@ -464,7 +466,7 @@ fn decode_account_risk(data: &[u8]) -> Result<Option<AccountRiskReading>> {
         ("borrowed_usd", reading.borrowed_usd),
         ("notional_usd", reading.notional_usd),
     ] {
-        if !value.is_finite() {
+        if !value.is_finite() && !value.is_nan() {
             bail!("account risk {name} is not finite");
         }
     }
@@ -554,6 +556,23 @@ mod tests {
     fn rejects_unknown_scope_and_non_finite_values() {
         assert!(decode_account_risk(&risk_event(99, 5_000.0, 20.0)).is_err());
         assert!(decode_account_risk(&risk_event(1, 5_000.0, f64::NAN)).is_err());
+        assert!(decode_account_risk(&risk_event(1, 5_000.0, f64::INFINITY)).is_err());
+        let mut infinite_amount = risk_event(1, 5_000.0, 20.0);
+        infinite_amount
+            [ACCOUNT_EVENT_HEADER_BYTES + 4 + 8 + 24..ACCOUNT_EVENT_HEADER_BYTES + 4 + 8 + 32]
+            .copy_from_slice(&f64::INFINITY.to_le_bytes());
+        assert!(decode_account_risk(&infinite_amount).is_err());
+    }
+
+    #[test]
+    fn nan_amounts_mean_absent_and_still_decode() {
+        let mut event = risk_event(1, 5_000.0, 20.0);
+        // initial_margin_usd sits after type/timestamp/adj/actual/maintenance.
+        event[ACCOUNT_EVENT_HEADER_BYTES + 4 + 8 + 24..ACCOUNT_EVENT_HEADER_BYTES + 4 + 8 + 32]
+            .copy_from_slice(&f64::NAN.to_le_bytes());
+        let reading = decode_account_risk(&event).unwrap().unwrap();
+        assert!(reading.initial_margin_usd.is_nan());
+        assert_eq!(reading.maintenance_margin_usd, 5_000.0);
     }
 
     #[test]
