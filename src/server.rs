@@ -603,8 +603,11 @@ pub async fn run() -> Result<()> {
                FROM strategy_envs
                WHERE enabled
                  AND host = 'local'
-                 AND account_mode IN ('portfolio_margin','unified')
-                 AND strategy_kind NOT IN ('market_making','cta')
+                 AND (
+                   account_mode = 'rapidx'
+                   OR (account_mode IN ('portfolio_margin','unified')
+                       AND strategy_kind NOT IN ('market_making','cta'))
+                 )
                ORDER BY sort_order,slug"#,
         )
         .fetch_all(&pool)

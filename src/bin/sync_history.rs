@@ -8,6 +8,7 @@ use crypto_nav_manager::{
         bitget::{BitgetClient, BitgetCredentials},
         bybit::{BybitCategory, BybitClient, BybitCredentials},
         gate::{GateClient, GateCredentials},
+        ltp::{LtpClient, LtpCredentials},
         okx::{OkxClient, OkxCredentials, OkxInstrumentType},
     },
     models::{ProductCategory, TimeRange},
@@ -123,7 +124,19 @@ struct Strategy {
 }
 
 impl Strategy {
+    fn is_rapidx(&self) -> bool {
+        self.account_mode == "rapidx"
+    }
+
     fn supports(&self, dataset: Dataset) -> bool {
+        // RapidX/LTP exposes executions plus funding and interest statements;
+        // there is no rebate or liquidation history endpoint to mirror.
+        if self.is_rapidx() {
+            return matches!(
+                dataset,
+                Dataset::All | Dataset::Trades | Dataset::Funding | Dataset::Interest
+            );
+        }
         match dataset {
             Dataset::All | Dataset::Trades | Dataset::Funding => true,
             Dataset::Interest => self.class != StrategyClass::Mm,
@@ -250,6 +263,7 @@ enum ExchangeClient {
     Gate(GateClient),
     Bitget(BitgetClient),
     Okx(OkxClient),
+    Ltp(LtpClient),
 }
 
 #[tokio::main]
@@ -430,7 +444,15 @@ async fn sync_dataset(
             }
             let mut rows = raw
                 .into_iter()
-                .map(|(leg, value)| normalize_trade(&strategy.exchange, leg, value, &multipliers))
+                .map(|(leg, value)| {
+                    normalize_trade(
+                        &strategy.exchange,
+                        &strategy.account_mode,
+                        leg,
+                        value,
+                        &multipliers,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             rows.sort_by(|a, b| {
                 (a.event_time_ms, &a.market, &a.symbol, &a.trade_id).cmp(&(
@@ -452,7 +474,14 @@ async fn sync_dataset(
             let raw = fetch_funding(client, range).await?;
             let rows = raw
                 .into_iter()
-                .map(|value| normalize_cash(&strategy.exchange, Dataset::Funding, value))
+                .map(|value| {
+                    normalize_cash(
+                        &strategy.exchange,
+                        &strategy.account_mode,
+                        Dataset::Funding,
+                        value,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let storage = cash_storage(pool, &strategy.schema, Dataset::Funding).await?;
             let affected = commit_cash(
@@ -474,7 +503,14 @@ async fn sync_dataset(
             let raw = fetch_interest(client, range).await?;
             let rows = raw
                 .into_iter()
-                .map(|value| normalize_cash(&strategy.exchange, Dataset::Interest, value))
+                .map(|value| {
+                    normalize_cash(
+                        &strategy.exchange,
+                        &strategy.account_mode,
+                        Dataset::Interest,
+                        value,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let storage = cash_storage(pool, &strategy.schema, Dataset::Interest).await?;
             let affected = commit_cash(
@@ -628,7 +664,8 @@ async fn fetch_trades(
     range: TimeRange,
     derivatives_only: bool,
 ) -> Result<Vec<(Leg, Value)>> {
-    let include_spot = strategy.class != StrategyClass::Mm && !derivatives_only;
+    let include_spot =
+        (strategy.class != StrategyClass::Mm || strategy.is_rapidx()) && !derivatives_only;
     let mut rows = Vec::new();
     match client {
         ExchangeClient::Binance(client) => {
@@ -730,6 +767,32 @@ async fn fetch_trades(
                     .map(|value| (Leg::Derivative, value)),
             );
         }
+        ExchangeClient::Ltp(client) => {
+            // RapidX executions are portfolio-scoped rather than
+            // symbol-scoped; --symbol only narrows the normalized result.
+            let filter = symbols.iter().collect::<BTreeSet<_>>();
+            for value in client
+                .execution_history(range)
+                .await
+                .context("fetch LTP executions")?
+            {
+                let business = optional_text(&value, &["businessType"])
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let (leg, included) = match business.as_str() {
+                    "SPOT" | "MARGIN" => (Leg::Spot, include_spot),
+                    "PERP" => (Leg::Derivative, true),
+                    other => bail!("unsupported LTP execution businessType {other}"),
+                };
+                if !included {
+                    continue;
+                }
+                if !filter.is_empty() && !filter.contains(&ltp_symbol(&value)?) {
+                    continue;
+                }
+                rows.push((leg, value));
+            }
+        }
     }
     Ok(rows)
 }
@@ -757,6 +820,7 @@ async fn fetch_funding(client: &ExchangeClient, range: TimeRange) -> Result<Vec<
         ExchangeClient::Gate(client) => client.funding_fees(range).await,
         ExchangeClient::Bitget(client) => client.funding_fees(range).await,
         ExchangeClient::Okx(client) => client.funding_fees(range).await,
+        ExchangeClient::Ltp(client) => client.statement_history(range, "FUNDING_FEE").await,
     }
     .context("fetch funding history")
 }
@@ -768,6 +832,7 @@ async fn fetch_interest(client: &ExchangeClient, range: TimeRange) -> Result<Vec
         ExchangeClient::Gate(client) => client.interest_records(range).await,
         ExchangeClient::Bitget(client) => client.margin_interest(range).await,
         ExchangeClient::Okx(client) => client.interest_accrued(None, range).await,
+        ExchangeClient::Ltp(client) => client.statement_history(range, "DEDUCT_INTEREST").await,
     }
     .context("fetch interest history")
 }
@@ -871,9 +936,15 @@ async fn build_client(
     strategy: &Strategy,
     local_ip: &[IpAddr],
 ) -> Result<ExchangeClient> {
-    let local_ips = configured_or_exchange_local_ips(pool, &strategy.exchange, local_ip.to_vec())
-        .await
-        .with_context(|| format!("select {} REST source IPs", strategy.exchange))?;
+    // RapidX REST must egress from the env's own LTP source IP; the generic
+    // exchange pool deliberately selects IPs other envs do not use.
+    let local_ips = if strategy.is_rapidx() {
+        rapidx_local_ips(pool, &strategy.slug, local_ip).await?
+    } else {
+        configured_or_exchange_local_ips(pool, &strategy.exchange, local_ip.to_vec())
+            .await
+            .with_context(|| format!("select {} REST source IPs", strategy.exchange))?
+    };
     let mut dispatcher_config = DispatcherConfig {
         local_ips,
         request_timeout: Duration::from_secs(30),
@@ -887,6 +958,19 @@ async fn build_client(
         .with_context(|| format!("create {} REST dispatcher", strategy.exchange))?;
     let values = read_env(&strategy.host, &strategy.env_path)?;
     let client = match strategy.exchange.as_str() {
+        "binance" if strategy.is_rapidx() => ExchangeClient::Ltp(
+            LtpClient::new(
+                dispatcher,
+                LtpCredentials::new(
+                    env_required(&values, "LTP_API_KEY")?,
+                    env_required(&values, "LTP_API_SECRET")?,
+                ),
+                env_required(&values, "LTP_PORTFOLIO_ID")?,
+                "BINANCE",
+                values.get("LTP_REST_URL").cloned(),
+            )
+            .context("create RapidX LTP client")?,
+        ),
         "binance" => {
             let mode = match strategy.account_mode.as_str() {
                 "usdm_futures" => BinanceAccountMode::UsdmFutures,
@@ -946,6 +1030,36 @@ async fn build_client(
     Ok(client)
 }
 
+/// RapidX requests are signed with the env's own LTP key and must leave from
+/// the source IP that env registered for `ltp` traffic, which may coincide
+/// with IPs the generic pool assigns to other exchanges.
+async fn rapidx_local_ips(pool: &PgPool, slug: &str, configured: &[IpAddr]) -> Result<Vec<IpAddr>> {
+    if !configured.is_empty() {
+        return Ok(configured.to_vec());
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT host(ip) FROM rest_egress_ip_envs \
+         WHERE env=$1 AND exchange='ltp' ORDER BY ip",
+    )
+    .bind(slug)
+    .fetch_all(pool)
+    .await
+    .context("load RapidX REST source IPs")?;
+    if rows.is_empty() {
+        bail!(
+            "{slug} has no rest_egress_ip_envs row for exchange 'ltp'; \
+             register the env's LTP egress IP or pass --local-ip"
+        );
+    }
+    rows.iter()
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("parse RapidX REST source IP {value}"))
+        })
+        .collect()
+}
+
 async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
     let row: Option<(String, String, String, String, String, String, i64)> = sqlx::query_as(
         "SELECT db_schema,host,env_path,exchange,account_mode,strategy_kind,st_ms \
@@ -997,6 +1111,8 @@ fn read_env(host: &str, path: &Path) -> Result<HashMap<String, String>> {
             || name.ends_with("API_SECRET")
             || name.ends_with("SECRET_KEY")
             || name.ends_with("PASSPHRASE")
+            || name == "LTP_PORTFOLIO_ID"
+            || name == "LTP_REST_URL"
         {
             values.insert(
                 name.to_string(),
@@ -1040,10 +1156,14 @@ fn env_required_any(values: &HashMap<String, String>, keys: &[&str]) -> Result<S
 }
 fn normalize_trade(
     exchange: &str,
+    account_mode: &str,
     leg: Leg,
     raw: Value,
     gate_multipliers: &HashMap<String, f64>,
 ) -> Result<TradeRow> {
+    if account_mode == "rapidx" {
+        return normalize_ltp_trade(leg, raw);
+    }
     match exchange {
         "binance" => normalize_binance_trade(leg, raw),
         "bybit" => normalize_bybit_trade(leg, raw),
@@ -1269,6 +1389,112 @@ fn normalize_okx_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
     )
 }
 
+/// LTP `sym` is `EXCHANGE_BUSINESSTYPE_BASE_QUOTE`; the normalized symbol is
+/// the canonical `BASEQUOTE` form shared with Binance history.
+fn ltp_symbol_text(sym: &str) -> Result<String> {
+    let parts: Vec<&str> = sym.split('_').collect();
+    if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
+        bail!("unexpected LTP sym format: {sym}");
+    }
+    Ok(normalize_symbol(&format!("{}{}", parts[2], parts[3])))
+}
+
+fn ltp_symbol(raw: &Value) -> Result<String> {
+    ltp_symbol_text(&text_field(raw, &["sym"])?)
+}
+
+/// REST executions report a non-negative `fee` plus a non-negative `rebate`;
+/// the stored signed fee cost is their net when both share one currency.
+fn normalize_ltp_trade(leg: Leg, raw: Value) -> Result<TradeRow> {
+    let business = text_field(&raw, &["businessType"])?.to_ascii_uppercase();
+    let (expected_leg, market) = match business.as_str() {
+        "SPOT" => (Leg::Spot, "spot"),
+        "MARGIN" => (Leg::Spot, "margin"),
+        "PERP" => (Leg::Derivative, "usdm_futures"),
+        other => bail!("unsupported LTP businessType {other}"),
+    };
+    if leg != expected_leg {
+        bail!("LTP businessType {business} does not match leg {leg:?}");
+    }
+    let sym = text_field(&raw, &["sym"])?;
+    let exchange_type = text_field(&raw, &["exchangeType"])?;
+    let parts: Vec<&str> = sym.split('_').collect();
+    if parts.len() != 4
+        || !parts[0].eq_ignore_ascii_case(&exchange_type)
+        || !parts[1].eq_ignore_ascii_case(&business)
+    {
+        bail!("LTP sym {sym} does not match {exchange_type}/{business}");
+    }
+    let fee = number_field(&raw, &["fee"])?;
+    let fee_coin = optional_text(&raw, &["feeCoin"]).unwrap_or_else(|| "USDT".into());
+    let rebate = optional_number(&raw, &["rebate"]).unwrap_or_else(|| "0".into());
+    let fee_amount = if parse_number(&rebate)? != 0.0 {
+        let rebate_coin = optional_text(&raw, &["rebateCoin"]).unwrap_or_else(|| fee_coin.clone());
+        if !rebate_coin.eq_ignore_ascii_case(&fee_coin) {
+            bail!("LTP fee/rebate currency mismatch: {fee_coin} vs {rebate_coin}");
+        }
+        decimal_string(parse_number(&fee)? - parse_number(&rebate)?)
+    } else {
+        fee
+    };
+    make_trade(
+        leg,
+        market,
+        ltp_symbol_text(&sym)?,
+        text_field(&raw, &["transactionId"])?,
+        text_field(&raw, &["orderId"])?,
+        lower_side(&text_field(&raw, &["side"])?),
+        &lower_side(&optional_text(&raw, &["execType"]).unwrap_or_else(|| "taker".into())),
+        number_field(&raw, &["price"])?,
+        number_field(&raw, &["quantity"])?,
+        None,
+        fee_amount,
+        fee_coin,
+        optional_number(&raw, &["rpnl"]),
+        timestamp_field(&raw, &["createAt"])?,
+        raw,
+    )
+}
+
+/// Statement `deltaAmount` is the signed settlement quantity. The Binance
+/// interest convention stores the cost as a positive amount, so deductions
+/// are negated; funding stays signed as reported.
+fn normalize_ltp_cash(dataset: Dataset, raw: Value) -> Result<CashRow> {
+    let statement_type = text_field(&raw, &["statementType"])?.to_ascii_uppercase();
+    let expected = match dataset {
+        Dataset::Funding => "FUNDING_FEE",
+        Dataset::Interest => "DEDUCT_INTEREST",
+        other => bail!("LTP statements do not support {}", other.name()),
+    };
+    if statement_type != expected {
+        bail!(
+            "unexpected LTP statementType {statement_type} in {} rows",
+            dataset.name()
+        );
+    }
+    let delta = number_field(&raw, &["deltaAmount"])?;
+    let event_time_ms = timestamp_field(&raw, &["createAt"])?;
+    if event_time_ms <= 0 {
+        bail!("invalid LTP {} timestamp", dataset.name());
+    }
+    let symbol = optional_text(&raw, &["sym"])
+        .map(|sym| ltp_symbol_text(&sym))
+        .transpose()?;
+    let amount = match dataset {
+        Dataset::Funding => signed_decimal(&delta)?,
+        Dataset::Interest => negate_decimal(&delta)?,
+        _ => unreachable!(),
+    };
+    parse_number(&amount)?;
+    Ok(CashRow {
+        record_id: text_field(&raw, &["statementId"])?,
+        symbol,
+        asset: text_field(&raw, &["coin"])?.to_ascii_uppercase(),
+        amount,
+        event_time_ms,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_trade(
     leg: Leg,
@@ -1320,7 +1546,15 @@ fn make_trade(
     })
 }
 
-fn normalize_cash(exchange: &str, dataset: Dataset, raw: Value) -> Result<CashRow> {
+fn normalize_cash(
+    exchange: &str,
+    account_mode: &str,
+    dataset: Dataset,
+    raw: Value,
+) -> Result<CashRow> {
+    if account_mode == "rapidx" {
+        return normalize_ltp_cash(dataset, raw);
+    }
     let (record_id, symbol, asset, amount, event_time_ms) = match (exchange, dataset) {
         ("binance", Dataset::Funding) => (
             text_field(&raw, &["tranId"])?,
@@ -1634,6 +1868,15 @@ async fn load_trade_symbols(
 ) -> Result<Vec<String>> {
     if strategy.exchange != "binance" {
         return Ok(Vec::new());
+    }
+    if strategy.is_rapidx() {
+        // RapidX executions are portfolio-scoped; --symbol is an optional
+        // repair filter and never a discovery requirement.
+        return Ok(requested
+            .iter()
+            .map(|value| normalize_symbol(value))
+            .filter(|value| !value.is_empty())
+            .collect());
     }
     let mut symbols = requested
         .iter()
@@ -2582,6 +2825,7 @@ mod tests {
     fn gate_interest_accepts_create_time() {
         let row = normalize_cash(
             "gate",
+            "unified",
             Dataset::Interest,
             serde_json::json!({
                 "actual_rate": "0.0000044795",
@@ -2674,6 +2918,7 @@ mod tests {
     fn bitget_cash_outflow_is_negative() {
         let row = normalize_cash(
             "bitget",
+            "unified",
             Dataset::Interest,
             serde_json::json!({
                 "id": "91",
@@ -2707,5 +2952,122 @@ mod tests {
         .unwrap();
         assert!(backfill_args.no_advance_watermark);
         assert_eq!(backfill_args.symbol, vec!["COTIUSDT".to_string()]);
+    }
+
+    fn ltp_execution(business: &str) -> Value {
+        serde_json::json!({
+            "transactionId": "tx1",
+            "portfolioId": "2208503406035269",
+            "orderId": "ord1",
+            "exchangeType": "BINANCE",
+            "businessType": business,
+            "sym": format!("BINANCE_{business}_DOGE_USDT"),
+            "side": "BUY",
+            "quantity": "100",
+            "price": "0.2",
+            "fee": "0.002",
+            "feeCoin": "USDT",
+            "rebate": "0.001",
+            "rebateCoin": "USDT",
+            "rpnl": "0",
+            "clientOrderId": "cid1",
+            "execType": "MAKER",
+            "createAt": "1789572820420"
+        })
+    }
+
+    #[test]
+    fn ltp_margin_and_perp_executions_normalize_like_binance_unified() {
+        let margin = normalize_ltp_trade(Leg::Spot, ltp_execution("MARGIN")).unwrap();
+        assert_eq!(margin.market, "margin");
+        assert_eq!(margin.symbol, "DOGEUSDT");
+        assert_eq!(margin.side, "buy");
+        assert_eq!(margin.role, "maker");
+        assert_eq!(margin.fee_amount, "0.001");
+        assert_eq!(margin.fee_asset, "USDT");
+        assert_eq!(margin.event_time_ms, 1789572820420);
+
+        let perp = normalize_ltp_trade(Leg::Derivative, ltp_execution("PERP")).unwrap();
+        assert_eq!(perp.market, "usdm_futures");
+        assert_eq!(perp.symbol, "DOGEUSDT");
+        assert_eq!(perp.trade_id, "tx1");
+        assert_eq!(perp.order_id, "ord1");
+        assert_eq!(perp.realized_pnl.as_deref(), Some("0"));
+
+        assert!(normalize_ltp_trade(Leg::Spot, ltp_execution("PERP")).is_err());
+        assert!(normalize_ltp_trade(Leg::Spot, ltp_execution("OPTION")).is_err());
+        let mut mismatched = ltp_execution("MARGIN");
+        mismatched["sym"] = Value::String("BINANCE_PERP_DOGE_USDT".into());
+        assert!(normalize_ltp_trade(Leg::Spot, mismatched).is_err());
+        let mut foreign = ltp_execution("MARGIN");
+        foreign["rebateCoin"] = Value::String("BTC".into());
+        assert!(normalize_ltp_trade(Leg::Spot, foreign).is_err());
+    }
+
+    #[test]
+    fn ltp_statements_normalize_funding_signed_and_interest_as_cost() {
+        let funding = normalize_ltp_cash(
+            Dataset::Funding,
+            serde_json::json!({
+                "statementId": "s1",
+                "requestId": "r1",
+                "statementType": "FUNDING_FEE",
+                "businessType": "PERP",
+                "exchangeType": "BINANCE",
+                "coin": "USDT",
+                "sym": "BINANCE_PERP_BTC_USDT",
+                "deltaAmount": "-1.5",
+                "createAt": 1789572820420_i64
+            }),
+        )
+        .unwrap();
+        assert_eq!(funding.record_id, "s1");
+        assert_eq!(funding.symbol.as_deref(), Some("BTCUSDT"));
+        assert_eq!(funding.amount, "-1.5");
+        assert_eq!(funding.asset, "USDT");
+
+        // Binance interest convention stores the charge as a positive amount.
+        let interest = normalize_ltp_cash(
+            Dataset::Interest,
+            serde_json::json!({
+                "statementId": "s2",
+                "requestId": "r2",
+                "statementType": "DEDUCT_INTEREST",
+                "businessType": "MARGIN",
+                "exchangeType": "BINANCE",
+                "coin": "USDT",
+                "sym": "",
+                "deltaAmount": "-0.25",
+                "createAt": 1789572820420_i64
+            }),
+        )
+        .unwrap();
+        assert_eq!(interest.amount, "0.25");
+        assert!(interest.symbol.is_none());
+
+        assert!(
+            normalize_ltp_cash(
+                Dataset::Interest,
+                serde_json::json!({
+                    "statementId": "s3",
+                    "statementType": "FUNDING_FEE",
+                    "coin": "USDT",
+                    "deltaAmount": "1",
+                    "createAt": 1789572820420_i64
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rapidx_supports_executions_and_statements_only() {
+        let mut rapidx = strategy("binance", StrategyClass::Mm);
+        rapidx.account_mode = "rapidx".into();
+        assert!(rapidx.supports(Dataset::Trades));
+        assert!(rapidx.supports(Dataset::Funding));
+        assert!(rapidx.supports(Dataset::Interest));
+        assert!(!rapidx.supports(Dataset::Rebates));
+        assert!(!rapidx.supports(Dataset::Liquidations));
     }
 }

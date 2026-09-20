@@ -49,6 +49,7 @@ struct LiveHistoryStrategy {
     db_schema: String,
     env_path: String,
     exchange: String,
+    account_mode: String,
     strategy_kind: String,
     st_ms: i64,
     schedule_offset_minutes: i64,
@@ -289,7 +290,8 @@ async fn load_automatic_alignment_enabled(pool: &PgPool, slug: &str) -> Result<b
 
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
     sqlx::query_as(
-        r#"SELECT s.slug, s.db_schema, s.env_path, s.exchange, s.strategy_kind, s.st_ms,
+        r#"SELECT s.slug, s.db_schema, s.env_path, s.exchange, s.account_mode, s.strategy_kind,
+                  s.st_ms,
                   (ROW_NUMBER() OVER (
                     PARTITION BY s.exchange ORDER BY s.sort_order, s.slug
                   ) - 1)::bigint AS schedule_offset_minutes
@@ -297,6 +299,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
            WHERE enabled
              AND (
                (host = 'local' AND exchange = 'binance' AND strategy_kind = 'funding_rate')
+               OR (host = 'local' AND account_mode = 'rapidx')
                OR slug IN (
                  'binance-intra-arb01',
                  'binance_mm_alpha',
@@ -481,7 +484,11 @@ fn order_synthesis_enabled(slug: &str) -> bool {
 }
 
 fn uses_online_symbols(strategy: &LiveHistoryStrategy) -> bool {
-    strategy.exchange == "binance" && strategy.strategy_kind != "market_making"
+    // RapidX executions are portfolio-scoped, so no online symbol discovery
+    // or per-symbol backfill is needed; the LTP history covers every leg.
+    strategy.exchange == "binance"
+        && strategy.strategy_kind != "market_making"
+        && strategy.account_mode != "rapidx"
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -686,6 +693,11 @@ fn run_order_synthesis(config: &LiveHistoryConfig, slug: &str) -> Result<String>
 }
 
 fn account_datasets(strategy: &LiveHistoryStrategy) -> &'static [&'static str] {
+    if strategy.account_mode == "rapidx" {
+        // RapidX statements carry funding and interest; executions sync via
+        // the trades dataset and no liquidation history endpoint exists.
+        return &["funding", "interest"];
+    }
     match (strategy.exchange.as_str(), strategy.strategy_kind.as_str()) {
         ("binance", "funding_rate") | ("gate", "funding_rate") => {
             &["funding", "interest", "liquidations"]
@@ -986,6 +998,7 @@ mod tests {
             db_schema: slug.replace('-', "_"),
             env_path: format!("/home/ubuntu/{slug}/env.sh"),
             exchange: exchange.to_string(),
+            account_mode: "unified".to_string(),
             strategy_kind: strategy_kind.to_string(),
             st_ms: 1_000,
             schedule_offset_minutes: 0,
@@ -1060,6 +1073,9 @@ mod tests {
             account_datasets(&strategy("bitget_fr_arb02", "bitget", "funding_rate")),
             ["funding", "interest"]
         );
+        let mut rapidx = strategy("binance_cta_rx01", "binance", "cta");
+        rapidx.account_mode = "rapidx".to_string();
+        assert_eq!(account_datasets(&rapidx), ["funding", "interest"]);
     }
 
     #[test]
@@ -1097,6 +1113,9 @@ mod tests {
             "binance",
             "intra_exchange"
         )));
+        let mut rapidx = strategy("binance_cta_rx01", "binance", "cta");
+        rapidx.account_mode = "rapidx".to_string();
+        assert!(!uses_online_symbols(&rapidx));
     }
 
     #[test]

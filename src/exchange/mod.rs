@@ -6,6 +6,7 @@ pub mod binance;
 pub mod bitget;
 pub mod bybit;
 pub mod gate;
+pub mod ltp;
 pub mod okx;
 
 pub use error::ExchangeError;

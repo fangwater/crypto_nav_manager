@@ -15,6 +15,7 @@
 | bitget_fr_self | funding_rate_analysis/fr_ltpbitget.ipynb | BitgetUnified / BitgetClient |
 | okx_fr_self | funding_rate_analysis/fr_okx_self.ipynb | OkxUnified / OkxClient |
 | gate_fr_self | funding_rate_analysis/fr_ltpgate.ipynb | GateUnified / GateClient |
+| binance_cta_rx01 | rapidx_account_monitor（RapidX/LTP） | RapidX / LtpClient |
 
 外部资金、自营、nova01、nova02 是账户身份，不是交易所 API 模式。每个身份必须使用独立凭证；共享同一交易所和出口 IP 池的账户应克隆同一个 Dispatcher，以共享 IP 级限频状态。
 
@@ -134,6 +135,36 @@ Gate 合约私有请求自动带 X-Gate-Size-Decimal: 1，避免整数张数响�
 成交和账单使用 begin/end 过滤，interest-accrued、funding-rate-history 和 positions-history 从查询
 结束时间向更早记录分页。强平查询分别请求 type=3（全量强平）和 type=4（部分强平），不混入 ADL。
 
+## RapidX / LTP
+
+RapidX 类账户（`account_mode = 'rapidx'`）由 LiquidityTech 代理底层交易所，NAV 通过 LTP REST
+读取组合级历史，`exchange` 仍登记为底层交易所（如 `binance`）以复用同一套估值与 PnL 口径。
+签名方式是把排序后的原始查询参数与 nonce 拼接后做 HMAC-SHA256，结果为小写 hex。
+
+| 能力 | REST API |
+| --- | --- |
+| 最近约 7 天成交 | GET /api/v1/trading/executions/pageable |
+| 约 7～90 天前归档成交 | GET /api/v1/trading/archive/executions/pageable |
+| 资金费、借贷利息等账务流水 | GET /api/v1/trading/statement |
+| 账户资产 | GET /api/v1/trading/portfolio/assets |
+| 账户仓位 | GET /api/v1/trading/position |
+
+成交拉取按 `page`/`pageSize`（最大 1000）分页，限频 5 req/10s，需要 READ 权限。实现按 7 天
+边界把请求区间拆到 recent/archive 两个端点，各自逐页校验分页包络（页码、页数、页容量、总条数）
+并按 `transactionId` 去重。`businessType` 区分 SPOT、MARGIN、PERP；`sym` 形如
+`BINANCE_PERP_BTC_USDT`，归一化后与 Binance 统一账户同口径写入 `trades` 表（SPOT→spot、
+MARGIN→margin、PERP→usdm_futures）。费用字段使用 `fee`/`feeCoin` 与 `rebate`/`rebateCoin`
+（旧 `tradingFee`/`tradingFeeCoin` 已废弃，2026-11-15 后移除）；同币种时净费用按
+`fee - rebate` 入库。`rpnl` 映射到 `realized_pnl`，`execType` 映射 MAKER/TAKER。
+
+`statement` 流水同样分页拉取，`statementType` 过滤 `FUNDING_FEE`（写入 `funding`，保留
+`deltaAmount` 符号）与 `DEDUCT_INTEREST`（写入 `interest`，取负后按 Binance 口径记为正数成本）。
+statement 的 `createAt` 为微秒、execution 的 `createAt` 为毫秒，入库前统一换算成毫秒。
+
+LTP 历史只保留约 90 天，无法事后回补更久以前的数据，因此 rapidx 账户必须持续增量同步：首次
+从 `st_ms` 起拉满可及窗口，之后依赖共享水位线继续推进。账户净值与仓位由 RapidX monitor 的
+账户快照（`/cta/<env>/snapshot`）与 IPC 风险推送提供，REST 资产/仓位接口仅作兜底校验。
+
 ## 手续费口径
 
 - 历史实际手续费随成交明细返回：Binance 使用 commission / commissionAsset，Gate 使用 fee，Bitget 使用 feeDetail，OKX 使用 fee / feeCcy。持久化表 trade_fills 已提供 fee_amount、fee_asset 和 fee_usdt，无需重复建立手续费流水表。
@@ -159,3 +190,4 @@ Gate 合约私有请求自动带 X-Gate-Size-Decimal: 1，避免整数张数响�
 - [Gate API v4](https://www.gate.com/docs/developers/apiv4/en/)
 - [Bitget UTA API](https://www.bitget.com/api-doc/uta/intro)
 - [OKX API v5](https://www.okx.com/docs-v5/)
+- [LTP API](https://apidocliquidity.readme.io/)

@@ -37,6 +37,10 @@ impl PnlSourceKind {
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
             ("cta", "binance", "usdm_futures") => Some(Self::MarketMaking),
+            // RapidX/LTP portfolios carry spot/margin plus perpetual legs with
+            // funding and interest statements, matching the unified-account
+            // spot+swap history shape.
+            ("cta", "binance", "rapidx") => Some(Self::FundingRate),
             _ => None,
         }
     }
@@ -2788,6 +2792,10 @@ mod tests {
         assert_eq!(
             PnlSourceKind::for_strategy("cta", "binance", "usdm_futures"),
             Some(PnlSourceKind::MarketMaking)
+        );
+        assert_eq!(
+            PnlSourceKind::for_strategy("cta", "binance", "rapidx"),
+            Some(PnlSourceKind::FundingRate)
         );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
     }
