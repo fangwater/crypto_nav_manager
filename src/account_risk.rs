@@ -45,6 +45,36 @@ impl AccountRiskFeed {
             sort_order,
         })
     }
+
+    /// RapidX account monitors publish under
+    /// `<slug>/account_pubs/rapidx_<exchange>_<portfolio_id>_pm`, matching the
+    /// `account_stream_slug` convention of the trading stack.
+    pub fn rapidx(
+        strategy_slug: String,
+        exchange: String,
+        portfolio_id: &str,
+        sort_order: i32,
+    ) -> Option<Self> {
+        let service_exchange = match exchange.as_str() {
+            "binance" => "binance",
+            "okx" => "okex",
+            _ => return None,
+        };
+        if portfolio_id.is_empty()
+            || portfolio_id.len() > 64
+            || !portfolio_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let service_name =
+            format!("{strategy_slug}/account_pubs/rapidx_{service_exchange}_{portfolio_id}_pm");
+        Some(Self {
+            strategy_slug,
+            exchange,
+            service_name,
+            sort_order,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -543,5 +573,23 @@ mod tests {
     fn maps_okx_strategy_to_okex_service_name() {
         let feed = AccountRiskFeed::new("okex_fr_arb01".into(), "okx".into(), 1).unwrap();
         assert_eq!(feed.service_name, "okex_fr_arb01/account_pubs/okex_pm");
+    }
+
+    #[test]
+    fn maps_rapidx_feed_to_portfolio_scoped_service_name() {
+        let feed = AccountRiskFeed::rapidx(
+            "binance_cta_rx01".into(),
+            "binance".into(),
+            "2208503406035269",
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            feed.service_name,
+            "binance_cta_rx01/account_pubs/rapidx_binance_2208503406035269_pm"
+        );
+        assert_eq!(feed.exchange, "binance");
+        assert!(AccountRiskFeed::rapidx("s".into(), "binance".into(), "abc", 1).is_none());
+        assert!(AccountRiskFeed::rapidx("s".into(), "gate".into(), "123", 1).is_none());
     }
 }

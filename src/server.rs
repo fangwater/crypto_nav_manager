@@ -80,7 +80,10 @@ struct FrLimitStrategyRecord {
 #[derive(Debug, FromRow)]
 struct AccountRiskFeedRecord {
     slug: String,
+    host: String,
+    env_path: String,
     exchange: String,
+    account_mode: String,
     sort_order: i32,
 }
 
@@ -599,7 +602,7 @@ pub async fn run() -> Result<()> {
             .await
             .context("run PostgreSQL migrations")?;
         let account_risk_feeds = sqlx::query_as::<_, AccountRiskFeedRecord>(
-            r#"SELECT slug,exchange,sort_order
+            r#"SELECT slug,host,env_path,exchange,account_mode,sort_order
                FROM strategy_envs
                WHERE enabled
                  AND host = 'local'
@@ -614,7 +617,7 @@ pub async fn run() -> Result<()> {
         .await
         .context("load local account risk feeds")?
         .into_iter()
-        .filter_map(|row| AccountRiskFeed::new(row.slug, row.exchange, row.sort_order))
+        .filter_map(|row| account_risk_feed(&row))
         .collect();
         let account_risks = AccountRiskCache::start(account_risk_feeds);
         contract_multipliers::spawn(pool.clone());
@@ -2816,6 +2819,46 @@ fn assigned_env_keys(content: &str) -> HashMap<String, bool> {
             Some((key.to_string(), assigned))
         })
         .collect()
+}
+
+fn account_risk_feed(row: &AccountRiskFeedRecord) -> Option<AccountRiskFeed> {
+    if row.account_mode != "rapidx" {
+        return AccountRiskFeed::new(row.slug.clone(), row.exchange.clone(), row.sort_order);
+    }
+    // RapidX monitors publish account_pubs/rapidx_<exchange>_<portfolio>_pm,
+    // so the feed name needs LTP_PORTFOLIO_ID from the env file.
+    let content = match read_env_file(&row.host, Path::new(&row.env_path)) {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(host = %row.host, path = %row.env_path, %error, "rapidx account risk env unavailable");
+            return None;
+        }
+    };
+    let feed = env_value(&content, "LTP_PORTFOLIO_ID")
+        .as_deref()
+        .and_then(|id| {
+            AccountRiskFeed::rapidx(row.slug.clone(), row.exchange.clone(), id, row.sort_order)
+        });
+    if feed.is_none() {
+        warn!(slug = %row.slug, "rapidx account risk feed lacks a valid LTP_PORTFOLIO_ID");
+    }
+    feed
+}
+
+fn env_value(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn valid_schema(schema: &str) -> bool {
