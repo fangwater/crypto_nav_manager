@@ -32,6 +32,16 @@ Gateway: Nginx on 4191 (`/nav/` and `/nav-api/`)
 All builds run on the local powerleader machine. The remote host only keeps
 its git worktree synchronized with `origin/master` and receives the built
 artifacts; do not run `cargo build`, `npm`, or Vite builds on the remote host.
+On powerleader, `.cargo/config.toml` redirects builds to
+`/mnt/nvme-raid0-28t/fanghaizhou/cargo-target/crypto_nav_manager/` — the
+repo-local `target/` directory is a stale leftover; never upload binaries
+from it. `sqlx::migrate!` embeds `migrations/` at compile time in every
+binary that runs migrations (`crypto_nav_manager`, `reconcile_rocksdb`,
+`sync_history`, `sync_fee_rates`, `sync_intra_orders`,
+`sync_intra_hourly_latency`, `fee_rate_probe`): once a migration has been
+applied to the database, any older binary still on the remote host fails
+startup with "migration N previously applied but is missing", so deploy all
+of these binaries together.
 Both machines are currently Ubuntu 24.04 x86_64 (glibc 2.39), so locally built
 binaries are directly compatible — re-check `ldd --version` on both sides if
 either OS changes.
