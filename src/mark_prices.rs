@@ -420,7 +420,7 @@ fn run_ipc_listener(cache: MarkPriceCache) {
     let mut feeds = [
         IpcFeed::new(
             MarkPriceExchange::Binance,
-            "dat_pbs/binance-futures/derivatives",
+            "dat_pbs_proxy/binance-futures/derivatives",
         ),
         IpcFeed::new(MarkPriceExchange::Gate, "dat_pbs/gate-futures/derivatives"),
         IpcFeed::new(MarkPriceExchange::Okx, "dat_pbs/okex-futures/derivatives"),
