@@ -1874,6 +1874,17 @@ fn expected_history_datasets(
     const BINANCE_INTRA: &[&str] = &["trades", "funding", "interest"];
     const BYBIT_INTRA: &[&str] = &["trades", "funding", "interest"];
     const MM: &[&str] = &["trades"];
+    const RAPIDX_FUTURES: &[&str] = &["trades", "funding", "interest"];
+
+    if matches!(
+        slug,
+        "binance_cta_special_rx02" | "binance_cta_special_rx03"
+    ) && host == "local"
+        && exchange == "binance"
+        && strategy_kind == "market_making"
+    {
+        return Some(RAPIDX_FUTURES);
+    }
 
     let scheduled = (host == "local" && exchange == "binance" && strategy_kind == "funding_rate")
         || matches!(
@@ -1890,6 +1901,7 @@ fn expected_history_datasets(
                 | "bitget_fr_arb02"
                 | "gate_fr_arb01"
                 | "gate_fr_arb02"
+                | "gate_fr_arb03"
         );
     if !scheduled {
         return None;
@@ -3108,6 +3120,19 @@ mod tests {
         assert_eq!(
             expected_history_datasets("binance_exec_trade02", "local", "binance", "cta"),
             Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets(
+                "binance_cta_special_rx02",
+                "local",
+                "binance",
+                "market_making",
+            ),
+            Some(["trades", "funding", "interest"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("gate_fr_arb03", "local", "gate", "funding_rate"),
+            Some(["trades", "funding", "interest", "liquidations"].as_slice())
         );
         assert_eq!(
             expected_history_datasets("okex_mm_alpha", "local", "okx", "market_making"),

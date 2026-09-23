@@ -1,7 +1,6 @@
 import {
   Activity,
   ArrowRight,
-  Ban,
   CheckCircle2,
   CircleAlert,
   Clock3,
@@ -420,12 +419,6 @@ export function IndexPage({
               </div>
             </div>
           </div>
-        </section>
-
-        <section className="retired-notice" aria-label="已停用盘子">
-          <Ban size={16} />
-          <strong>binance nova01 / nova02 / mm alpha</strong>
-          <span>已停用，不再拉取</span>
         </section>
 
         {loading && (

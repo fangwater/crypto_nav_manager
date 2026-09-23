@@ -25,6 +25,7 @@ pub enum PnlSourceKind {
     Intra,
     FundingRate,
     MarketMaking,
+    FuturesMarketMaking,
     Cta,
 }
 
@@ -37,6 +38,7 @@ impl PnlSourceKind {
             | ("funding_rate", "bybit" | "gate" | "bitget", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
+            ("market_making", "binance", "rapidx") => Some(Self::FuturesMarketMaking),
             ("cta", "binance", "usdm_futures") => Some(Self::Cta),
             // RapidX/LTP portfolios carry spot/margin plus perpetual legs with
             // funding and interest statements, matching the unified-account
@@ -50,6 +52,7 @@ impl PnlSourceKind {
         match self {
             Self::Intra | Self::FundingRate => "spot_swap_history_v1",
             Self::MarketMaking => "market_making_futures_v1",
+            Self::FuturesMarketMaking => "market_making_futures_qty",
             Self::Cta => "cta_futures_v1",
         }
     }
@@ -344,9 +347,10 @@ impl Default for VenueFifo {
 impl VenueFifo {
     fn for_source(source: PnlSourceKind) -> Self {
         match source {
-            PnlSourceKind::Intra | PnlSourceKind::FundingRate | PnlSourceKind::Cta => {
-                Self::Quantity(QuantityFifoPnl::default())
-            }
+            PnlSourceKind::Intra
+            | PnlSourceKind::FundingRate
+            | PnlSourceKind::Cta
+            | PnlSourceKind::FuturesMarketMaking => Self::Quantity(QuantityFifoPnl::default()),
             PnlSourceKind::MarketMaking => Self::default(),
         }
     }
@@ -640,9 +644,10 @@ pub async fn load_inputs(
             )
             .await
         }
-        (PnlSourceKind::MarketMaking | PnlSourceKind::Cta, exchange) => {
-            load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
-        }
+        (
+            PnlSourceKind::MarketMaking | PnlSourceKind::FuturesMarketMaking | PnlSourceKind::Cta,
+            exchange,
+        ) => load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await,
         _ => bail!("unsupported PnL source {source:?} for exchange {exchange}"),
     }
 }
@@ -2650,7 +2655,7 @@ mod tests {
 
     #[test]
     fn cta_uses_quantity_fifo_for_equal_size_fills_at_different_prices() {
-        let inputs = PnlInputs {
+        let mut inputs = PnlInputs {
             trades: vec![
                 NormalizedTrade {
                     symbol: "BTCUSDT".to_string(),
@@ -2688,12 +2693,24 @@ mod tests {
         let mut calculation = request(1_000, 1_400);
         calculation.source = PnlSourceKind::Cta;
 
-        let response = calculate(inputs, calculation).unwrap();
+        let response = calculate(inputs.clone(), calculation.clone()).unwrap();
         assert_eq!(response.source.adapter, "cta_futures_v1");
         assert!((response.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
         assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
         assert_eq!(response.summary.open_amount_usdt, 300.0);
         assert_eq!(response.points.last().unwrap().futures_position_qty, 1.0);
+
+        inputs.funding.push(FundingEvent {
+            symbol: "BTCUSDT".to_string(),
+            amount_usdt: 5.0,
+            ts: 1_350,
+        });
+        calculation.source = PnlSourceKind::FuturesMarketMaking;
+        let response = calculate(inputs, calculation).unwrap();
+        assert_eq!(response.source.adapter, "market_making_futures_qty");
+        assert!((response.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 105.0).abs() < 1e-9);
+        assert_eq!(response.summary.open_amount_usdt, 300.0);
     }
 
     #[test]
@@ -2846,6 +2863,10 @@ mod tests {
         assert_eq!(
             PnlSourceKind::for_strategy("cta", "binance", "rapidx"),
             Some(PnlSourceKind::FundingRate)
+        );
+        assert_eq!(
+            PnlSourceKind::for_strategy("market_making", "binance", "rapidx"),
+            Some(PnlSourceKind::FuturesMarketMaking)
         );
         assert_eq!(PnlSourceKind::for_strategy("cta", "bybit", "unified"), None);
     }

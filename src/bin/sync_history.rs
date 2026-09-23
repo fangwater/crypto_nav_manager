@@ -119,6 +119,7 @@ struct Strategy {
     env_path: PathBuf,
     exchange: String,
     account_mode: String,
+    strategy_kind: String,
     class: StrategyClass,
     st_ms: i64,
 }
@@ -126,6 +127,12 @@ struct Strategy {
 impl Strategy {
     fn is_rapidx(&self) -> bool {
         self.account_mode == "rapidx"
+    }
+
+    fn include_spot_trades(&self, derivatives_only: bool) -> bool {
+        !derivatives_only
+            && (self.class != StrategyClass::Mm
+                || (self.is_rapidx() && self.strategy_kind == "cta"))
     }
 
     fn supports(&self, dataset: Dataset) -> bool {
@@ -664,8 +671,7 @@ async fn fetch_trades(
     range: TimeRange,
     derivatives_only: bool,
 ) -> Result<Vec<(Leg, Value)>> {
-    let include_spot =
-        (strategy.class != StrategyClass::Mm || strategy.is_rapidx()) && !derivatives_only;
+    let include_spot = strategy.include_spot_trades(derivatives_only);
     let mut rows = Vec::new();
     match client {
         ExchangeClient::Binance(client) => {
@@ -1087,6 +1093,7 @@ async fn load_strategy(pool: &PgPool, slug: &str) -> Result<Strategy> {
         env_path: PathBuf::from(env_path),
         exchange: exchange.to_ascii_lowercase(),
         account_mode,
+        strategy_kind: kind,
         class,
         st_ms,
     })
@@ -2626,6 +2633,12 @@ mod tests {
             env_path: PathBuf::new(),
             exchange: exchange.into(),
             account_mode: "unified".into(),
+            strategy_kind: match class {
+                StrategyClass::Mm => "market_making",
+                StrategyClass::Fr => "funding_rate",
+                StrategyClass::Intra => "intra_exchange",
+            }
+            .into(),
             class,
             st_ms: 1_000_000,
         }
@@ -2637,6 +2650,18 @@ mod tests {
         assert!(strategy("binance", StrategyClass::Intra).supports(Dataset::Interest));
         assert!(strategy("bybit", StrategyClass::Intra).supports(Dataset::Interest));
         assert!(strategy("bitget", StrategyClass::Fr).supports(Dataset::Interest));
+    }
+
+    #[test]
+    fn rapidx_futures_market_making_skips_spot_without_affecting_cta() {
+        let mut strategy = strategy("binance", StrategyClass::Mm);
+        strategy.account_mode = "rapidx".into();
+        assert!(!strategy.include_spot_trades(false));
+        assert!(strategy.supports(Dataset::Funding));
+        assert!(strategy.supports(Dataset::Interest));
+        strategy.strategy_kind = "cta".into();
+        assert!(strategy.include_spot_trades(false));
+        assert!(!strategy.include_spot_trades(true));
     }
 
     #[test]

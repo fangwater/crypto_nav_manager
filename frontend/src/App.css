@@ -503,34 +503,6 @@
   background: #eaf6f3;
 }
 
-.retired-notice {
-  min-height: 38px;
-  margin: 12px 0 20px;
-  padding: 8px 12px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  border-top: 1px solid #d8dce2;
-  border-bottom: 1px solid #d8dce2;
-  color: var(--subtle);
-  font-size: 11px;
-}
-
-.retired-notice svg {
-  color: #7b8490;
-}
-
-.retired-notice strong {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.retired-notice span {
-  margin-left: auto;
-  color: #9a5f18;
-  font-weight: 650;
-}
-
 .alignment-check {
   min-height: 45px;
   margin-top: 12px;
@@ -944,16 +916,6 @@
 }
 
 @media (max-width: 640px) {
-  .retired-notice {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .retired-notice span {
-    width: 100%;
-    margin-left: 25px;
-  }
-
   .alignment-detail {
     grid-template-columns: 18px minmax(0, 1fr) auto;
   }
