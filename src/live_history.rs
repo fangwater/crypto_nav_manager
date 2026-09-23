@@ -304,6 +304,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'binance-intra-arb01',
                  'binance_mm_alpha',
                  'binance_exec_trade01',
+                 'binance_exec_trade02',
                  'bybit_mm_alpha',
                  'okex_mm_alpha',
                  'bybit-intra-arb01',
@@ -334,13 +335,15 @@ fn sync_strategy(
         let online = if strategy.strategy_kind == "cta" {
             match load_cta_manager_symbols(config, &strategy) {
                 Ok(entries) => {
-                    backfill_cta_symbols(
-                        config,
-                        &strategy,
-                        &entries,
-                        &recent_symbols,
-                        &mut summaries,
-                    );
+                    if !recent_symbols.is_empty() {
+                        backfill_cta_symbols(
+                            config,
+                            &strategy,
+                            &entries,
+                            &recent_symbols,
+                            &mut summaries,
+                        );
+                    }
                     entries.into_iter().map(|entry| entry.symbol).collect()
                 }
                 Err(error) => {

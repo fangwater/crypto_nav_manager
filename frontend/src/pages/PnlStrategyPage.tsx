@@ -323,13 +323,18 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
       .then(([nextStrategy, snapshots, selectedSnapshot]) => {
         const now = Date.now()
         const effectiveStart = selectedSnapshot?.snapshotTsMs ?? nextStrategy.stMs
+        const defaultRangeDays =
+          nextStrategy.strategyKind === 'cta' &&
+          nextStrategy.accountMode === 'usdm_futures'
+            ? 1
+            : DEFAULT_RANGE_DAYS
         setStrategy(nextStrategy)
         setSnapshotHistory(snapshots)
         setInitialSnapshotState(selectedSnapshot)
         setSelectedSnapshotTs(selectedSnapshot?.snapshotTsMs ?? snapshots[0]?.snapshotTsMs ?? null)
         const defaultStart = Math.max(
           effectiveStart,
-          now - DEFAULT_RANGE_DAYS * DAY_MS,
+          now - defaultRangeDays * DAY_MS,
         )
         setStartInput(toDatetimeLocal(defaultStart))
         setEndInput(toDatetimeLocal(now))

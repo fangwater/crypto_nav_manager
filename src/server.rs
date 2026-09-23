@@ -1880,6 +1880,7 @@ fn expected_history_datasets(
             slug,
             "binance_mm_alpha"
                 | "binance_exec_trade01"
+                | "binance_exec_trade02"
                 | "bybit_mm_alpha"
                 | "okex_mm_alpha"
                 | "binance-intra-arb01"
@@ -3102,6 +3103,10 @@ mod tests {
         );
         assert_eq!(
             expected_history_datasets("binance_exec_trade01", "local", "binance", "cta"),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("binance_exec_trade02", "local", "binance", "cta"),
             Some(["trades"].as_slice())
         );
         assert_eq!(

@@ -25,6 +25,7 @@ pub enum PnlSourceKind {
     Intra,
     FundingRate,
     MarketMaking,
+    Cta,
 }
 
 impl PnlSourceKind {
@@ -36,7 +37,7 @@ impl PnlSourceKind {
             | ("funding_rate", "bybit" | "gate" | "bitget", "unified") => Some(Self::FundingRate),
             ("market_making", "binance", "usdm_futures")
             | ("market_making", "bybit" | "gate" | "okx", "unified") => Some(Self::MarketMaking),
-            ("cta", "binance", "usdm_futures") => Some(Self::MarketMaking),
+            ("cta", "binance", "usdm_futures") => Some(Self::Cta),
             // RapidX/LTP portfolios carry spot/margin plus perpetual legs with
             // funding and interest statements, matching the unified-account
             // spot+swap history shape.
@@ -49,6 +50,7 @@ impl PnlSourceKind {
         match self {
             Self::Intra | Self::FundingRate => "spot_swap_history_v1",
             Self::MarketMaking => "market_making_futures_v1",
+            Self::Cta => "cta_futures_v1",
         }
     }
 
@@ -342,7 +344,7 @@ impl Default for VenueFifo {
 impl VenueFifo {
     fn for_source(source: PnlSourceKind) -> Self {
         match source {
-            PnlSourceKind::Intra | PnlSourceKind::FundingRate => {
+            PnlSourceKind::Intra | PnlSourceKind::FundingRate | PnlSourceKind::Cta => {
                 Self::Quantity(QuantityFifoPnl::default())
             }
             PnlSourceKind::MarketMaking => Self::default(),
@@ -638,7 +640,7 @@ pub async fn load_inputs(
             )
             .await
         }
-        (PnlSourceKind::MarketMaking, exchange) => {
+        (PnlSourceKind::MarketMaking | PnlSourceKind::Cta, exchange) => {
             load_market_making_inputs(pool, schema, exchange, strategy_start_ms, end_ms).await
         }
         _ => bail!("unsupported PnL source {source:?} for exchange {exchange}"),
@@ -2647,6 +2649,54 @@ mod tests {
     }
 
     #[test]
+    fn cta_uses_quantity_fifo_for_equal_size_fills_at_different_prices() {
+        let inputs = PnlInputs {
+            trades: vec![
+                NormalizedTrade {
+                    symbol: "BTCUSDT".to_string(),
+                    side: Side::Buy,
+                    leg: PositionLeg::Futures,
+                    price: 100.0,
+                    amount_u: 100.0,
+                    quantity: 1.0,
+                    fee_usdt: Some(0.0),
+                    ts: 1_100,
+                },
+                NormalizedTrade {
+                    symbol: "BTCUSDT".to_string(),
+                    side: Side::Sell,
+                    leg: PositionLeg::Futures,
+                    price: 200.0,
+                    amount_u: 200.0,
+                    quantity: 1.0,
+                    fee_usdt: Some(0.0),
+                    ts: 1_200,
+                },
+                NormalizedTrade {
+                    symbol: "BTCUSDT".to_string(),
+                    side: Side::Buy,
+                    leg: PositionLeg::Futures,
+                    price: 300.0,
+                    amount_u: 300.0,
+                    quantity: 1.0,
+                    fee_usdt: Some(0.0),
+                    ts: 1_300,
+                },
+            ],
+            ..PnlInputs::default()
+        };
+        let mut calculation = request(1_000, 1_400);
+        calculation.source = PnlSourceKind::Cta;
+
+        let response = calculate(inputs, calculation).unwrap();
+        assert_eq!(response.source.adapter, "cta_futures_v1");
+        assert!((response.summary.fee_before_pnl_usdt - 100.0).abs() < 1e-9);
+        assert!((response.summary.total_pnl_usdt - 100.0).abs() < 1e-9);
+        assert_eq!(response.summary.open_amount_usdt, 300.0);
+        assert_eq!(response.points.last().unwrap().futures_position_qty, 1.0);
+    }
+
+    #[test]
     fn spot_base_rebate_increases_signed_position() {
         assert_eq!(
             spot_swap_position_quantity(
@@ -2791,7 +2841,7 @@ mod tests {
         );
         assert_eq!(
             PnlSourceKind::for_strategy("cta", "binance", "usdm_futures"),
-            Some(PnlSourceKind::MarketMaking)
+            Some(PnlSourceKind::Cta)
         );
         assert_eq!(
             PnlSourceKind::for_strategy("cta", "binance", "rapidx"),
