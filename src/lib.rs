@@ -17,6 +17,7 @@ pub mod ops_monitor;
 pub mod pnl;
 pub mod postgres;
 mod quantity_fifo_pnl;
+pub mod reconcile_cleanup;
 pub mod rest_dispatcher;
 pub mod rest_ip_pool;
 pub mod runtime;

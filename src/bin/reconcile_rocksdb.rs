@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, TimeZone, Utc};
 use clap::Parser;
+use crypto_nav_manager::reconcile_cleanup::cleanup_default_stale_work_dirs;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::{
@@ -390,6 +391,9 @@ struct PgTradeRow {
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+    if let Err(error) = cleanup_default_stale_work_dirs() {
+        eprintln!("stale reconciliation directory cleanup failed: {error:#}");
+    }
     let pool = connect_postgres(args.database_url.as_deref()).await?;
     sqlx::migrate!("./migrations")
         .run(&pool)
