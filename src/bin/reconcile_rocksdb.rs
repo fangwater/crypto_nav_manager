@@ -24,6 +24,7 @@ const SUPPORTED: [&str; 5] = [
     "bybit-intra-arb01",
     "bybit-intra-arb02",
 ];
+const MAX_PERSISTED_GROUPS: usize = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "Reconcile PostgreSQL trades with persisted RocksDB fills")]
@@ -77,6 +78,175 @@ struct Args {
 
     #[arg(long)]
     cleanup_on_success: bool,
+
+    /// Retain CSV and Parquet exports for troubleshooting, including failed runs.
+    #[arg(long)]
+    keep_work_dir: bool,
+}
+
+struct WorkDirGuard {
+    work_root: PathBuf,
+    reports_root: PathBuf,
+    cleanup_on_success: bool,
+    keep_work_dir: bool,
+    succeeded: bool,
+    finished: bool,
+}
+
+impl WorkDirGuard {
+    fn new(work_root: PathBuf, cleanup_on_success: bool, keep_work_dir: bool) -> Self {
+        let run_name = work_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("custom");
+        let reports_root = env::temp_dir()
+            .join("crypto_nav_rocksdb_reconcile_reports")
+            .join(format!("{run_name}-{}", Utc::now().timestamp_micros()));
+        Self::with_reports_root(work_root, reports_root, cleanup_on_success, keep_work_dir)
+    }
+
+    fn with_reports_root(
+        work_root: PathBuf,
+        reports_root: PathBuf,
+        cleanup_on_success: bool,
+        keep_work_dir: bool,
+    ) -> Self {
+        Self {
+            work_root,
+            reports_root,
+            cleanup_on_success,
+            keep_work_dir,
+            succeeded: false,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, succeeded: bool) -> Result<PathBuf> {
+        self.succeeded = succeeded;
+        let summary_path = self.finalize()?;
+        self.finished = true;
+        Ok(summary_path)
+    }
+
+    fn finalize(&self) -> Result<PathBuf> {
+        let report_result = if self.succeeded {
+            Ok(self.work_root.join("summary.json"))
+        } else {
+            persist_small_reports(&self.work_root, &self.reports_root)
+                .map(|()| self.reports_root.join("summary.json"))
+        };
+        let cleanup_result = if !self.keep_work_dir && (!self.succeeded || self.cleanup_on_success)
+        {
+            fs::remove_dir_all(&self.work_root)
+                .with_context(|| format!("remove work directory {}", self.work_root.display()))
+        } else {
+            Ok(())
+        };
+        cleanup_result?;
+        report_result
+    }
+}
+
+struct RemoteWorkGuard {
+    host: String,
+    path: String,
+    keep: bool,
+}
+
+impl Drop for RemoteWorkGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let mut cleanup = Command::new("ssh");
+            cleanup.args([&self.host, "rm", "-rf", "--", &self.path]);
+            if let Err(error) = run(&mut cleanup) {
+                eprintln!("remote cleanup failed for {}: {error:#}", self.path);
+            }
+        }
+    }
+}
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = self.finalize() {
+                eprintln!("reconciliation work directory cleanup failed: {error:#}");
+            }
+        }
+    }
+}
+
+fn persist_small_reports(work_root: &Path, reports_root: &Path) -> Result<()> {
+    fs::create_dir_all(reports_root)?;
+    let mut top_summary = read_or_fallback_summary(&work_root.join("summary.json"));
+    for entry in fs::read_dir(work_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let strategy = entry.file_name();
+        let source = entry.path();
+        let source_groups = source.join("groups.csv");
+        let source_summary = source.join("summary.json");
+        if !source_groups.exists() && !source_summary.exists() {
+            continue;
+        }
+        let destination = reports_root.join(&strategy);
+        fs::create_dir_all(&destination)?;
+        let (rows, truncated) = if source_groups.exists() {
+            copy_limited_groups(&source_groups, &destination.join("groups.csv"))?
+        } else {
+            (0, false)
+        };
+        let mut summary = read_or_fallback_summary(&source_summary);
+        add_group_report_metadata(&mut summary, rows, truncated);
+        write_json(&destination.join("summary.json"), &summary)?;
+        if let Some(items) = top_summary.as_array_mut() {
+            for item in items.iter_mut() {
+                if item.get("strategy").and_then(|value| value.as_str()) == strategy.to_str() {
+                    add_group_report_metadata(item, rows, truncated);
+                }
+            }
+        }
+    }
+    write_json(&reports_root.join("summary.json"), &top_summary)
+}
+
+fn read_or_fallback_summary(path: &Path) -> serde_json::Value {
+    File::open(path)
+        .ok()
+        .and_then(|file| serde_json::from_reader(file).ok())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "aligned": false,
+                "error": "reconciliation ended before a complete summary was written",
+                "panicked": std::thread::panicking(),
+            })
+        })
+}
+
+fn add_group_report_metadata(summary: &mut serde_json::Value, rows: usize, truncated: bool) {
+    if let Some(object) = summary.as_object_mut() {
+        object.insert("groups_csv_rows".into(), rows.into());
+        object.insert("groups_csv_truncated".into(), truncated.into());
+    }
+}
+
+fn copy_limited_groups(source: &Path, destination: &Path) -> Result<(usize, bool)> {
+    let mut reader = csv::Reader::from_path(source)?;
+    let mut writer = csv::Writer::from_path(destination)?;
+    writer.write_record(reader.headers()?)?;
+    let mut rows = 0;
+    let mut truncated = false;
+    for record in reader.records() {
+        if rows == MAX_PERSISTED_GROUPS {
+            truncated = true;
+            break;
+        }
+        writer.write_record(&record?)?;
+        rows += 1;
+    }
+    writer.flush()?;
+    Ok((rows, truncated))
 }
 
 #[derive(Debug)]
@@ -251,6 +421,11 @@ async fn main() -> Result<()> {
     let latest_end_ms = now_ms - gap_ms;
     let candidate_end_ms = args.end_ms.unwrap_or(latest_end_ms).min(latest_end_ms);
     let report_root = prepare_report_root(&args)?;
+    let mut work_guard = WorkDirGuard::new(
+        report_root.clone(),
+        args.cleanup_on_success,
+        args.keep_work_dir,
+    );
     println!("report_root={}", report_root.display());
     println!("candidate_end_ms={candidate_end_ms}");
 
@@ -297,11 +472,9 @@ async fn main() -> Result<()> {
         }
     }
     write_json(&report_root.join("summary.json"), &summaries)?;
-    println!("summary={}", report_root.join("summary.json").display());
-    if args.cleanup_on_success && !failed {
-        ensure_generated_report_path(&report_root)?;
-        fs::remove_dir_all(&report_root)
-            .with_context(|| format!("remove successful report {}", report_root.display()))?;
+    let summary_path = work_guard.finish(!failed)?;
+    println!("summary={}", summary_path.display());
+    if args.cleanup_on_success && !failed && !args.keep_work_dir {
         println!("removed_success_report={}", report_root.display());
     }
     pool.close().await;
@@ -352,6 +525,12 @@ async fn connect_postgres(database_url: Option<&str>) -> Result<PgPool> {
 
 fn prepare_report_root(args: &Args) -> Result<PathBuf> {
     if let Some(path) = &args.work_dir {
+        if path.is_symlink() {
+            bail!("--work-dir must not be a symbolic link");
+        }
+        if path.exists() && fs::read_dir(path)?.next().is_some() {
+            bail!("--work-dir must be empty: {}", path.display());
+        }
         fs::create_dir_all(path)
             .with_context(|| format!("create report root {}", path.display()))?;
         return path.canonicalize().context("resolve report root");
@@ -364,19 +543,9 @@ fn prepare_report_root(args: &Args) -> Result<PathBuf> {
             std::process::id(),
             Utc::now().timestamp_micros()
         ));
-    fs::create_dir_all(&path).with_context(|| format!("create report root {}", path.display()))?;
+    fs::create_dir_all(path.parent().context("report root has no parent")?)?;
+    fs::create_dir(&path).with_context(|| format!("create report root {}", path.display()))?;
     Ok(path)
-}
-
-fn ensure_generated_report_path(path: &Path) -> Result<()> {
-    let parent = env::temp_dir().join("crypto_nav_rocksdb_reconcile");
-    if !path.starts_with(&parent) || path == parent {
-        bail!(
-            "refuse to remove non-generated report path {}",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 async fn reconcile(
@@ -868,6 +1037,11 @@ fn export_orders(
     let remote_root = format!("/tmp/crypto_nav_rocksdb_reconcile/{token}");
     let remote_binary = format!("{remote_root}/order_export");
     let remote_output = format!("{remote_root}/output");
+    let _remote_guard = RemoteWorkGuard {
+        host: args.ssh_host.clone(),
+        path: remote_root.clone(),
+        keep: args.keep_remote,
+    };
     let result = (|| {
         let mut mkdir = Command::new("ssh");
         mkdir.args([&args.ssh_host, "mkdir", "-p", &remote_output]);
@@ -901,13 +1075,6 @@ fn export_orders(
         locate_order_export(output_root)
     })();
 
-    if !args.keep_remote {
-        let mut cleanup = Command::new("ssh");
-        cleanup.args([&args.ssh_host, "rm", "-rf", "--", &remote_root]);
-        if let Err(error) = run(&mut cleanup) {
-            eprintln!("remote cleanup failed for {remote_root}: {error:#}");
-        }
-    }
     result
 }
 
@@ -1332,6 +1499,19 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_root(label: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "reconcile_rocksdb_test_{label}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
     fn key() -> GroupKey {
         GroupKey {
             market: Market::Swap,
@@ -1401,6 +1581,85 @@ mod tests {
             assert!(!quantities_equal(value, value, 1e-8, 1e-9));
             assert!(!quantities_equal(value, 1.0, 1e-8, 1e-9));
         }
+    }
+
+    #[test]
+    fn failed_work_dir_keeps_only_limited_reports() {
+        let root = test_root("failed");
+        let work = root.join("work");
+        let reports = root.join("reports");
+        let strategy = work.join("bybit-intra-arb01");
+        fs::create_dir_all(&strategy).unwrap();
+        fs::write(
+            work.join("summary.json"),
+            "[{\"strategy\":\"bybit-intra-arb01\"}]",
+        )
+        .unwrap();
+        fs::write(strategy.join("summary.json"), "{\"aligned\":false}").unwrap();
+        fs::write(strategy.join("uniform_orders.parquet"), b"large export").unwrap();
+        let mut groups = csv::Writer::from_path(strategy.join("groups.csv")).unwrap();
+        groups.write_record(["symbol", "status"]).unwrap();
+        for _ in 0..=MAX_PERSISTED_GROUPS {
+            groups.write_record(["ZKUSDT", "MISMATCH"]).unwrap();
+        }
+        groups.flush().unwrap();
+        drop(groups);
+
+        let mut guard = WorkDirGuard::with_reports_root(work.clone(), reports.clone(), true, false);
+        assert_eq!(guard.finish(false).unwrap(), reports.join("summary.json"));
+        assert!(!work.exists());
+        assert!(
+            !reports
+                .join("bybit-intra-arb01/uniform_orders.parquet")
+                .exists()
+        );
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(reports.join("bybit-intra-arb01/summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["groups_csv_rows"], MAX_PERSISTED_GROUPS);
+        assert_eq!(summary["groups_csv_truncated"], true);
+        let rows = csv::Reader::from_path(reports.join("bybit-intra-arb01/groups.csv"))
+            .unwrap()
+            .records()
+            .count();
+        assert_eq!(rows, MAX_PERSISTED_GROUPS);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_work_dir_obeys_cleanup_flag() {
+        for cleanup in [false, true] {
+            let root = test_root("success");
+            let work = root.join("work");
+            fs::create_dir(&work).unwrap();
+            fs::write(work.join("summary.json"), "[]").unwrap();
+            let mut guard =
+                WorkDirGuard::with_reports_root(work.clone(), root.join("reports"), cleanup, false);
+            guard.finish(true).unwrap();
+            assert_eq!(work.exists(), !cleanup);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn panic_cleans_work_dir_and_writes_fallback_summary() {
+        let root = test_root("panic");
+        let work = root.join("work");
+        let reports = root.join("reports");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("uniform_orders.parquet"), b"large export").unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _guard =
+                WorkDirGuard::with_reports_root(work.clone(), reports.clone(), false, false);
+            panic!("simulated reconciliation panic");
+        });
+        assert!(result.is_err());
+        assert!(!work.exists());
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(reports.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["panicked"], true);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
