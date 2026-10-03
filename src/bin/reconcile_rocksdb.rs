@@ -51,6 +51,9 @@ struct Args {
     #[arg(long, default_value_t = 1e-8)]
     qty_epsilon: f64,
 
+    #[arg(long, default_value_t = 1e-9)]
+    rel_epsilon: f64,
+
     #[arg(long)]
     skip_sync: bool,
 
@@ -321,6 +324,9 @@ fn validate_args(args: &Args) -> Result<()> {
     if !args.qty_epsilon.is_finite() || args.qty_epsilon < 0.0 {
         bail!("--qty-epsilon must be finite and non-negative");
     }
+    if !args.rel_epsilon.is_finite() || args.rel_epsilon < 0.0 {
+        bail!("--rel-epsilon must be finite and non-negative");
+    }
     Ok(())
 }
 
@@ -482,7 +488,13 @@ async fn reconcile(
         &client_ids,
         selected_symbols.as_ref(),
     )?;
-    let groups = compare_groups(&pg, &uniform, &unmatched, args.qty_epsilon);
+    let groups = compare_groups(
+        &pg,
+        &uniform,
+        &unmatched,
+        args.qty_epsilon,
+        args.rel_epsilon,
+    );
     let mismatch_count = groups.iter().filter(|row| row.status == "MISMATCH").count();
     let aligned = mismatch_count == 0;
     let advanced = aligned && actual_end_ms > checkpoint.verified_through_ms;
@@ -1041,11 +1053,14 @@ fn pg_groups(
             csv::Reader::from_path(&path).with_context(|| format!("open {}", path.display()))?;
         for row in reader.deserialize::<PgTradeRow>() {
             let row = row.with_context(|| format!("read {}", path.display()))?;
-            if row.ts < start_ms || row.ts > end_ms || row.qty <= 0.0 {
+            if row.ts < start_ms || row.ts > end_ms {
                 continue;
             }
             if !row.qty.is_finite() {
                 bail!("non-finite PostgreSQL quantity in {}", path.display());
+            }
+            if row.qty <= 0.0 {
+                continue;
             }
             let market = Market::from_sid(row.sid.trim())?;
             if exclusions.contains(&(market, row.order_id.clone())) {
@@ -1099,6 +1114,9 @@ fn uniform_groups(
             continue;
         }
         let qty = amount.get(row).context("null uniform amount_update")?;
+        if !qty.is_finite() {
+            bail!("non-finite uniform amount_update: {qty}");
+        }
         if qty < -epsilon {
             bail!("negative uniform amount_update: {qty}");
         }
@@ -1156,6 +1174,9 @@ fn unmatched_groups(
         let qty = cumulative
             .get(row)
             .context("null unmatched cumulative_filled_quantity")?;
+        if !qty.is_finite() {
+            bail!("non-finite unmatched cumulative quantity: {qty}");
+        }
         if qty < -epsilon {
             bail!("negative unmatched cumulative quantity: {qty}");
         }
@@ -1245,7 +1266,8 @@ fn compare_groups(
     pg: &BTreeMap<GroupKey, Stat>,
     uniform: &BTreeMap<GroupKey, Stat>,
     unmatched: &BTreeMap<GroupKey, Stat>,
-    epsilon: f64,
+    abs_epsilon: f64,
+    rel_epsilon: f64,
 ) -> Vec<GroupReport> {
     let mut keys = BTreeSet::new();
     keys.extend(pg.keys().cloned());
@@ -1273,7 +1295,7 @@ fn compare_groups(
                 unmatched_qty: unmatched.qty,
                 local_qty,
                 qty_diff,
-                status: if qty_diff.abs() <= epsilon {
+                status: if quantities_equal(local_qty, pg.qty, abs_epsilon, rel_epsilon) {
                     "MATCH"
                 } else {
                     "MISMATCH"
@@ -1281,6 +1303,14 @@ fn compare_groups(
             }
         })
         .collect()
+}
+
+fn quantities_equal(a: f64, b: f64, abs_epsilon: f64, rel_epsilon: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    diff <= abs_epsilon || diff <= rel_epsilon * a.abs().max(b.abs())
 }
 
 fn write_groups(path: &Path, groups: &[GroupReport]) -> Result<()> {
@@ -1340,9 +1370,37 @@ mod tests {
             &BTreeMap::from([(key.clone(), stat(2.0))]),
             &BTreeMap::from([(key, stat(1.0))]),
             1e-8,
+            1e-9,
         );
         assert_eq!(rows[0].status, "MATCH");
         assert_eq!(rows[0].local_qty, 3.0);
+    }
+
+    #[test]
+    fn zkusdt_rounding_differences_match() {
+        for diff in [1.41561031e-7, 3.05473804e-7, 1.34110451e-6, 7.97212124e-7] {
+            assert!(quantities_equal(
+                40_000_000.0,
+                40_000_000.0 + diff,
+                1e-8,
+                1e-9
+            ));
+        }
+    }
+
+    #[test]
+    fn material_quantity_differences_do_not_match() {
+        assert!(!quantities_equal(1.0, 1.001, 1e-8, 1e-9));
+        assert!(!quantities_equal(40_000_000.0, 40_000_040.0, 1e-8, 1e-9));
+        assert!(quantities_equal(1.0, 1.0 + 5e-9, 1e-8, 1e-9));
+    }
+
+    #[test]
+    fn non_finite_quantities_never_match() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!quantities_equal(value, value, 1e-8, 1e-9));
+            assert!(!quantities_equal(value, 1.0, 1e-8, 1e-9));
+        }
     }
 
     #[test]
