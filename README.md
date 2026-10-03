@@ -164,6 +164,10 @@ CRYPTO_NAV_REDIS_DB=0
 `CRYPTO_NAV_AUTO_RECONCILE` defaults to `true`; set it to `false`, `0`, `off`,
 or `no` to stop automatic RocksDB reconciliation while history sync continues.
 The per-strategy switch is stored in `rocksdb_alignment_status.automatic_enabled`.
+If an automatic comparison finds a mismatch, fails, or exceeds 30 minutes, the
+worker turns off that strategy's switch and leaves the last result in the same
+status row. This stops later scheduled exports for that strategy until an admin
+re-enables it with `PUT /api/alignment-status/{slug}` and `{"enabled":true}`.
 
 Sync current trading fee rates for every enabled strategy account:
 

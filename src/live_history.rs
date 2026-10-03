@@ -4,6 +4,7 @@ use sqlx::{AssertSqlSafe, FromRow, PgPool};
 use std::{
     collections::BTreeSet,
     env,
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -14,6 +15,7 @@ use tracing::{error, info, warn};
 const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
 const SYNC_INTERVAL_ENV: &str = "CRYPTO_NAV_LIVE_SYNC_SECS";
 const AUTO_RECONCILE_ENV: &str = "CRYPTO_NAV_AUTO_RECONCILE";
+const ALIGNMENT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_REDIS_CLI: &str = "/usr/bin/redis-cli";
 const DEFAULT_REDIS_HOST: &str = "127.0.0.1";
 const DEFAULT_REDIS_PORT: &str = "6379";
@@ -63,7 +65,15 @@ struct SyncReport {
     symbol_count: usize,
     summaries: Vec<String>,
     alignment_summary: Option<String>,
+    alignment_failure: Option<AlignmentFailure>,
     synthesis_summary: Option<String>,
+    failures: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AlignmentFailure {
+    reason: String,
+    mismatch: bool,
 }
 
 pub fn spawn(pool: PgPool) -> Result<()> {
@@ -247,16 +257,40 @@ async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHis
         })
         .await
         {
-            Ok(Ok(report)) => info!(
-                strategy = %report.slug,
-                online_symbols = report.symbol_count,
-                summaries = %report.summaries.join("; "),
-                alignment = report.alignment_summary.as_deref().unwrap_or("not scheduled"),
-                synthesis = report.synthesis_summary.as_deref().unwrap_or("not scheduled"),
-                "live history sync complete"
-            ),
-            Ok(Err(error)) => {
-                error!(strategy = %strategy.slug, error = ?error, "live history strategy sync failed");
+            Ok(report) => {
+                let failure_pool = pool.clone();
+                if let Err(error) = disable_after_alignment_failure(
+                    &report.slug,
+                    report.alignment_failure.as_ref(),
+                    move |slug, failure| async move {
+                        persist_alignment_failure(&failure_pool, &slug, &failure).await
+                    },
+                )
+                .await
+                {
+                    warn!(
+                        strategy = %report.slug,
+                        reason = report.alignment_failure.as_ref().map(|failure| failure.reason.as_str()).unwrap_or_default(),
+                        error = ?error,
+                        "persist automatic RocksDB alignment shutdown failed"
+                    );
+                }
+                if report.failures.is_empty() {
+                    info!(
+                        strategy = %report.slug,
+                        online_symbols = report.symbol_count,
+                        summaries = %report.summaries.join("; "),
+                        alignment = report.alignment_summary.as_deref().unwrap_or("not scheduled"),
+                        synthesis = report.synthesis_summary.as_deref().unwrap_or("not scheduled"),
+                        "live history sync complete"
+                    );
+                } else {
+                    error!(
+                        strategy = %report.slug,
+                        failures = %report.failures.join("; "),
+                        "live history strategy sync failed"
+                    );
+                }
             }
             Err(error) => {
                 error!(strategy = %strategy.slug, error = ?error, "join live history strategy sync failed");
@@ -298,6 +332,60 @@ async fn load_automatic_alignment_enabled(pool: &PgPool, slug: &str) -> Result<b
     .await
     .context("load automatic RocksDB alignment switch")?
     .unwrap_or(true))
+}
+
+async fn persist_alignment_failure(
+    pool: &PgPool,
+    slug: &str,
+    failure: &AlignmentFailure,
+) -> Result<()> {
+    let message = failure.reason.chars().take(1_000).collect::<String>();
+    let state = if failure.mismatch {
+        "mismatch"
+    } else {
+        "failed"
+    };
+    sqlx::query(
+        "INSERT INTO rocksdb_alignment_status \
+         (strategy_slug,state,phase,progress_percent,updated_at,completed_at,\
+          automatic_enabled,automatic_updated_at,message) \
+         VALUES ($1,$2,'complete',100,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                 FALSE,CURRENT_TIMESTAMP,$3) \
+         ON CONFLICT (strategy_slug) DO UPDATE SET \
+           automatic_enabled=FALSE,automatic_updated_at=CURRENT_TIMESTAMP,\
+           state=EXCLUDED.state,\
+           phase='complete',progress_percent=100,updated_at=CURRENT_TIMESTAMP,\
+           completed_at=CURRENT_TIMESTAMP,\
+           message=CASE WHEN EXCLUDED.state='mismatch' AND rocksdb_alignment_status.state='mismatch' \
+                        THEN rocksdb_alignment_status.message ELSE EXCLUDED.message END",
+    )
+    .bind(slug)
+    .bind(state)
+    .bind(message)
+    .execute(pool)
+    .await
+    .context("disable automatic RocksDB alignment after failure")?;
+    Ok(())
+}
+
+async fn disable_after_alignment_failure<F, Fut>(
+    slug: &str,
+    failure: Option<&AlignmentFailure>,
+    persist: F,
+) -> Result<()>
+where
+    F: FnOnce(String, AlignmentFailure) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if let Some(failure) = failure {
+        persist(slug.to_owned(), failure.clone()).await?;
+        warn!(
+            strategy = slug,
+            reason = failure.reason,
+            "automatic RocksDB alignment disabled after failure"
+        );
+    }
+    Ok(())
 }
 
 async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
@@ -342,7 +430,7 @@ fn sync_strategy(
     strategy: LiveHistoryStrategy,
     automatic_alignment_enabled: bool,
     recent_symbols: Vec<String>,
-) -> Result<SyncReport> {
+) -> SyncReport {
     let mut failures = Vec::new();
     let mut summaries = Vec::new();
     let needs_online_symbols = uses_online_symbols(&strategy);
@@ -428,6 +516,7 @@ fn sync_strategy(
     }
 
     let mut alignment_succeeded = false;
+    let mut alignment_failure = None;
     let alignment_summary = if trades_succeeded
         && alignment_check_enabled(&strategy.slug, automatic_alignment_enabled)
     {
@@ -439,10 +528,12 @@ fn sync_strategy(
             Err(error) => {
                 warn!(
                     strategy = %strategy.slug,
-                    error = ?error,
+                    reason = error.reason,
                     "automatic RocksDB alignment check failed"
                 );
-                Some(format!("failed: {error:#}"))
+                let summary = format!("failed: {}", error.reason);
+                alignment_failure = Some(error);
+                Some(summary)
             }
         }
     } else {
@@ -466,20 +557,15 @@ fn sync_strategy(
         None
     };
 
-    if !failures.is_empty() {
-        bail!(
-            "live history sync failed for {}: {}",
-            strategy.slug,
-            failures.join("; ")
-        );
-    }
-    Ok(SyncReport {
+    SyncReport {
         slug: strategy.slug,
         symbol_count: symbols.len(),
         summaries,
         alignment_summary,
+        alignment_failure,
         synthesis_summary,
-    })
+        failures,
+    }
 }
 
 fn alignment_check_enabled(slug: &str, automatic_enabled: bool) -> bool {
@@ -662,19 +748,55 @@ fn merge_cta_symbols(
     symbols.into_iter().collect()
 }
 
-fn run_alignment_check(config: &LiveHistoryConfig, slug: &str) -> Result<String> {
-    let output = Command::new(&config.alignment_check)
+fn run_alignment_check(
+    config: &LiveHistoryConfig,
+    slug: &str,
+) -> std::result::Result<String, AlignmentFailure> {
+    run_alignment_check_with_timeout(config, slug, ALIGNMENT_TIMEOUT)
+}
+
+fn run_alignment_check_with_timeout(
+    config: &LiveHistoryConfig,
+    slug: &str,
+    timeout: Duration,
+) -> std::result::Result<String, AlignmentFailure> {
+    let mut command = tokio::process::Command::new(&config.alignment_check);
+    command
         .args(["--strategy", slug, "--skip-sync", "--cleanup-on-success"])
-        .output()
-        .with_context(|| format!("run {} for {slug}", config.alignment_check.display()))?;
+        .kill_on_drop(true);
+    let output = tokio::runtime::Handle::current()
+        .block_on(async { tokio::time::timeout(timeout, command.output()).await })
+        .map_err(|_| AlignmentFailure {
+            reason: format!(
+                "{} timed out after {} seconds for {slug}",
+                config.alignment_check.display(),
+                timeout.as_secs()
+            ),
+            mismatch: false,
+        })?
+        .map_err(|error| AlignmentFailure {
+            reason: format!(
+                "run {} for {slug}: {error}",
+                config.alignment_check.display()
+            ),
+            mismatch: false,
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{} exited with {}: {}",
-            config.alignment_check.display(),
-            output.status,
-            stderr.trim()
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mismatch = stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("{slug}: aligned=false ")));
+        return Err(AlignmentFailure {
+            reason: format!(
+                "{} exited with {}: stdout={} stderr={}",
+                config.alignment_check.display(),
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            ),
+            mismatch,
+        });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout
@@ -1009,14 +1131,80 @@ fn parse_auto_reconcile(value: Option<&str>) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::{
+        collections::HashMap,
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, UNIX_EPOCH},
+    };
+
+    use sqlx::postgres::PgPoolOptions;
 
     use super::{
-        CtaManagerSymbol, CtaManagerSymbolsResponse, LiveHistoryStrategy, account_datasets,
-        alignment_check_enabled, delay_until_next_slot, merge_cta_symbols, merge_trade_symbols,
-        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_auto_reconcile,
-        parse_redis_mget, uses_online_symbols,
+        AlignmentFailure, CtaManagerSymbol, CtaManagerSymbolsResponse, LiveHistoryConfig,
+        LiveHistoryStrategy, account_datasets, alignment_check_enabled, delay_until_next_slot,
+        disable_after_alignment_failure, load_automatic_alignment_enabled, merge_cta_symbols,
+        merge_trade_symbols, normalize_online_symbol, online_symbol_keys, order_synthesis_enabled,
+        parse_auto_reconcile, parse_redis_mget, persist_alignment_failure,
+        run_alignment_check_with_timeout, sync_strategy, uses_online_symbols,
     };
+
+    static NEXT_SCRIPT_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestScript(PathBuf);
+
+    impl TestScript {
+        fn new(contents: &str) -> Self {
+            let id = NEXT_SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "crypto_nav_alignment_test_{}_{}",
+                std::process::id(),
+                id
+            ));
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestScript {
+        fn drop(&mut self) {
+            fs::remove_file(&self.0).unwrap();
+        }
+    }
+
+    fn test_config(alignment_check: PathBuf) -> LiveHistoryConfig {
+        LiveHistoryConfig {
+            sync_interval: Duration::from_secs(900),
+            auto_reconcile: true,
+            redis_cli: PathBuf::from("/bin/true"),
+            redis_host: "127.0.0.1".into(),
+            redis_port: "6379".into(),
+            redis_db: "0".into(),
+            sync_history: PathBuf::from("/bin/true"),
+            alignment_check,
+            order_synthesis: PathBuf::from("/bin/true"),
+            cta_manager_url: String::new(),
+        }
+    }
+
+    async fn test_sync(alignment_check: PathBuf, enabled: bool) -> super::SyncReport {
+        tokio::task::spawn_blocking(move || {
+            sync_strategy(
+                &test_config(alignment_check),
+                strategy("binance_mm_alpha", "binance", "market_making"),
+                enabled,
+                Vec::new(),
+            )
+        })
+        .await
+        .unwrap()
+    }
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
         LiveHistoryStrategy {
@@ -1123,6 +1311,165 @@ mod tests {
         }
         assert!(parse_auto_reconcile(Some("yes")).unwrap());
         assert!(parse_auto_reconcile(Some("unexpected")).is_err());
+    }
+
+    #[tokio::test]
+    async fn mismatch_and_execution_failure_disable_and_record_the_strategy() {
+        let mismatch_script = TestScript::new(
+            "#!/bin/sh\necho 'binance_mm_alpha: aligned=false groups=1 mismatches=1 end=0 advanced=false'\nexit 1\n",
+        );
+        let persisted = Arc::new(Mutex::new(HashMap::from([(
+            "binance_mm_alpha".to_string(),
+            true,
+        )])));
+        for (path, mismatch) in [
+            (mismatch_script.0.clone(), true),
+            (PathBuf::from("/bin/false"), false),
+        ] {
+            let report = test_sync(path, true).await;
+            let failure = report.alignment_failure.as_ref().unwrap();
+            assert_eq!(failure.mismatch, mismatch);
+            let saved = persisted.clone();
+            disable_after_alignment_failure(
+                &report.slug,
+                Some(failure),
+                move |slug, failure| async move {
+                    assert!(!failure.reason.is_empty());
+                    saved.lock().unwrap().insert(slug, false);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!persisted.lock().unwrap()["binance_mm_alpha"]);
+    }
+
+    #[tokio::test]
+    async fn successful_alignment_does_not_disable_automatic_checks() {
+        let report = test_sync(PathBuf::from("/bin/true"), true).await;
+        assert!(report.alignment_failure.is_none());
+        disable_after_alignment_failure(
+            &report.slug,
+            report.alignment_failure.as_ref(),
+            |_, _| async { panic!("successful alignment must not persist a shutdown") },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_strategy_does_not_run_alignment_check() {
+        let report = test_sync(PathBuf::from("/bin/false"), false).await;
+        assert!(report.alignment_summary.is_none());
+        assert!(report.alignment_failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn timed_out_alignment_is_an_execution_failure() {
+        let script = TestScript::new("#!/bin/sh\nexec sleep 5\n");
+        let config = test_config(script.0.clone());
+        let failure = tokio::task::spawn_blocking(move || {
+            run_alignment_check_with_timeout(&config, "binance_mm_alpha", Duration::from_millis(50))
+                .unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert!(!failure.mismatch);
+        assert!(failure.reason.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn alignment_failure_is_persisted_in_the_existing_status_table() {
+        let Ok(url) = env::var("CRYPTO_NAV_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE rocksdb_alignment_status (\
+             strategy_slug TEXT PRIMARY KEY,state TEXT NOT NULL,phase TEXT NOT NULL,\
+             progress_percent INTEGER NOT NULL,updated_at TIMESTAMPTZ,completed_at TIMESTAMPTZ,\
+             automatic_enabled BOOLEAN NOT NULL,automatic_updated_at TIMESTAMPTZ,message TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO rocksdb_alignment_status \
+             (strategy_slug,state,phase,progress_percent,automatic_enabled,message) \
+             VALUES ('binance_mm_alpha','mismatch','complete',100,TRUE,'one group differs')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        persist_alignment_failure(
+            &pool,
+            "binance_mm_alpha",
+            &AlignmentFailure {
+                reason: "aligned=false".into(),
+                mismatch: true,
+            },
+        )
+        .await
+        .unwrap();
+        let mismatch: (bool, String, String, bool) = sqlx::query_as(
+            "SELECT automatic_enabled,state,message,automatic_updated_at IS NOT NULL \
+             FROM rocksdb_alignment_status WHERE strategy_slug='binance_mm_alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            mismatch,
+            (false, "mismatch".into(), "one group differs".into(), true)
+        );
+
+        sqlx::query(
+            "UPDATE rocksdb_alignment_status SET automatic_enabled=TRUE,state='running' \
+             WHERE strategy_slug='binance_mm_alpha'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        persist_alignment_failure(
+            &pool,
+            "binance_mm_alpha",
+            &AlignmentFailure {
+                reason: "timed out".into(),
+                mismatch: false,
+            },
+        )
+        .await
+        .unwrap();
+        let failed: (bool, String, String) = sqlx::query_as(
+            "SELECT automatic_enabled,state,message FROM rocksdb_alignment_status \
+             WHERE strategy_slug='binance_mm_alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(failed, (false, "failed".into(), "timed out".into()));
+        assert!(
+            !load_automatic_alignment_enabled(&pool, "binance_mm_alpha")
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "UPDATE rocksdb_alignment_status SET automatic_enabled=TRUE,\
+             automatic_updated_at=CURRENT_TIMESTAMP WHERE strategy_slug='binance_mm_alpha'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            load_automatic_alignment_enabled(&pool, "binance_mm_alpha")
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
