@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
 const SYNC_INTERVAL_ENV: &str = "CRYPTO_NAV_LIVE_SYNC_SECS";
+const AUTO_RECONCILE_ENV: &str = "CRYPTO_NAV_AUTO_RECONCILE";
 const DEFAULT_REDIS_CLI: &str = "/usr/bin/redis-cli";
 const DEFAULT_REDIS_HOST: &str = "127.0.0.1";
 const DEFAULT_REDIS_PORT: &str = "6379";
@@ -33,6 +34,7 @@ const CTA_BACKFILL_LOOKBACK_MS: i64 = 15 * 60 * 1_000;
 #[derive(Clone, Debug)]
 struct LiveHistoryConfig {
     sync_interval: Duration,
+    auto_reconcile: bool,
     redis_cli: PathBuf,
     redis_host: String,
     redis_port: String,
@@ -71,6 +73,7 @@ pub fn spawn(pool: PgPool) -> Result<()> {
     };
     info!(
         sync_interval_secs = config.sync_interval.as_secs(),
+        auto_reconcile = config.auto_reconcile,
         clock = "UTC",
         redis_host = %config.redis_host,
         redis_port = %config.redis_port,
@@ -111,8 +114,14 @@ impl LiveHistoryConfig {
                     .context("resolve NAV server executable")?
                     .with_file_name("sync_intra_orders"),
             );
+        let auto_reconcile = match env::var(AUTO_RECONCILE_ENV) {
+            Ok(value) => parse_auto_reconcile(Some(&value))?,
+            Err(env::VarError::NotPresent) => parse_auto_reconcile(None)?,
+            Err(error) => return Err(error).with_context(|| format!("read {AUTO_RECONCILE_ENV}")),
+        };
         Ok(Some(Self {
             sync_interval: Duration::from_secs(sync_interval_secs),
+            auto_reconcile,
             redis_cli: env::var_os("CRYPTO_NAV_REDIS_CLI")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_REDIS_CLI)),
@@ -188,7 +197,7 @@ async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHis
         );
         tokio::time::sleep(delay).await;
 
-        let automatic_alignment_enabled =
+        let automatic_alignment_enabled = if config.auto_reconcile {
             match load_automatic_alignment_enabled(&pool, &strategy.slug).await {
                 Ok(enabled) => enabled,
                 Err(error) => {
@@ -199,7 +208,10 @@ async fn run_strategy(pool: PgPool, config: LiveHistoryConfig, strategy: LiveHis
                     );
                     false
                 }
-            };
+            }
+        } else {
+            false
+        };
         let recent_symbols = if uses_online_symbols(&strategy) {
             // CTA coverage uses the full stored symbol set, not just the recent
             // window: symbols missing from it are treated as undiscovered and
@@ -987,6 +999,14 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+fn parse_auto_reconcile(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("true" | "1" | "on" | "yes") => Ok(true),
+        Some("false" | "0" | "off" | "no") => Ok(false),
+        Some(_) => bail!("{AUTO_RECONCILE_ENV} must be true/1/on/yes or false/0/off/no"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
@@ -994,8 +1014,8 @@ mod tests {
     use super::{
         CtaManagerSymbol, CtaManagerSymbolsResponse, LiveHistoryStrategy, account_datasets,
         alignment_check_enabled, delay_until_next_slot, merge_cta_symbols, merge_trade_symbols,
-        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_redis_mget,
-        uses_online_symbols,
+        normalize_online_symbol, online_symbol_keys, order_synthesis_enabled, parse_auto_reconcile,
+        parse_redis_mget, uses_online_symbols,
     };
 
     fn strategy(slug: &str, exchange: &str, strategy_kind: &str) -> LiveHistoryStrategy {
@@ -1093,6 +1113,16 @@ mod tests {
         assert!(alignment_check_enabled("bybit-intra-arb01", true));
         assert!(alignment_check_enabled("bybit-intra-arb02", true));
         assert!(!alignment_check_enabled("binance_fr_arb03", true));
+    }
+
+    #[test]
+    fn auto_reconcile_defaults_on_and_accepts_explicit_off_values() {
+        assert!(parse_auto_reconcile(None).unwrap());
+        for value in ["false", "0", "off", "no", " FALSE "] {
+            assert!(!parse_auto_reconcile(Some(value)).unwrap());
+        }
+        assert!(parse_auto_reconcile(Some("yes")).unwrap());
+        assert!(parse_auto_reconcile(Some("unexpected")).is_err());
     }
 
     #[test]

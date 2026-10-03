@@ -155,10 +155,15 @@ Configure the worker with:
 ```bash
 # Defaults shown. Set the interval to 0 to disable the worker.
 CRYPTO_NAV_LIVE_SYNC_SECS=900
+CRYPTO_NAV_AUTO_RECONCILE=true
 CRYPTO_NAV_REDIS_HOST=127.0.0.1
 CRYPTO_NAV_REDIS_PORT=6379
 CRYPTO_NAV_REDIS_DB=0
 ```
+
+`CRYPTO_NAV_AUTO_RECONCILE` defaults to `true`; set it to `false`, `0`, `off`,
+or `no` to stop automatic RocksDB reconciliation while history sync continues.
+The per-strategy switch is stored in `rocksdb_alignment_status.automatic_enabled`.
 
 Sync current trading fee rates for every enabled strategy account:
 
