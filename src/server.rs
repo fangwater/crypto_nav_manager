@@ -752,7 +752,9 @@ async fn visible_slugs(pool: &PgPool, user: &AuthUser) -> Result<Option<HashSet<
         return Ok(None);
     }
     let slugs = sqlx::query_scalar::<_, String>(
-        "SELECT strategy_slug FROM nav_user_strategy_grants WHERE user_id = $1",
+        "SELECT g.strategy_slug FROM nav_user_strategy_grants g \
+         JOIN strategy_envs s ON s.slug = g.strategy_slug \
+         WHERE g.user_id = $1 AND s.enabled",
     )
     .bind(user.user_id)
     .fetch_all(pool)
@@ -891,12 +893,13 @@ async fn list_nav_users(
         r#"SELECT u.user_id, u.username, u.role,
                   (EXTRACT(EPOCH FROM u.created_at) * 1000)::bigint AS created_at_ms,
                   COALESCE(
-                    array_agg(g.strategy_slug ORDER BY g.strategy_slug)
-                      FILTER (WHERE g.strategy_slug IS NOT NULL),
+                    array_agg(s.slug ORDER BY s.slug)
+                      FILTER (WHERE s.slug IS NOT NULL),
                     '{}'
                   ) AS strategy_slugs
            FROM nav_users u
            LEFT JOIN nav_user_strategy_grants g ON g.user_id = u.user_id
+           LEFT JOIN strategy_envs s ON s.slug = g.strategy_slug AND s.enabled
            GROUP BY u.user_id, u.username, u.role, u.created_at
            ORDER BY u.username"#,
     )
@@ -1096,11 +1099,12 @@ async fn set_nav_user_strategies(
         .map(|slug| slug.trim().to_string())
         .filter(|slug| !slug.is_empty())
         .collect();
-    let known: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT slug FROM strategy_envs")
-        .fetch_all(&state.pool)
-        .await?
-        .into_iter()
-        .collect();
+    let known: HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT slug FROM strategy_envs WHERE enabled")
+            .fetch_all(&state.pool)
+            .await?
+            .into_iter()
+            .collect();
     if let Some(invalid) = slugs.iter().find(|slug| !known.contains(*slug)) {
         warn!(%invalid, "rejected unknown strategy slug in grant update");
         return Ok(bad_request("unknown strategy slug"));
@@ -2045,12 +2049,13 @@ async fn list_latest_snapshots(
 ) -> Result<Json<Vec<SnapshotResponse>>, ApiError> {
     let visible = visible_slugs(&state.pool, &user).await?;
     let mut rows = sqlx::query_as::<_, SnapshotRecord>(
-        r#"SELECT DISTINCT ON (strategy_slug)
-               strategy_slug,snapshot_ts_ms,
-               (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
-               source_url,payload
-           FROM strategy_snapshots
-           ORDER BY strategy_slug,snapshot_ts_ms DESC"#,
+        r#"SELECT DISTINCT ON (p.strategy_slug)
+               p.strategy_slug,p.snapshot_ts_ms,
+               (EXTRACT(EPOCH FROM p.fetched_at) * 1000)::bigint AS fetched_at_ms,
+               p.source_url,p.payload
+           FROM strategy_snapshots p
+           JOIN strategy_envs s ON s.slug = p.strategy_slug AND s.enabled
+           ORDER BY p.strategy_slug,p.snapshot_ts_ms DESC"#,
     )
     .fetch_all(&state.pool)
     .await?;
@@ -2070,12 +2075,13 @@ async fn get_latest_snapshot(
         return Ok(not_found("strategy not found"));
     }
     let row = sqlx::query_as::<_, SnapshotRecord>(
-        r#"SELECT strategy_slug,snapshot_ts_ms,
-                  (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
-                  source_url,payload
-           FROM strategy_snapshots
-           WHERE strategy_slug=$1
-           ORDER BY snapshot_ts_ms DESC LIMIT 1"#,
+        r#"SELECT p.strategy_slug,p.snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM p.fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  p.source_url,p.payload
+           FROM strategy_snapshots p
+           JOIN strategy_envs s ON s.slug = p.strategy_slug AND s.enabled
+           WHERE p.strategy_slug=$1
+           ORDER BY p.snapshot_ts_ms DESC LIMIT 1"#,
     )
     .bind(slug)
     .fetch_optional(&state.pool)
@@ -2096,12 +2102,13 @@ async fn list_strategy_snapshots(
         return Ok(Json(Vec::new()));
     }
     let rows = sqlx::query_as::<_, SnapshotRecord>(
-        r#"SELECT strategy_slug,snapshot_ts_ms,
-                  (EXTRACT(EPOCH FROM fetched_at) * 1000)::bigint AS fetched_at_ms,
-                  source_url,payload
-           FROM strategy_snapshots
-           WHERE strategy_slug=$1
-           ORDER BY snapshot_ts_ms DESC"#,
+        r#"SELECT p.strategy_slug,p.snapshot_ts_ms,
+                  (EXTRACT(EPOCH FROM p.fetched_at) * 1000)::bigint AS fetched_at_ms,
+                  p.source_url,p.payload
+           FROM strategy_snapshots p
+           JOIN strategy_envs s ON s.slug = p.strategy_slug AND s.enabled
+           WHERE p.strategy_slug=$1
+           ORDER BY p.snapshot_ts_ms DESC"#,
     )
     .bind(slug)
     .fetch_all(&state.pool)
@@ -2118,6 +2125,14 @@ async fn get_initial_snapshot(
 ) -> Result<Response, ApiError> {
     let visible = visible_slugs(&state.pool, &user).await?;
     if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
+    let enabled: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM strategy_envs WHERE slug=$1 AND enabled)")
+            .bind(&slug)
+            .fetch_one(&state.pool)
+            .await?;
+    if !enabled {
         return Ok(not_found("strategy not found"));
     }
     let row = load_initial_snapshot(&state.pool, &slug).await?;
