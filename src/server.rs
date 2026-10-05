@@ -1903,6 +1903,7 @@ fn expected_history_datasets(
                 | "bybit-intra-arb02"
                 | "bitget_fr_arb01"
                 | "bitget_fr_arb02"
+                | "bitget_fr_arb03"
                 | "gate_fr_arb01"
                 | "gate_fr_arb02"
                 | "gate_fr_arb03"
@@ -3063,11 +3064,14 @@ mod tests {
     }
 
     #[test]
-    fn schedules_bitget_fr_arb01_history_datasets() {
-        assert_eq!(
-            expected_history_datasets("bitget_fr_arb01", "local", "bitget", "funding_rate",),
-            Some(&["trades", "funding", "interest"][..])
-        );
+    fn schedules_bitget_fr_history_datasets() {
+        for slug in ["bitget_fr_arb01", "bitget_fr_arb02", "bitget_fr_arb03"] {
+            assert_eq!(
+                expected_history_datasets(slug, "local", "bitget", "funding_rate"),
+                Some(&["trades", "funding", "interest"][..]),
+                "{slug} must be scheduled"
+            );
+        }
     }
 
     #[test]
