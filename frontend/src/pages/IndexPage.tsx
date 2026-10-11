@@ -10,7 +10,6 @@ import {
   GitCompareArrows,
   LogOut,
   Percent,
-  RadioTower,
   ShieldAlert,
   ShieldCheck,
   UserRound,
@@ -292,15 +291,6 @@ export function IndexPage({
           <div className="header-actions">
             {session.admin && (
               <>
-                <Link
-                  className="header-nav-link"
-                  to="/market-data"
-                  aria-label="行情网络"
-                  title="行情网络"
-                >
-                  <RadioTower size={16} />
-                  <span>行情网络</span>
-                </Link>
                 <Link
                   className="header-nav-link"
                   to="/monitor"

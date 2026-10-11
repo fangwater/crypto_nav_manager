@@ -41,12 +41,6 @@ const IntraAnalysisPage = lazy(() =>
   })),
 )
 
-const MarketDataNetworkPage = lazy(() =>
-  import('./pages/MarketDataNetworkPage').then((module) => ({
-    default: module.MarketDataNetworkPage,
-  })),
-)
-
 const FrPositionLimitsPage = lazy(() =>
   import('./pages/FrPositionLimitsPage').then((module) => ({
     default: module.FrPositionLimitsPage,
@@ -121,12 +115,6 @@ export default function App() {
         <Route
           path="/monitor"
           element={admin ? <OpsMonitorPage /> : <Navigate to="/" replace />}
-        />
-        <Route
-          path="/market-data"
-          element={
-            admin ? <MarketDataNetworkPage /> : <Navigate to="/" replace />
-          }
         />
         <Route
           path="/admin"

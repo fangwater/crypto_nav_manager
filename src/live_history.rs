@@ -405,8 +405,6 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'binance_mm_alpha',
                  'binance_exec_trade01',
                  'binance_exec_trade02',
-                 'binance_cta_special_rx02',
-                 'binance_cta_special_rx03',
                  'bybit_mm_alpha',
                  'okex_mm_alpha',
                  'bybit-intra-arb01',
@@ -1500,7 +1498,7 @@ mod tests {
         let mut rapidx = strategy("binance_cta_rx01", "binance", "cta");
         rapidx.account_mode = "rapidx".to_string();
         assert!(!uses_online_symbols(&rapidx));
-        let mut rapidx_futures = strategy("binance_cta_special_rx02", "binance", "market_making");
+        let mut rapidx_futures = strategy("binance_exec_trade05", "binance", "cta");
         rapidx_futures.account_mode = "rapidx".to_string();
         assert!(!uses_online_symbols(&rapidx_futures));
         assert_eq!(account_datasets(&rapidx_futures), ["funding", "interest"]);

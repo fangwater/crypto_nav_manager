@@ -210,6 +210,20 @@ Funding and interest files use the existing 12-column cash format. The CSV
 The service runs embedded PostgreSQL migrations at startup. SQLite and
 `CRYPTO_NAV_DB_PATH` are not supported.
 
+### Market monitoring and current CTA accounts
+
+Market liveness monitoring belongs to `mkt_signal`'s independent `fr_monitor`
+at `/fr-monitor/`. NAV no longer includes the market-network dashboard or the
+`public-infra-monitor`/BPF collector. The retired collector can be recovered
+from Git history if kernel-level network diagnostics are needed again.
+
+RX02 and RX03 are retired from NAV, including their PostgreSQL history,
+snapshots, sync state and strategy grants. Exec05 is registered independently
+as `binance_exec_trade05`, with display alias `lgq_cta`, RapidX account mode,
+and a start time of `1791686890453` (its first confirmed Exec05 fill).
+Its trades, funding and interest are synced every 15 minutes. Retirement only
+removes NAV-owned data; it does not remove deployed trading data or RocksDB.
+
 ### Read-only replica deployment
 
 Set `CRYPTO_NAV_READ_ONLY=1` when the API runs against a local PostgreSQL

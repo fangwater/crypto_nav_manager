@@ -198,6 +198,7 @@ struct SnapshotStrategyRecord {
     slug: String,
     host: String,
     config_url: String,
+    snapshot_url: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -262,6 +263,7 @@ struct HistorySyncStrategyRecord {
     slug: String,
     host: String,
     exchange: String,
+    account_mode: String,
     strategy_kind: String,
 }
 
@@ -1191,7 +1193,7 @@ async fn list_history_sync_status(
 ) -> Result<Json<Vec<HistorySyncStatusResponse>>, ApiError> {
     let visible = visible_slugs(&state.pool, &user).await?;
     let mut strategies = sqlx::query_as::<_, HistorySyncStrategyRecord>(
-        r#"SELECT slug,host,exchange,strategy_kind
+        r#"SELECT slug,host,exchange,account_mode,strategy_kind
            FROM strategy_envs
            WHERE enabled
            ORDER BY sort_order,slug"#,
@@ -1228,6 +1230,7 @@ async fn list_history_sync_status(
                     &strategy.host,
                     &strategy.exchange,
                     &strategy.strategy_kind,
+                    &strategy.account_mode,
                 );
                 let watermarks = watermarks_by_strategy.get(&strategy.slug);
                 let datasets = expected
@@ -1871,6 +1874,7 @@ fn expected_history_datasets(
     host: &str,
     exchange: &str,
     strategy_kind: &str,
+    account_mode: &str,
 ) -> Option<&'static [&'static str]> {
     const BINANCE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
     const GATE_FR: &[&str] = &["trades", "funding", "interest", "liquidations"];
@@ -1880,13 +1884,7 @@ fn expected_history_datasets(
     const MM: &[&str] = &["trades"];
     const RAPIDX_FUTURES: &[&str] = &["trades", "funding", "interest"];
 
-    if matches!(
-        slug,
-        "binance_cta_special_rx02" | "binance_cta_special_rx03"
-    ) && host == "local"
-        && exchange == "binance"
-        && strategy_kind == "market_making"
-    {
+    if host == "local" && account_mode == "rapidx" {
         return Some(RAPIDX_FUTURES);
     }
 
@@ -1939,7 +1937,7 @@ async fn sync_snapshots(
             .into_response());
     };
     let strategies = sqlx::query_as::<_, SnapshotStrategyRecord>(
-        "SELECT slug,host,config_url FROM strategy_envs WHERE enabled ORDER BY sort_order,slug",
+        "SELECT slug,host,config_url,snapshot_url FROM strategy_envs WHERE enabled ORDER BY sort_order,slug",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -1953,7 +1951,10 @@ async fn sync_snapshots(
         tasks.spawn(async move {
             let slug = strategy.slug;
             let result = async {
-                let source_url = snapshot_source_url(&strategy.host, &strategy.config_url)?;
+                let source_url = match strategy.snapshot_url {
+                    Some(url) => url,
+                    None => snapshot_source_url(&strategy.host, &strategy.config_url)?,
+                };
                 let payload = client
                     .get(&source_url)
                     .send()
@@ -3067,7 +3068,7 @@ mod tests {
     fn schedules_bitget_fr_history_datasets() {
         for slug in ["bitget_fr_arb01", "bitget_fr_arb02", "bitget_fr_arb03"] {
             assert_eq!(
-                expected_history_datasets(slug, "local", "bitget", "funding_rate"),
+                expected_history_datasets(slug, "local", "bitget", "funding_rate", "uta"),
                 Some(&["trades", "funding", "interest"][..]),
                 "{slug} must be scheduled"
             );
@@ -3117,44 +3118,69 @@ mod tests {
     #[test]
     fn identifies_recurring_history_datasets() {
         assert_eq!(
-            expected_history_datasets("binance_fr_arb01", "local", "binance", "funding_rate"),
+            expected_history_datasets(
+                "binance_fr_arb01",
+                "local",
+                "binance",
+                "funding_rate",
+                "portfolio_margin"
+            ),
             Some(["trades", "funding", "interest", "liquidations"].as_slice())
         );
         assert_eq!(
-            expected_history_datasets("binance-intra-arb01", "local", "binance", "intra_exchange",),
-            Some(["trades", "funding", "interest"].as_slice())
-        );
-        assert_eq!(
-            expected_history_datasets("bybit-intra-arb01", "sg", "bybit", "intra_exchange"),
-            Some(["trades", "funding", "interest"].as_slice())
-        );
-        assert_eq!(
-            expected_history_datasets("bybit_mm_alpha", "sg", "bybit", "market_making"),
-            Some(["trades"].as_slice())
-        );
-        assert_eq!(
-            expected_history_datasets("binance_exec_trade01", "local", "binance", "cta"),
-            Some(["trades"].as_slice())
-        );
-        assert_eq!(
-            expected_history_datasets("binance_exec_trade02", "local", "binance", "cta"),
-            Some(["trades"].as_slice())
-        );
-        assert_eq!(
             expected_history_datasets(
-                "binance_cta_special_rx02",
+                "binance-intra-arb01",
                 "local",
                 "binance",
-                "market_making",
+                "intra_exchange",
+                "portfolio_margin"
             ),
             Some(["trades", "funding", "interest"].as_slice())
         );
         assert_eq!(
-            expected_history_datasets("gate_fr_arb03", "local", "gate", "funding_rate"),
+            expected_history_datasets(
+                "bybit-intra-arb01",
+                "sg",
+                "bybit",
+                "intra_exchange",
+                "unified"
+            ),
+            Some(["trades", "funding", "interest"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("bybit_mm_alpha", "sg", "bybit", "market_making", "unified"),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets(
+                "binance_exec_trade01",
+                "local",
+                "binance",
+                "cta",
+                "usdm_futures"
+            ),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets(
+                "binance_exec_trade02",
+                "local",
+                "binance",
+                "cta",
+                "usdm_futures"
+            ),
+            Some(["trades"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("binance_exec_trade05", "local", "binance", "cta", "rapidx",),
+            Some(["trades", "funding", "interest"].as_slice())
+        );
+        assert_eq!(
+            expected_history_datasets("gate_fr_arb03", "local", "gate", "funding_rate", "unified"),
             Some(["trades", "funding", "interest", "liquidations"].as_slice())
         );
         assert_eq!(
-            expected_history_datasets("okex_mm_alpha", "local", "okx", "market_making"),
+            expected_history_datasets("okex_mm_alpha", "local", "okx", "market_making", "unified"),
             Some(["trades"].as_slice())
         );
     }
