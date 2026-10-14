@@ -14,7 +14,8 @@ use tracing::{info, warn};
 const ACCOUNT_PAYLOAD_BYTES: usize = 16_384;
 const ACCOUNT_RISK_EVENT_TYPE: u32 = 4_007;
 const ACCOUNT_EVENT_HEADER_BYTES: usize = 12;
-const ACCOUNT_RISK_BODY_BYTES: usize = 4 + 8 + 8 * 7;
+const ACCOUNT_RISK_LEGACY_BODY_BYTES: usize = 4 + 8 + 8 * 7;
+const ACCOUNT_RISK_BODY_BYTES: usize = ACCOUNT_RISK_LEGACY_BODY_BYTES + 8;
 const IPC_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const IPC_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const IPC_WARNING_INTERVAL: Duration = Duration::from_secs(30);
@@ -428,9 +429,11 @@ fn decode_account_risk(data: &[u8]) -> Result<Option<AccountRiskReading>> {
     }
     let scope = AccountScope::decode(read_u32(data, 4)?)?;
     let body_len = read_u32(data, 8)? as usize;
-    if body_len != ACCOUNT_RISK_BODY_BYTES {
+    // New monitors append available_margin_usd; the NAV risk fields retain
+    // their offsets. Older monitors still publish the seven-amount body.
+    if body_len != ACCOUNT_RISK_LEGACY_BODY_BYTES && body_len != ACCOUNT_RISK_BODY_BYTES {
         bail!(
-            "unsupported account risk body length: {body_len}, expected {ACCOUNT_RISK_BODY_BYTES}"
+            "unsupported account risk body length: {body_len}, expected {ACCOUNT_RISK_LEGACY_BODY_BYTES} or {ACCOUNT_RISK_BODY_BYTES}"
         );
     }
     let total_len = ACCOUNT_EVENT_HEADER_BYTES + body_len;
@@ -543,6 +546,42 @@ mod tests {
         assert_eq!(reading.maintenance_margin_usd, 5_000.0);
         assert_eq!(reading.margin_ratio, 20.0);
         assert_eq!(reading.notional_usd, 300_000.0);
+    }
+
+    #[test]
+    fn appended_available_margin_keeps_gate_and_bitget_unimmr_live() {
+        for (scope, exchange) in [(11, "gate"), (12, "bitget")] {
+            for available_margin in [42_000.0_f64, f64::NAN] {
+                let mut event = risk_event(scope, 5_000.0, 20.0);
+                event[8..12].copy_from_slice(&(ACCOUNT_RISK_BODY_BYTES as u32).to_le_bytes());
+                let offset = ACCOUNT_EVENT_HEADER_BYTES + ACCOUNT_RISK_LEGACY_BODY_BYTES;
+                event[offset..offset + 8].copy_from_slice(&available_margin.to_le_bytes());
+                let mut reading = decode_account_risk(&event).unwrap().unwrap();
+                assert_eq!(reading.adjusted_equity_usd, 100_000.0);
+                assert_eq!(reading.actual_equity_usd, 101_000.0);
+                assert_eq!(reading.maintenance_margin_usd, 5_000.0);
+                assert_eq!(reading.initial_margin_usd, 12_000.0);
+                assert_eq!(reading.borrowed_usd, 2_500.0);
+                assert_eq!(reading.notional_usd, 300_000.0);
+
+                let feed = AccountRiskFeed::new("test".into(), exchange.into(), 1).unwrap();
+                reading.received_at_ms = unix_time_ms();
+                let snapshot = snapshot_for_feed(&feed, true, Some(&reading), unix_time_ms());
+                assert_eq!(snapshot.status, "live");
+                assert_eq!(snapshot.risk_level, Some("free_trade"));
+                assert_eq!(snapshot.uni_mmr, Some(20.0));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_or_truncated_risk_bodies() {
+        let mut event = risk_event(11, 5_000.0, 20.0);
+        event[8..12].copy_from_slice(&((ACCOUNT_RISK_BODY_BYTES + 1) as u32).to_le_bytes());
+        assert!(decode_account_risk(&event).is_err());
+        event[8..12].copy_from_slice(&(ACCOUNT_RISK_BODY_BYTES as u32).to_le_bytes());
+        event.truncate(ACCOUNT_EVENT_HEADER_BYTES + ACCOUNT_RISK_BODY_BYTES - 1);
+        assert!(decode_account_risk(&event).is_err());
     }
 
     #[test]
