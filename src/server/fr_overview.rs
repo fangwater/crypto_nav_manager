@@ -200,14 +200,19 @@ impl FrOverview {
                 .clone()
                 .unwrap_or_else(|| strategy.slug.clone());
             account.row.venue = strategy.exchange.clone();
-            let risk = snapshots.get(&strategy.slug);
             let time = now();
             account.row.queried_at_ms = time;
-            if let Some(risk) = risk {
-                account.row.equity = risk.actual_equity_usd;
-                account.row.date_ms = risk.source_ts_ms;
-                account.row.margin = risk.initial_margin_usd;
-            }
+            let mut risk = snapshots
+                .get(&strategy.slug)
+                .filter(|r| r.status == "live")
+                .and_then(|r| {
+                    Some(RiskFact {
+                        ts: r.source_ts_ms?,
+                        equity: r.actual_equity_usd?,
+                        margin: r.initial_margin_usd,
+                    })
+                })
+                .filter(|r| r.valid(time));
             let url = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT snapshot_url FROM strategy_envs WHERE slug=$1",
             )
@@ -225,15 +230,29 @@ impl FrOverview {
                     .error_for_status()?
                     .json()
                     .await?;
-                exposure(&payload)
+                Ok::<_, anyhow::Error>((
+                    exposure(&payload)?,
+                    snapshot_risk(&payload).filter(|r| r.valid(time)),
+                ))
             }
             .await;
-            if let Ok((ts, long, short)) = exposure {
+            if let Ok(((ts, long, short), snapshot_risk)) = exposure {
                 account.row.long_position = Some(long);
                 account.row.short_position = Some(short);
                 account.exposure_at = Some(ts);
+                if snapshot_risk
+                    .as_ref()
+                    .is_some_and(|r| risk.as_ref().is_none_or(|old| r.ts > old.ts))
+                {
+                    risk = snapshot_risk;
+                }
             }
-            let live = risk.is_some_and(|r| r.status == "live")
+            if let Some(risk) = &risk {
+                account.row.equity = Some(risk.equity);
+                account.row.date_ms = Some(risk.ts);
+                account.row.margin = risk.margin;
+            }
+            let live = risk.is_some()
                 && account
                     .row
                     .date_ms
@@ -312,6 +331,36 @@ fn exposure(payload: &Value) -> Result<(i64, f64, f64)> {
         }
     }
     Ok((ts, long, short))
+}
+
+struct RiskFact {
+    ts: i64,
+    equity: f64,
+    margin: Option<f64>,
+}
+impl RiskFact {
+    fn valid(&self, time: i64) -> bool {
+        (0..=FRESH).contains(&(time - self.ts))
+            && self.equity.is_finite()
+            && self.margin.is_none_or(|v| v.is_finite() && v >= 0.0)
+    }
+}
+// Viz carries the same account-monitor facts as IPC. Use their original time,
+// never the enclosing page timestamp or a recomputed/adjusted-equity proxy.
+fn snapshot_risk(payload: &Value) -> Option<RiskFact> {
+    let entry = payload["entries"]
+        .as_array()?
+        .iter()
+        .find(|e| e["type"] == "pre_trade_risk")?;
+    let rows = entry["entry"]["account_risks"].as_array()?;
+    if rows.len() != 1 {
+        return None;
+    }
+    Some(RiskFact {
+        ts: rows[0]["ts_ms"].as_i64()?,
+        equity: rows[0]["actual_equity_usd"].as_f64()?,
+        margin: rows[0]["initial_margin_usd"].as_f64(),
+    })
 }
 
 async fn reconstruct(
@@ -491,6 +540,19 @@ fn ratio(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn viz_risk_requires_factual_equity_and_its_own_fresh_timestamp() {
+        let mut payload = serde_json::json!({"entries":[{"type":"pre_trade_risk","entry":{"ts_ms":1000000,"total_equity":100,"account_risks":[{"ts_ms":100,"actual_equity_usd":90,"initial_margin_usd":10}]}}]});
+        let risk = snapshot_risk(&payload).unwrap();
+        assert_eq!(risk.equity, 90.0);
+        assert!(risk.valid(101));
+        assert!(!risk.valid(1000000));
+        payload["entries"][0]["entry"]["account_risks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("actual_equity_usd");
+        assert!(snapshot_risk(&payload).is_none());
+    }
     #[test]
     fn reconstructed_equity_drawdown_uses_complete_history_and_never_fills_missing_days() {
         let reconstruction = Reconstruction {
