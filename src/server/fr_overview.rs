@@ -231,15 +231,24 @@ impl FrOverview {
                     .json()
                     .await?;
                 Ok::<_, anyhow::Error>((
-                    exposure(&payload)?,
+                    exposure(&payload),
                     snapshot_risk(&payload).filter(|r| r.valid(time)),
                 ))
             }
             .await;
-            if let Ok(((ts, long, short), snapshot_risk)) = exposure {
-                account.row.long_position = Some(long);
-                account.row.short_position = Some(short);
-                account.exposure_at = Some(ts);
+            if let Ok((exposure, snapshot_risk)) = exposure {
+                match exposure {
+                    Ok((ts, long, short)) => {
+                        account.row.long_position = Some(long);
+                        account.row.short_position = Some(short);
+                        account.exposure_at = Some(ts);
+                    }
+                    Err(_) => {
+                        account.row.long_position = None;
+                        account.row.short_position = None;
+                        account.exposure_at = None;
+                    }
+                }
                 if snapshot_risk
                     .as_ref()
                     .is_some_and(|r| risk.as_ref().is_none_or(|old| r.ts > old.ts))
@@ -256,9 +265,6 @@ impl FrOverview {
                 && account
                     .row
                     .date_ms
-                    .is_some_and(|ts| (0..=FRESH).contains(&(time - ts)))
-                && account
-                    .exposure_at
                     .is_some_and(|ts| (0..=FRESH).contains(&(time - ts)));
             account.row.collection_status = if live {
                 "live"
@@ -508,10 +514,7 @@ pub(super) async fn report(
         if selected.is_none_or(|ts| ts == day(time))
             && (row
                 .date_ms
-                .is_none_or(|ts| !(0..=FRESH).contains(&(time - ts)))
-                || account
-                    .exposure_at
-                    .is_none_or(|ts| !(0..=FRESH).contains(&(time - ts))))
+                .is_none_or(|ts| !(0..=FRESH).contains(&(time - ts))))
         {
             row.collection_status = if row.equity.is_some() {
                 "stale"
@@ -519,6 +522,14 @@ pub(super) async fn report(
                 "unavailable"
             }
             .into();
+        }
+        if selected.is_none_or(|ts| ts == day(time))
+            && account
+                .exposure_at
+                .is_none_or(|ts| !(0..=FRESH).contains(&(time - ts)))
+        {
+            row.long_position = None;
+            row.short_position = None;
         }
         row.today_profit = row.equity.zip(row.yesterday_equity).map(|(a, b)| a - b);
         row.profit_percent = ratio(row.today_profit, row.yesterday_equity).map(|r| r * 100.0);
@@ -573,9 +584,14 @@ mod tests {
     }
     #[test]
     fn exposure_keeps_both_legs_and_skips_total_rows() {
-        let payload = serde_json::json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":100,"rows":[{"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30},{"is_total":true,"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30}]}}]});
+        let mut payload = serde_json::json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":100,"rows":[{"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30},{"is_total":true,"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30}]}}]});
         assert_eq!(exposure(&payload).unwrap(), (100, 20.0, 30.0));
         assert!(exposure(&serde_json::json!({"entries":[]})).is_err());
+        payload["entries"][0]["entry"]["rows"][0]["open_usdt"] = serde_json::json!(0);
+        assert!(
+            exposure(&payload).is_err(),
+            "an unpriced holding must not become zero exposure"
+        );
     }
     #[test]
     fn integration_token_does_not_accept_sessions_or_missing_tokens() {
