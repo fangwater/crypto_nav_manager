@@ -1,5 +1,25 @@
 # crypto_nav_manager
 
+## FR account overview integration
+
+`GET /api/integrations/fr-account-overview` exports the enabled funding-rate
+accounts for an independently polling CTA Manager. Optional `date=YYYY-MM-DD`
+selects a completed Shanghai day. The gateway route is
+`/nav-api/integrations/fr-account-overview`.
+
+Set a host-only `CRYPTO_NAV_OVERVIEW_TOKEN` (32–256 characters) and supply it as
+`Authorization: Bearer ...`. Without it, the endpoint denies requests and its
+worker stays disabled. This permission exports summary metrics only; browser
+sessions keep their existing permissions and cannot authenticate this endpoint.
+
+Facts refresh every 15 seconds; account history replays at most every 300 seconds
+using the existing FR FIFO, fee, funding and interest model. Shanghai midnight
+equity is reconstructed from live factual equity minus subsequent FR PnL. The
+response contains `accounts`, `dates`, `generated_at_ms`, and `loading`, with
+snake_case monitoring fields and per-account `collection_status`. Unknown
+metrics stay null. Historical holdings/margin are not inferred from equity.
+No trading writes, raw fills, environment paths or credentials are exported.
+
 A read-only crypto net asset value management system. It includes a multi-source
 IP REST dispatcher plus authenticated REST clients for Binance, Gate, Bitget,
 and OKX.

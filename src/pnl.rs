@@ -20,6 +20,8 @@ const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
 // through the next-hour wallet distribution.
 const BINANCE_INTRA_SPOT_MAKER_REBATE_RATE: f64 = 0.4 / 10_000.0;
 
+pub mod overview;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PnlSourceKind {
     Intra,

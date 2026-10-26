@@ -50,6 +50,8 @@ const DEFAULT_DB_USER: &str = "ubuntu";
 const FRONTEND_DIR_ENV: &str = "CRYPTO_NAV_FRONTEND_DIR";
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+mod fr_overview;
+
 #[derive(Clone, Copy)]
 struct IntraAnalysisAdapter {
     premium_table: &'static str,
@@ -66,6 +68,7 @@ struct AppState {
     fee_rate_syncs: Arc<Mutex<HashSet<String>>>,
     snapshot_sync: Arc<Mutex<()>>,
     fr_position_limits: FrPositionLimitMonitor,
+    fr_overview: fr_overview::FrOverview,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -631,6 +634,10 @@ pub async fn run() -> Result<()> {
         (account_risks, mark_prices)
     };
     let fr_position_limits = FrPositionLimitMonitor::new()?;
+    let fr_overview = fr_overview::FrOverview::new()?;
+    if !read_only {
+        fr_overview.spawn(pool.clone(), account_risks.clone(), mark_prices.clone());
+    }
     let sessions = if read_only {
         SessionStore::volatile(pool.clone())
     } else {
@@ -696,6 +703,11 @@ pub async fn run() -> Result<()> {
     let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth_login))
+        // Machine-only, read-only integration; browser APIs retain session auth.
+        .route(
+            "/api/integrations/fr-account-overview",
+            get(fr_overview::report),
+        )
         .merge(authed);
     if let Some(frontend_dir) = frontend_dir()? {
         let index = frontend_dir.join("index.html");
@@ -717,6 +729,7 @@ pub async fn run() -> Result<()> {
             fee_rate_syncs: Arc::new(Mutex::new(HashSet::new())),
             snapshot_sync: Arc::new(Mutex::new(())),
             fr_position_limits,
+            fr_overview,
         })
         .layer(TraceLayer::new_for_http());
 

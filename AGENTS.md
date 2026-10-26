@@ -84,6 +84,15 @@ read-only instances). Users live in `nav_users` (`admin` / `user`); regular
 users only see strategies granted in `nav_user_strategy_grants` and all write
 plus `/api/admin/*` endpoints are admin-only. There is no self-registration.
 
+The read-only machine endpoint `/api/integrations/fr-account-overview` is a
+separate authentication exception: require a Bearer token from host-only
+`CRYPTO_NAV_OVERVIEW_TOKEN` (32–256 characters); a browser session alone is not
+accepted. Without that environment variable, deny access and leave its worker
+disabled. Export enabled funding-rate accounts and summary metrics only, never
+credentials or environment paths. CTA Manager polls the endpoint over HTTP;
+do not add shared databases, runtime state or relative-path coupling. Keep FR
+FIFO/fees/funding/interest calculations in NAV, independent per account.
+
 Create the first administrator directly in PostgreSQL:
 
 ```sql
