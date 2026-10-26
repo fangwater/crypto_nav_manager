@@ -14,7 +14,12 @@ sessions keep their existing permissions and cannot authenticate this endpoint.
 
 Facts refresh every 15 seconds; account history replays at most every 300 seconds
 using the existing FR FIFO, fee, funding and interest model. Shanghai midnight
-equity is reconstructed from live factual equity minus subsequent FR PnL. The
+equity is reconstructed from live factual equity minus subsequent total FR PnL.
+Daily profit uses FIFO realized trading PnL plus actual funding minus trading
+fees and borrowing interest, excluding open-position floating PnL. It is
+independent of the live-equity anchor; historical profit uses the same daily
+realized-event boundaries. Return divides that profit by opening equity;
+equity and equity drawdown retain their account-NAV meaning. The
 response contains `accounts`, `dates`, `generated_at_ms`, and `loading`, with
 snake_case monitoring fields and per-account `collection_status`. Unknown
 metrics stay null. Historical holdings/margin are not inferred from equity.

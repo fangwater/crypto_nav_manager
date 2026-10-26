@@ -58,6 +58,15 @@ impl Reconstruction {
             .get(&ts)
             .map(|p| self.equity - self.history.final_pnl + p)
     }
+    fn daily_realized_profit(&self, start: i64, end: Option<i64>) -> Option<f64> {
+        let opening = *self.history.realized_boundaries.get(&start)?;
+        let closing = match end {
+            Some(end) => *self.history.realized_boundaries.get(&end)?,
+            None if day(self.at) == start => self.history.final_realized_net,
+            None => return None,
+        };
+        Some(closing - opening)
+    }
     fn drawdown(&self, end: i64) -> Option<f64> {
         let start = end - 15 * DAY;
         if start < self.start {
@@ -499,6 +508,7 @@ pub(super) async fn report(
             } else {
                 row.yesterday_equity = r.equity_at(day(time));
             }
+            row.today_profit = r.daily_realized_profit(end.map_or(day(time), |end| end - DAY), end);
             row.max_drawdown_15d_percent = r.drawdown(end.unwrap_or(r.at));
             row.history_start_ms = Some(r.start);
             row.history_rebuilt_at_ms = Some(r.at);
@@ -531,7 +541,9 @@ pub(super) async fn report(
             row.long_position = None;
             row.short_position = None;
         }
-        row.today_profit = row.equity.zip(row.yesterday_equity).map(|(a, b)| a - b);
+        // Profit comes only from realized events; live equity movements must
+        // never introduce floating PnL or deposits into the daily profit.
+
         row.profit_percent = ratio(row.today_profit, row.yesterday_equity).map(|r| r * 100.0);
         row.long_leverage = ratio(row.long_position, row.equity);
         row.short_leverage = ratio(row.short_position, row.equity);
@@ -573,6 +585,8 @@ mod tests {
             history: pnl::overview::History {
                 boundaries: BTreeMap::from([(5 * DAY, 10.0), (20 * DAY, 0.0)]),
                 points: vec![(6 * DAY, 20.0), (7 * DAY, -10.0), (20 * DAY, 0.0)],
+                realized_boundaries: BTreeMap::from([(5 * DAY, 3.0), (20 * DAY, 8.0)]),
+                final_realized_net: 10.0,
                 final_pnl: 0.0,
                 start_pnl: 0.0,
             },
@@ -581,6 +595,29 @@ mod tests {
         assert_eq!(reconstruction.equity_at(19 * DAY), None);
         assert_eq!(reconstruction.drawdown(20 * DAY), Some(25.0));
         assert_eq!(reconstruction.drawdown(14 * DAY), None);
+        assert_eq!(
+            reconstruction.daily_realized_profit(5 * DAY, Some(20 * DAY)),
+            Some(5.0)
+        );
+        let mut changed_equity = reconstruction.clone();
+        let opening = day(changed_equity.at);
+        changed_equity
+            .history
+            .realized_boundaries
+            .insert(opening, 8.0);
+        assert_eq!(
+            changed_equity.daily_realized_profit(opening, None),
+            Some(2.0)
+        );
+        assert_eq!(
+            changed_equity.daily_realized_profit(opening - DAY, None),
+            None
+        );
+        changed_equity.equity = 2000.0;
+        assert_eq!(
+            changed_equity.daily_realized_profit(opening, None),
+            Some(2.0)
+        );
     }
     #[test]
     fn exposure_keeps_both_legs_and_skips_total_rows() {

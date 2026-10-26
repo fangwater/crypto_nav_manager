@@ -91,7 +91,10 @@ accepted. Without that environment variable, deny access and leave its worker
 disabled. Export enabled funding-rate accounts and summary metrics only, never
 credentials or environment paths. CTA Manager polls the endpoint over HTTP;
 do not add shared databases, runtime state or relative-path coupling. Keep FR
-FIFO/fees/funding/interest calculations in NAV, independent per account.
+FIFO/fees/funding/interest calculations in NAV, independent per account. FR
+overview daily profit uses FIFO realized trading PnL plus actual funding minus
+fees and borrowing interest; exclude open-position floating PnL and do not
+derive profit from the live-equity difference.
 
 Create the first administrator directly in PostgreSQL:
 
