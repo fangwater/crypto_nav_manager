@@ -1,4 +1,4 @@
-//! Lean account replay using exactly the FR page's FIFO, fee, funding and interest model.
+//! Lean account replay using the source page's FIFO, fee, funding and interest model.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -14,12 +14,18 @@ pub struct History {
 
 /// Boundary values precede fills at the boundary: a Shanghai-midnight fill
 /// belongs to the new day. Keep every change for drawdown, without chart sampling.
-pub fn replay(inputs: PnlInputs, start: i64, end: i64, boundaries: &[i64]) -> Result<History> {
+pub fn replay(
+    source: PnlSourceKind,
+    inputs: PnlInputs,
+    start: i64,
+    end: i64,
+    boundaries: &[i64],
+) -> Result<History> {
     let mut states = HashMap::new();
     for position in &inputs.initial_positions {
         states
             .entry(position.symbol.clone())
-            .or_insert_with(|| SymbolState::for_source(PnlSourceKind::FundingRate))
+            .or_insert_with(|| SymbolState::for_source(source))
             .seed_position(position)?;
     }
     let mut events =
@@ -64,7 +70,7 @@ pub fn replay(inputs: PnlInputs, start: i64, end: i64, boundaries: &[i64]) -> Re
         let symbol = event.symbol();
         states
             .entry(symbol.into())
-            .or_insert_with(|| SymbolState::for_source(PnlSourceKind::FundingRate));
+            .or_insert_with(|| SymbolState::for_source(source));
         let before = states[symbol].metrics();
         apply_event(&mut states, event)?;
         let after = states[symbol].metrics();
@@ -108,6 +114,70 @@ fn realized_net_pnl(metrics: &Metrics) -> f64 {
 mod tests {
     use super::*;
     #[test]
+    fn market_making_summary_preserves_its_existing_amount_fifo_model() {
+        let inputs = PnlInputs {
+            trades: vec![
+                NormalizedTrade {
+                    symbol: "BTCUSDT".into(),
+                    side: Side::Buy,
+                    leg: PositionLeg::Futures,
+                    price: 100.0,
+                    amount_u: 200.0,
+                    quantity: 2.0,
+                    fee_usdt: Some(1.0),
+                    ts: 100,
+                },
+                NormalizedTrade {
+                    symbol: "BTCUSDT".into(),
+                    side: Side::Sell,
+                    leg: PositionLeg::Futures,
+                    price: 120.0,
+                    amount_u: 120.0,
+                    quantity: 1.0,
+                    fee_usdt: Some(0.5),
+                    ts: 110,
+                },
+            ],
+            funding: vec![FundingEvent {
+                symbol: "BTCUSDT".into(),
+                amount_usdt: 2.0,
+                ts: 115,
+            }],
+            ..Default::default()
+        };
+        let history = replay(
+            PnlSourceKind::MarketMaking,
+            inputs.clone(),
+            0,
+            200,
+            &[100, 110, 200],
+        )
+        .unwrap();
+        let full = calculate(
+            inputs.clone(),
+            PnlCalculation {
+                source: PnlSourceKind::MarketMaking,
+                exchange: "bybit".into(),
+                strategy_start_ms: 0,
+                start_ms: 0,
+                end_ms: 200,
+                selected_symbols: vec![],
+                max_points: 1000,
+                initial_snapshot_ts_ms: None,
+                skipped_initial_position_count: 0,
+                principal_usdt: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(history.final_pnl, full.summary.total_pnl_usdt);
+        assert_eq!(
+            history.final_realized_net,
+            full.summary.fee_after_pnl_usdt + full.summary.funding_pnl_usdt
+        );
+        let quantity = replay(PnlSourceKind::FundingRate, inputs, 0, 200, &[200]).unwrap();
+        assert_ne!(history.final_realized_net, quantity.final_realized_net);
+    }
+    #[test]
     fn daily_realized_profit_excludes_open_marks_and_counts_closes_and_charges_once() {
         let trade = |side, price, quantity, ts| NormalizedTrade {
             symbol: "BTCUSDT".into(),
@@ -139,7 +209,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let history = replay(inputs, 0, 200, &[100, 102, 200]).unwrap();
+        let history = replay(PnlSourceKind::FundingRate, inputs, 0, 200, &[100, 102, 200]).unwrap();
         assert_eq!(history.realized_boundaries[&100], 0.0);
         // Opening another lot changes floating marks by 40, but only its fee is realized.
         assert_eq!(history.boundaries[&102], 38.0);
@@ -182,7 +252,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let history = replay(inputs.clone(), 0, 200, &[100, 101, 102, 200]).unwrap();
+        let history = replay(
+            PnlSourceKind::FundingRate,
+            inputs.clone(),
+            0,
+            200,
+            &[100, 101, 102, 200],
+        )
+        .unwrap();
         assert_eq!(history.boundaries[&100], 0.0);
         assert_eq!(history.boundaries[&101], -1.0);
         assert_eq!(history.boundaries[&102], 1.0);

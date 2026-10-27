@@ -100,6 +100,11 @@ subtotals when other balances lack prices, and exports `position_unpriced_assets
 for CTA's partial-valuation disclosure. An entirely unpriced side remains null.
 Do not infer dust value from base quantity, value missing assets at zero, or
 change the independent FIFO/fees/funding/interest calculations for this display.
+The same operator request adds enabled `okex_mm_alpha` and `bybit_mm_alpha` to
+this HTTP summary with `account_kind = "mm"`; FR rows use `"fr"`. Preserve each
+source's existing NAV FIFO model, including MM's amount-based FIFO, fees and
+funding. Run historical replay independently of the live-facts polling loop,
+with one reconstruction at a time, so large MM histories cannot stale FR facts.
 
 Create the first administrator directly in PostgreSQL:
 

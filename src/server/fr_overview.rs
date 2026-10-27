@@ -25,6 +25,7 @@ pub(super) struct Row {
     source_id: String,
     account: String,
     venue: String,
+    account_kind: String,
     yesterday_equity: Option<f64>,
     equity: Option<f64>,
     today_profit: Option<f64>,
@@ -122,6 +123,7 @@ pub(super) struct FrOverview {
     token_hash: Option<[u8; 32]>,
     cache: Arc<RwLock<Cache>>,
     client: reqwest::Client,
+    history_gate: Arc<tokio::sync::Semaphore>,
 }
 impl FrOverview {
     pub(super) fn new() -> Result<Self> {
@@ -135,6 +137,7 @@ impl FrOverview {
         Ok(Self {
             token_hash: token.map(|v| Sha256::digest(v.as_bytes()).into()),
             cache: Arc::default(),
+            history_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -176,7 +179,7 @@ impl FrOverview {
         risks: &AccountRiskCache,
         marks: &MarkPriceCache,
     ) -> Result<()> {
-        let strategies=sqlx::query_as::<_,StrategyRecord>("SELECT slug,alias,db_schema,host,env_path,csv_output_dir,st_ms,strategy_kind,exchange,account_mode,required_keys,config_url,sort_order FROM strategy_envs WHERE enabled AND strategy_kind='funding_rate' ORDER BY sort_order,slug").fetch_all(pool).await?;
+        let strategies=sqlx::query_as::<_,StrategyRecord>("SELECT slug,alias,db_schema,host,env_path,csv_output_dir,st_ms,strategy_kind,exchange,account_mode,required_keys,config_url,sort_order FROM strategy_envs WHERE enabled AND (strategy_kind='funding_rate' OR (strategy_kind='market_making' AND slug IN ('okex_mm_alpha','bybit_mm_alpha'))) ORDER BY sort_order,slug").fetch_all(pool).await?;
         let slugs = strategies
             .iter()
             .map(|s| s.slug.clone())
@@ -210,6 +213,12 @@ impl FrOverview {
                 .clone()
                 .unwrap_or_else(|| strategy.slug.clone());
             account.row.venue = strategy.exchange.clone();
+            account.row.account_kind = if strategy.strategy_kind == "market_making" {
+                "mm"
+            } else {
+                "fr"
+            }
+            .into();
             let time = now();
             account.row.queried_at_ms = time;
             let mut risk = snapshots
@@ -286,34 +295,47 @@ impl FrOverview {
                 "unavailable"
             }
             .into();
-            if live
+            let history_permit = if live
                 && time - account.history_attempt_at >= 300_000
                 && account
                     .reconstruction
                     .as_ref()
                     .is_none_or(|r| time - r.at >= 300_000 || day(r.at) != day(time))
             {
+                self.history_gate.clone().try_acquire_owned().ok()
+            } else {
+                None
+            };
+            if history_permit.is_some() {
                 account.history_attempt_at = time;
-                match reconstruct(
-                    pool,
-                    marks,
-                    &strategy,
-                    account.row.equity.unwrap(),
-                    account.row.date_ms.unwrap(),
-                )
-                .await
-                {
-                    Ok(reconstruction) => account.reconstruction = Some(Arc::new(reconstruction)),
-                    Err(error) => {
-                        warn!(slug=%strategy.slug,%error,"FR overview history unavailable")
-                    }
-                }
             }
+            let anchor = account.row.equity.zip(account.row.date_ms);
             self.cache
                 .write()
                 .unwrap()
                 .accounts
-                .insert(strategy.slug, account);
+                .insert(strategy.slug.clone(), account);
+            if let Some(permit) = history_permit {
+                let hub = self.clone();
+                let pool = pool.clone();
+                let marks = marks.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let (equity, at) = anchor.unwrap();
+                    match reconstruct(&pool, &marks, &strategy, equity, at).await {
+                        Ok(value) => {
+                            if let Some(account) =
+                                hub.cache.write().unwrap().accounts.get_mut(&strategy.slug)
+                            {
+                                account.reconstruction = Some(Arc::new(value));
+                            }
+                        }
+                        Err(error) => {
+                            warn!(slug=%strategy.slug,%error,"account overview history unavailable")
+                        }
+                    }
+                });
+            }
         }
         let mut cache = self.cache.write().unwrap();
         cache.accounts.retain(|slug, _| slugs.contains(slug));
@@ -414,13 +436,19 @@ async fn reconstruct(
     equity: f64,
     at: i64,
 ) -> Result<Reconstruction> {
+    let source = PnlSourceKind::for_strategy(
+        &strategy.strategy_kind,
+        &strategy.exchange,
+        &strategy.account_mode,
+    )
+    .context("unsupported overview PnL source")?;
     let initial = load_initial_snapshot(pool, &strategy.slug).await?;
     let start = initial
         .as_ref()
         .map_or(strategy.st_ms, |s| s.snapshot_ts_ms);
     let mut inputs = pnl::load_inputs(
         pool,
-        PnlSourceKind::FundingRate,
+        source,
         &strategy.db_schema,
         &strategy.exchange,
         marks,
@@ -441,7 +469,7 @@ async fn reconstruct(
         .filter(|ts| *ts >= start)
         .collect::<Vec<_>>();
     let history = tokio::task::spawn_blocking(move || {
-        pnl::overview::replay(inputs, at - 46 * DAY, at, &boundaries)
+        pnl::overview::replay(source, inputs, at - 46 * DAY, at, &boundaries)
     })
     .await??;
     Ok(Reconstruction {
@@ -547,6 +575,7 @@ pub(super) async fn report(
                 source_id: row.source_id,
                 account: row.account,
                 venue: row.venue,
+                account_kind: row.account_kind,
                 collection_status: "unavailable".into(),
                 ..Default::default()
             };
