@@ -34,6 +34,7 @@ pub(super) struct Row {
     long_leverage: Option<f64>,
     short_leverage: Option<f64>,
     net_position: Option<f64>,
+    position_unpriced_assets: Vec<String>,
     max_drawdown_15d_percent: Option<f64>,
     margin: Option<f64>,
     margin_percent: Option<f64>,
@@ -247,14 +248,16 @@ impl FrOverview {
             .await;
             if let Ok((exposure, snapshot_risk)) = exposure {
                 match exposure {
-                    Ok((ts, long, short)) => {
-                        account.row.long_position = Some(long);
-                        account.row.short_position = Some(short);
-                        account.exposure_at = Some(ts);
+                    Ok(exposure) => {
+                        account.row.long_position = exposure.long;
+                        account.row.short_position = exposure.short;
+                        account.row.position_unpriced_assets = exposure.unpriced_assets;
+                        account.exposure_at = Some(exposure.ts);
                     }
                     Err(_) => {
                         account.row.long_position = None;
                         account.row.short_position = None;
+                        account.row.position_unpriced_assets.clear();
                         account.exposure_at = None;
                     }
                 }
@@ -319,7 +322,15 @@ impl FrOverview {
     }
 }
 
-fn exposure(payload: &Value) -> Result<(i64, f64, f64)> {
+#[derive(Debug, PartialEq)]
+struct Exposure {
+    ts: i64,
+    long: Option<f64>,
+    short: Option<f64>,
+    unpriced_assets: Vec<String>,
+}
+
+fn exposure(payload: &Value) -> Result<Exposure> {
     let entry = payload["entries"]
         .as_array()
         .context("missing snapshot entries")?
@@ -330,14 +341,26 @@ fn exposure(payload: &Value) -> Result<(i64, f64, f64)> {
     let ts = entry["ts_ms"].as_i64().context("missing exposure time")?;
     let rows = entry["rows"].as_array().context("missing exposure rows")?;
     let (mut long, mut short) = (0.0, 0.0);
+    let (mut unpriced_long, mut unpriced_short) = (false, false);
+    let mut unpriced_assets = std::collections::BTreeSet::new();
     for row in rows.iter().filter(|r| r["is_total"] != true) {
         for (qty, notional) in [("open_qty", "open_usdt"), ("hedge_qty", "hedge_usdt")] {
             let qty = row[qty].as_f64().context("missing factual quantity")?;
             let value = row[notional].as_f64().context("missing factual notional")?;
             anyhow::ensure!(
-                value.is_finite() && qty.is_finite() && (qty == 0.0 || value != 0.0),
+                value.is_finite() && qty.is_finite() && (qty != 0.0 || value == 0.0),
                 "invalid exposure valuation"
             );
+            if qty != 0.0 && value == 0.0 {
+                // Preserve measured legs, but never claim that an unpriced
+                // holding is flat or that its unknown notional is dust.
+                let asset = row["asset"].as_str().context("missing unpriced asset")?;
+                anyhow::ensure!(!asset.trim().is_empty(), "empty unpriced asset");
+                unpriced_assets.insert(asset.to_string());
+                unpriced_long |= qty > 0.0;
+                unpriced_short |= qty < 0.0;
+                continue;
+            }
             if qty > 0.0 {
                 long += value.abs();
             } else if qty < 0.0 {
@@ -345,7 +368,13 @@ fn exposure(payload: &Value) -> Result<(i64, f64, f64)> {
             }
         }
     }
-    Ok((ts, long, short))
+    anyhow::ensure!(long.is_finite() && short.is_finite(), "exposure overflow");
+    Ok(Exposure {
+        ts,
+        long: (long > 0.0 || !unpriced_long).then_some(long),
+        short: (short > 0.0 || !unpriced_short).then_some(short),
+        unpriced_assets: unpriced_assets.into_iter().collect(),
+    })
 }
 
 struct RiskFact {
@@ -498,6 +527,7 @@ pub(super) async fn report(
                 row.date_ms = Some(end);
                 row.long_position = None;
                 row.short_position = None;
+                row.position_unpriced_assets.clear();
                 row.margin = None;
                 row.collection_status = if row.equity.is_some() {
                     "historical"
@@ -540,6 +570,7 @@ pub(super) async fn report(
         {
             row.long_position = None;
             row.short_position = None;
+            row.position_unpriced_assets.clear();
         }
         // Profit comes only from realized events; live equity movements must
         // never introduce floating PnL or deposits into the daily profit.
@@ -622,13 +653,61 @@ mod tests {
     #[test]
     fn exposure_keeps_both_legs_and_skips_total_rows() {
         let mut payload = serde_json::json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":100,"rows":[{"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30},{"is_total":true,"open_qty":2,"open_usdt":20,"hedge_qty":-3,"hedge_usdt":-30}]}}]});
-        assert_eq!(exposure(&payload).unwrap(), (100, 20.0, 30.0));
+        assert_eq!(
+            exposure(&payload).unwrap(),
+            Exposure {
+                ts: 100,
+                long: Some(20.0),
+                short: Some(30.0),
+                unpriced_assets: vec![],
+            }
+        );
         assert!(exposure(&serde_json::json!({"entries":[]})).is_err());
         payload["entries"][0]["entry"]["rows"][0]["open_usdt"] = serde_json::json!(0);
         assert!(
             exposure(&payload).is_err(),
-            "an unpriced holding must not become zero exposure"
+            "an unpriced holding must identify the omitted asset"
         );
+    }
+    #[test]
+    fn unpriced_holdings_preserve_priced_legs_without_assuming_dust_value() {
+        let payload = serde_json::json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":100,"rows":[
+            {"asset":"BTC","open_qty":2,"open_usdt":200,"hedge_qty":-2,"hedge_usdt":-190},
+            {"asset":"FTM","open_qty":0.000000003281,"open_usdt":0,"hedge_qty":0,"hedge_usdt":0},
+            {"asset":"SLVON","open_qty":0.00911592,"open_usdt":0,"hedge_qty":0,"hedge_usdt":0},
+            {"asset":"MISSING","open_qty":1000000,"open_usdt":0,"hedge_qty":-1000000,"hedge_usdt":0},
+            {"is_total":true,"open_qty":null,"open_usdt":null,"hedge_qty":null,"hedge_usdt":null}
+        ]}}]});
+        assert_eq!(
+            exposure(&payload).unwrap(),
+            Exposure {
+                ts: 100,
+                long: Some(200.0),
+                short: Some(190.0),
+                unpriced_assets: vec!["FTM".into(), "MISSING".into(), "SLVON".into()],
+            }
+        );
+    }
+    #[test]
+    fn entirely_unpriced_side_stays_unknown_and_zero_holdings_stay_zero() {
+        let mut payload = serde_json::json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":100,"rows":[
+            {"asset":"SLVON","open_qty":0.00911592,"open_usdt":0,"hedge_qty":0,"hedge_usdt":0}
+        ]}}]});
+        let value = exposure(&payload).unwrap();
+        assert_eq!(value.long, None);
+        assert_eq!(value.short, Some(0.0));
+        payload["entries"][0]["entry"]["rows"][0]["hedge_qty"] = serde_json::json!(-2);
+        assert_eq!(exposure(&payload).unwrap().short, None);
+        payload["entries"][0]["entry"]["rows"][0]["open_qty"] = serde_json::json!(0);
+        payload["entries"][0]["entry"]["rows"][0]["hedge_qty"] = serde_json::json!(0);
+        let value = exposure(&payload).unwrap();
+        assert_eq!(value.long, Some(0.0));
+        assert_eq!(value.short, Some(0.0));
+        assert!(value.unpriced_assets.is_empty());
+        payload["entries"][0]["entry"]["rows"][0]["open_usdt"] = serde_json::json!(10);
+        assert!(exposure(&payload).is_err());
+        payload["entries"][0]["entry"]["rows"][0]["open_usdt"] = Value::Null;
+        assert!(exposure(&payload).is_err());
     }
     #[test]
     fn integration_token_does_not_accept_sessions_or_missing_tokens() {

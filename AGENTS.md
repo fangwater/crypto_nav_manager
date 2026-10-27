@@ -95,6 +95,11 @@ FIFO/fees/funding/interest calculations in NAV, independent per account. FR
 overview daily profit uses FIFO realized trading PnL plus actual funding minus
 fees and borrowing interest; exclude open-position floating PnL and do not
 derive profit from the live-equity difference.
+By operator request on 2026-10-27, the overview preserves priced position
+subtotals when other balances lack prices, and exports `position_unpriced_assets`
+for CTA's partial-valuation disclosure. An entirely unpriced side remains null.
+Do not infer dust value from base quantity, value missing assets at zero, or
+change the independent FIFO/fees/funding/interest calculations for this display.
 
 Create the first administrator directly in PostgreSQL:
 
