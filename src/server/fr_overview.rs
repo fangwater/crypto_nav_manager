@@ -115,6 +115,7 @@ struct Account {
     monitor_reconstruction: Option<Arc<Reconstruction>>,
     exposure_at: Option<i64>,
     history_attempt_at: i64,
+    history_error: Option<String>,
 }
 #[derive(Default)]
 struct Cache {
@@ -211,6 +212,7 @@ impl FrOverview {
                 monitor_reconstruction: None,
                 exposure_at: None,
                 history_attempt_at: 0,
+                history_error: None,
             });
             account.row.account = strategy
                 .alias
@@ -341,9 +343,16 @@ impl FrOverview {
                                     account.reconstruction = Some(value.clone());
                                 }
                                 account.monitor_reconstruction = Some(value);
+                                account.history_error = None;
                             }
                         }
                         Err(error) => {
+                            if let Some(account) =
+                                hub.cache.write().unwrap().accounts.get_mut(&strategy.slug)
+                            {
+                                account.history_error =
+                                    Some("NAV 历史重算暂不可用，后台会重试".into());
+                            }
                             warn!(slug=%strategy.slug,%error,"account overview history unavailable")
                         }
                     }
@@ -679,6 +688,7 @@ mod tests {
             monitor_reconstruction: Some(r),
             exposure_at: None,
             history_attempt_at: 0,
+            history_error: None,
         };
         let value = monitor_value(&account, end);
         assert_eq!(value["points"][0]["pnl_quote"], 0.0);
@@ -861,7 +871,7 @@ fn monitor_value(account: &Account, time: i64) -> Value {
         return serde_json::json!({
             "source_id":account.row.source_id,"start_ms":null,"end_ms":null,
             "generated_at_ms":time,"interval_hours":4,"valuation":"","funding":"actual",
-            "complete":false,"loading":true,"unavailable_reason":"NAV 历史重算中","points":[]
+            "complete":false,"loading":account.history_error.is_none(),"unavailable_reason":account.history_error.as_deref().unwrap_or("NAV 历史重算中"),"points":[]
         });
     };
     let realized = account.row.account_kind == "fr";
