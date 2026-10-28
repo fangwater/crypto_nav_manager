@@ -380,3 +380,14 @@ perform exchange signing and route every request through a `Dispatcher`.
 A `Dispatcher` is cheap to clone and all clones share quota and cooldown state.
 Accounts using the same exchange and egress-IP pool should receive clones of the
 same dispatcher so IP-level quota accounting is shared across those accounts.
+
+The read-only NAV monitoring endpoint
+`GET /api/integrations/fr-account-overview/nav?sourceId=<slug>` uses the same
+host-only Bearer token as the account overview. It serves a cached, zero-based
+cumulative PnL series from the configured initial snapshot (or strategy monitoring
+start), sampled every four hours with opening and latest points. FR excludes
+floating PnL and includes realized FIFO, actual funding, fees and interest; MM
+keeps its existing FIFO total-PnL model. No initial equity is required. Responses
+include `complete`, `loading`, `unavailable_reason`, valuation/funding labels and
+`points: [{ts_ms, pnl_quote}]`. Stale or missing histories are explicit. This
+endpoint exports enabled overview accounts only, without raw fills or credentials.

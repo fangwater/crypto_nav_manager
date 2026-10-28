@@ -49,16 +49,17 @@ pub(super) struct Row {
 #[derive(Clone)]
 struct Reconstruction {
     at: i64,
-    equity: f64,
+    equity: Option<f64>,
     start: i64,
     history: pnl::overview::History,
 }
 impl Reconstruction {
     fn equity_at(&self, ts: i64) -> Option<f64> {
+        let equity = self.equity?;
         self.history
             .boundaries
             .get(&ts)
-            .map(|p| self.equity - self.history.final_pnl + p)
+            .map(|p| equity - self.history.final_pnl + p)
     }
     fn daily_realized_profit(&self, start: i64, end: Option<i64>) -> Option<f64> {
         let opening = *self.history.realized_boundaries.get(&start)?;
@@ -70,6 +71,7 @@ impl Reconstruction {
         Some(closing - opening)
     }
     fn drawdown(&self, end: i64) -> Option<f64> {
+        let anchor_equity = self.equity?;
         let start = end - 15 * DAY;
         if start < self.start {
             return None;
@@ -87,7 +89,7 @@ impl Reconstruction {
                     .find(|(ts, _)| *ts < start)
                     .map_or(self.history.start_pnl, |(_, p)| *p)
             });
-        let mut peak = self.equity - self.history.final_pnl + start_pnl;
+        let mut peak = anchor_equity - self.history.final_pnl + start_pnl;
         if peak <= 0.0 {
             return None;
         }
@@ -98,7 +100,7 @@ impl Reconstruction {
             .iter()
             .filter(|(ts, _)| *ts >= start && *ts <= end)
         {
-            let equity = self.equity - self.history.final_pnl + pnl;
+            let equity = anchor_equity - self.history.final_pnl + pnl;
             peak = peak.max(equity);
             maximum = maximum.max((peak - equity) / peak * 100.0);
         }
@@ -110,6 +112,7 @@ impl Reconstruction {
 struct Account {
     row: Row,
     reconstruction: Option<Arc<Reconstruction>>,
+    monitor_reconstruction: Option<Arc<Reconstruction>>,
     exposure_at: Option<i64>,
     history_attempt_at: i64,
 }
@@ -205,6 +208,7 @@ impl FrOverview {
                     ..Default::default()
                 },
                 reconstruction: None,
+                monitor_reconstruction: None,
                 exposure_at: None,
                 history_attempt_at: 0,
             });
@@ -295,10 +299,9 @@ impl FrOverview {
                 "unavailable"
             }
             .into();
-            let history_permit = if live
-                && time - account.history_attempt_at >= 300_000
+            let history_permit = if time - account.history_attempt_at >= 300_000
                 && account
-                    .reconstruction
+                    .monitor_reconstruction
                     .as_ref()
                     .is_none_or(|r| time - r.at >= 300_000 || day(r.at) != day(time))
             {
@@ -309,7 +312,13 @@ impl FrOverview {
             if history_permit.is_some() {
                 account.history_attempt_at = time;
             }
-            let anchor = account.row.equity.zip(account.row.date_ms);
+            // PnL monitoring needs no live-equity anchor. Daily reconstructed
+            // equity remains unknown when a fresh factual anchor is absent.
+            let anchor = if live {
+                (account.row.equity, account.row.date_ms.unwrap())
+            } else {
+                (None, time)
+            };
             self.cache
                 .write()
                 .unwrap()
@@ -321,13 +330,17 @@ impl FrOverview {
                 let marks = marks.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let (equity, at) = anchor.unwrap();
+                    let (equity, at) = anchor;
                     match reconstruct(&pool, &marks, &strategy, equity, at).await {
                         Ok(value) => {
                             if let Some(account) =
                                 hub.cache.write().unwrap().accounts.get_mut(&strategy.slug)
                             {
-                                account.reconstruction = Some(Arc::new(value));
+                                let value = Arc::new(value);
+                                if value.equity.is_some() {
+                                    account.reconstruction = Some(value.clone());
+                                }
+                                account.monitor_reconstruction = Some(value);
                             }
                         }
                         Err(error) => {
@@ -433,7 +446,7 @@ async fn reconstruct(
     pool: &PgPool,
     marks: &MarkPriceCache,
     strategy: &StrategyRecord,
-    equity: f64,
+    equity: Option<f64>,
     at: i64,
 ) -> Result<Reconstruction> {
     let source = PnlSourceKind::for_strategy(
@@ -464,10 +477,11 @@ async fn reconstruct(
         );
         inputs.initial_positions = parsed.positions;
     }
-    let boundaries = (0..=46)
+    let mut boundaries = (0..=46)
         .map(|i| day(at) - i * DAY)
         .filter(|ts| *ts >= start)
         .collect::<Vec<_>>();
+    boundaries.extend(monitor_boundaries(start, at)?);
     let history = tokio::task::spawn_blocking(move || {
         pnl::overview::replay(source, inputs, at - 46 * DAY, at, &boundaries)
     })
@@ -538,11 +552,10 @@ pub(super) async fn report(
     for account in cache.accounts.values() {
         let mut row = account.row.clone();
         if let Some(r) = &account.reconstruction {
-            for ts in r
-                .history
-                .boundaries
-                .keys()
-                .filter(|ts| **ts >= day(time) - 30 * DAY && **ts < day(time))
+            for ts in
+                r.history.boundaries.keys().filter(|ts| {
+                    day(**ts) == **ts && **ts >= day(time) - 30 * DAY && **ts < day(time)
+                })
             {
                 if r.equity_at(ts + DAY).is_some() {
                     dates.insert(label(*ts));
@@ -624,6 +637,61 @@ fn ratio(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 mod tests {
     use super::*;
     #[test]
+    fn monitoring_is_zero_based_and_fr_excludes_floating_without_equity() {
+        let hour = 3_600_000;
+        let start = hour;
+        let end = 10 * hour;
+        assert_eq!(
+            monitor_boundaries(start, end).unwrap(),
+            vec![hour, 4 * hour, 8 * hour, 10 * hour]
+        );
+        let r = Arc::new(Reconstruction {
+            at: end,
+            equity: None,
+            start,
+            history: pnl::overview::History {
+                boundaries: BTreeMap::from([
+                    (start, 0.0),
+                    (4 * hour, 100.0),
+                    (8 * hour, 200.0),
+                    (end, 300.0),
+                ]),
+                realized_boundaries: BTreeMap::from([
+                    (start, 0.0),
+                    (4 * hour, 1.0),
+                    (8 * hour, -2.0),
+                    (end, 3.0),
+                ]),
+                points: vec![],
+                final_pnl: 300.0,
+                final_realized_net: 3.0,
+                start_pnl: 0.0,
+            },
+        });
+        assert_eq!(r.equity_at(end), None);
+        let mut account = Account {
+            row: Row {
+                source_id: "fr_a".into(),
+                account_kind: "fr".into(),
+                ..Default::default()
+            },
+            reconstruction: None,
+            monitor_reconstruction: Some(r),
+            exposure_at: None,
+            history_attempt_at: 0,
+        };
+        let value = monitor_value(&account, end);
+        assert_eq!(value["points"][0]["pnl_quote"], 0.0);
+        assert_eq!(value["points"][3]["pnl_quote"], 3.0);
+        assert_eq!(value["complete"], true);
+        account.row.account_kind = "mm".into();
+        assert_eq!(
+            monitor_value(&account, end)["points"][3]["pnl_quote"],
+            300.0
+        );
+        assert_eq!(monitor_value(&account, end + 600_001)["complete"], false);
+    }
+    #[test]
     fn viz_risk_requires_factual_equity_and_its_own_fresh_timestamp() {
         let mut payload = serde_json::json!({"entries":[{"type":"pre_trade_risk","entry":{"ts_ms":1000000,"total_equity":100,"account_risks":[{"ts_ms":100,"actual_equity_usd":90,"initial_margin_usd":10}]}}]});
         let risk = snapshot_risk(&payload).unwrap();
@@ -640,7 +708,7 @@ mod tests {
     fn reconstructed_equity_drawdown_uses_complete_history_and_never_fills_missing_days() {
         let reconstruction = Reconstruction {
             at: 20 * DAY,
-            equity: 100.0,
+            equity: Some(100.0),
             start: 0,
             history: pnl::overview::History {
                 boundaries: BTreeMap::from([(5 * DAY, 10.0), (20 * DAY, 0.0)]),
@@ -673,7 +741,7 @@ mod tests {
             changed_equity.daily_realized_profit(opening - DAY, None),
             None
         );
-        changed_equity.equity = 2000.0;
+        changed_equity.equity = Some(2000.0);
         assert_eq!(
             changed_equity.daily_realized_profit(opening, None),
             Some(2.0)
@@ -757,4 +825,107 @@ mod tests {
         hub.token_hash = None;
         assert!(!hub.authorized(&headers));
     }
+}
+
+const MONITOR_INTERVAL: i64 = 4 * 3_600_000;
+
+fn monitor_boundaries(start: i64, end: i64) -> Result<Vec<i64>> {
+    anyhow::ensure!(
+        start > 0 && end >= start,
+        "invalid monitoring history bounds"
+    );
+    anyhow::ensure!(
+        (end - start) / MONITOR_INTERVAL <= 99_998,
+        "monitoring history too large"
+    );
+    let mut result = vec![start];
+    let mut tick = (start.div_euclid(MONITOR_INTERVAL) + 1) * MONITOR_INTERVAL;
+    while tick < end {
+        result.push(tick);
+        tick += MONITOR_INTERVAL;
+    }
+    if end > start {
+        result.push(end);
+    }
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MonitorQuery {
+    source_id: String,
+}
+
+fn monitor_value(account: &Account, time: i64) -> Value {
+    let Some(r) = &account.monitor_reconstruction else {
+        return serde_json::json!({
+            "source_id":account.row.source_id,"start_ms":null,"end_ms":null,
+            "generated_at_ms":time,"interval_hours":4,"valuation":"","funding":"actual",
+            "complete":false,"loading":true,"unavailable_reason":"NAV 历史重算中","points":[]
+        });
+    };
+    let realized = account.row.account_kind == "fr";
+    let values = if realized {
+        &r.history.realized_boundaries
+    } else {
+        &r.history.boundaries
+    };
+    let baseline = values.get(&r.start).copied();
+    let points = monitor_boundaries(r.start, r.at).ok().and_then(|ticks| {
+        ticks
+            .into_iter()
+            .map(|ts| {
+                let value = if ts == r.at && ts != r.start {
+                    if realized {
+                        r.history.final_realized_net
+                    } else {
+                        r.history.final_pnl
+                    }
+                } else {
+                    *values.get(&ts)?
+                };
+                Some(serde_json::json!({"ts_ms":ts,"pnl_quote":value - baseline?}))
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let stale = time - r.at > 600_000;
+    serde_json::json!({
+        "source_id":account.row.source_id,"start_ms":r.start,"end_ms":r.at,
+        "generated_at_ms":r.at,"interval_hours":4,
+        "valuation":if realized {"realized_fifo_after_fees_funding_interest"} else {"nav_latest_trade_after_fees_funding_interest"},
+        "funding":"actual","complete":points.is_some() && !stale,"loading":false,
+        "unavailable_reason":if points.is_none() {Some("NAV 采样尚未就绪")} else if stale {Some("NAV 历史更新已过期")} else {None},
+        "points":points.unwrap_or_default()
+    })
+}
+
+pub(super) async fn nav_monitor(
+    State(state): State<AppState>,
+    Query(query): Query<MonitorQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if !state.fr_overview.authorized(&headers) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "integration token required",
+            }),
+        )
+            .into_response());
+    }
+    let cache = state.fr_overview.cache.read().unwrap();
+    let Some(account) = cache.accounts.get(&query.source_id) else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "unknown enabled overview account",
+            }),
+        )
+            .into_response());
+    };
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(monitor_value(account, now())),
+    )
+        .into_response())
 }

@@ -708,6 +708,10 @@ pub async fn run() -> Result<()> {
             "/api/integrations/fr-account-overview",
             get(fr_overview::report),
         )
+        .route(
+            "/api/integrations/fr-account-overview/nav",
+            get(fr_overview::nav_monitor),
+        )
         .merge(authed);
     if let Some(frontend_dir) = frontend_dir()? {
         let index = frontend_dir.join("index.html");
