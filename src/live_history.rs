@@ -414,7 +414,8 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'bitget_fr_arb03',
                  'gate_fr_arb01',
                  'gate_fr_arb02',
-                 'gate_fr_arb03'
+                 'gate_fr_arb03',
+                 'gate_fr_arb04'
                )
              )
            ORDER BY exchange, schedule_offset_minutes"#,
