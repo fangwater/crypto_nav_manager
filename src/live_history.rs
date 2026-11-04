@@ -409,6 +409,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'okex_mm_alpha',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
+                 'bybit_fr_arb01',
                  'bitget_fr_arb01',
                  'bitget_fr_arb02',
                  'bitget_fr_arb03',
