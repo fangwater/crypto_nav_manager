@@ -5,6 +5,24 @@ history selection. Live account facts continued refreshing, but all three
 successful history watermarks stopped at 2026-10-30 03:00 UTC. A curve marked
 complete did not establish exchange-history freshness.
 
+At 08:04 UTC, the follow-up check found and fixed a second omission: the
+08:00 automatic run selected the account but only synchronized trades because
+`account_datasets` did not cover Bybit funding-rate profiles. Commit `d8aa190`
+adds funding and interest, with a regression assertion in the worker tests.
+All 18 worker tests, focused checks and the local release build passed again.
+The seven binaries were atomically redeployed; only NAV restarted (PID 2666908).
+All three history watermarks reached 08:03:33.308 UTC after another bounded
+incremental pass. The next recurring slot is 08:15 UTC.
+
+The browser-facing CTA API was then checked at 08:04 UTC: 73 points through
+08:00 UTC (16:00 Shanghai), `complete=true`, `loading=false`, no unavailable
+reason, final realized net -520.9373957024443 USDT. The earlier updating state
+was the saved 12:00 Shanghai curve waiting for a post-16:00 upstream replay;
+the independent NAV replay may take up to its five-minute refresh interval.
+Neither CTA Manager nor any SG trading process was restarted for this follow-up.
+Backups of the intermediate release and account schema are under the original
+host-only recovery directory's `dataset-fix-d8aa190/` subdirectory.
+
 Commit `060251e` restores the account to the existing 15-minute history worker.
 The repair was built locally and deployed to jp-meta's existing
 `/home/ubuntu/crypto_nav_manager`; only `crypto-nav-manager.service` restarted
@@ -65,3 +83,17 @@ The NAV detail and live overview read the repaired history after the NAV
 restart; today's realized profit is +9.145066 USDT. CTA Manager's saved
 four-hour monitor rebuilds at its next normal 16:00 Shanghai boundary.
 No CTA Manager restart or direct Manager RocksDB write was performed.
+
+## WET exit state checked at 08:00 UTC
+
+The fresh SG Viz account risk ratio was 5.701254, above the configured UniMMR
+emergency-close line 4.5 (recovery 4.6), and the account was in `free_trade`.
+The softer UniMMR close line was 5.0 with recovery 5.1. Funding debits alone do
+not activate that account-margin emergency path.
+
+WETUSDT was absent from the current forward, backward, dump, position-dump,
+and UniMMR close lists, while its approximately 4,000-USDT-per-leg holding
+remained present in the factual snapshot. The regular FR rate-fetch universe
+comes from online lists, so this is a separate trading-management gap; the
+historical time or actor of list removal was not established by this check.
+No trading lists, risk settings, or positions were changed.
