@@ -2905,6 +2905,7 @@ mod tests {
         assert_eq!(interest_cost_usdt("binance", 1.25), 1.25);
         assert_eq!(interest_cost_usdt("bybit", -1.25), 1.25);
         assert_eq!(interest_cost_usdt("gate", -1.25), 1.25);
+        assert_eq!(interest_cost_usdt("bitget", -1.25), 1.25);
     }
 
     #[test]

@@ -2941,21 +2941,28 @@ mod tests {
 
     #[test]
     fn bitget_cash_outflow_is_negative() {
-        let row = normalize_cash(
-            "bitget",
-            "unified",
-            Dataset::Interest,
-            serde_json::json!({
-                "id": "91",
-                "symbol": "BTCUSDT",
-                "coin": "USDT",
-                "type": "INTEREST_SETTLEMENT_OUT",
-                "amount": "0.125",
-                "ts": "1750141421721"
-            }),
-        )
-        .unwrap();
-        assert_eq!(row.amount, "-0.125");
+        // Production OTHER statements already carry a negative amount.
+        // Both response shapes must remain deductions after normalization.
+        for amount in ["0.125", "-0.125"] {
+            let row = normalize_cash(
+                "bitget",
+                "unified",
+                Dataset::Interest,
+                serde_json::json!({
+                    "category": "OTHER",
+                    "id": "91",
+                    "symbol": "",
+                    "coin": "USDT",
+                    "type": "INTEREST_SETTLEMENT_OUT",
+                    "amount": amount,
+                    "ts": "1750141421721"
+                }),
+            )
+            .unwrap();
+            assert_eq!(row.amount, "-0.125");
+            assert_eq!(row.asset, "USDT");
+            assert_eq!(row.event_time_ms, 1750141421721);
+        }
     }
 
     #[test]

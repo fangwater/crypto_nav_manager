@@ -105,7 +105,7 @@ Gate 合约私有请求自动带 X-Gate-Size-Decimal: 1，避免整数张数响�
 | 通用财务流水 | GET /api/v3/account/financial-records |
 | 资金费 | financial-records 的 CONTRACT_MAIN_SETTLE_FEE_USER_IN/OUT |
 | 各交易对手续费率 | GET /api/v3/account/all-fee-rate |
-| 杠杆利息 | financial-records 的 INTEREST_SETTLEMENT_OUT |
+| 杠杆利息 | financial-records，category=OTHER，type=INTEREST_SETTLEMENT_OUT |
 | 当前借贷数据 | GET /api/v3/trade/loan-data |
 | 行情估值 | GET /api/v3/market/tickers |
 | 杠杆借贷利率 | GET /api/v3/market/margin-loans |
@@ -114,6 +114,8 @@ Gate 合约私有请求自动带 X-Gate-Size-Decimal: 1，避免整数张数响�
 成交、强平订单和财务流水按 30 天分块，并按 cursor 分页。强平订单来自账户私有历史订单并在本地
 校验 `execType/delegateType`，不会使用市场级 `/api/v3/market/liquidations`。ProductCategory
 区分 SPOT、MARGIN、USDT-FUTURES、COIN-FUTURES 和 USDC-FUTURES。
+UTA 借款利息属于账户级 OTHER 财务分类；使用 MARGIN 查询会成功但返回空记录。
+修正分类后，必须从策略起点补采历史利息，已有成功水位不代表此前计息记录完整。
 
 ## OKX Unified
 

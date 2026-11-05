@@ -251,12 +251,22 @@ impl BitgetClient {
         record_type: Option<&str>,
         range: TimeRange,
     ) -> Result<Vec<Value>, ExchangeError> {
+        self.financial_records_for_category(category.bitget_value(), record_type, range)
+            .await
+    }
+
+    async fn financial_records_for_category(
+        &self,
+        category: &str,
+        record_type: Option<&str>,
+        range: TimeRange,
+    ) -> Result<Vec<Value>, ExchangeError> {
         let mut rows = Vec::new();
         for chunk in range.chunks(THIRTY_DAYS_MS)? {
             let mut cursor: Option<String> = None;
             loop {
                 let mut params = vec![
-                    ("category".to_string(), category.bitget_value().to_string()),
+                    ("category".to_string(), category.to_string()),
                     ("startTime".to_string(), chunk.start_ms.to_string()),
                     ("endTime".to_string(), chunk.end_ms.to_string()),
                     ("limit".to_string(), PAGE_LIMIT.to_string()),
@@ -350,12 +360,10 @@ impl BitgetClient {
     }
 
     pub async fn margin_interest(&self, range: TimeRange) -> Result<Vec<Value>, ExchangeError> {
-        self.financial_records(
-            ProductCategory::Margin,
-            Some("INTEREST_SETTLEMENT_OUT"),
-            range,
-        )
-        .await
+        // UTA borrowing interest belongs to the account-wide OTHER ledger,
+        // not the MARGIN trading ledger. MARGIN returns success with no rows.
+        self.financial_records_for_category("OTHER", Some("INTEREST_SETTLEMENT_OUT"), range)
+            .await
     }
 
     pub async fn tickers(
