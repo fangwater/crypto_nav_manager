@@ -123,9 +123,22 @@ struct StrategyResponse {
     account_mode: String,
     config_url: String,
     sort_order: i32,
-    env_exists: bool,
-    credentials_ready: bool,
-    missing_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_exists: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    missing_keys: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct StrategyListQuery {
+    #[serde(default = "include_credentials_by_default")]
+    include_credentials: bool,
+}
+
+fn include_credentials_by_default() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -2388,6 +2401,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
 async fn list_strategies(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<StrategyListQuery>,
 ) -> Result<Json<Vec<StrategyResponse>>, ApiError> {
     let visible = visible_slugs(&state.pool, &user).await?;
     let mut rows = sqlx::query_as::<_, StrategyRecord>(
@@ -2408,7 +2422,7 @@ async fn list_strategies(
 
     let mut tasks = JoinSet::new();
     for row in rows {
-        tasks.spawn_blocking(move || strategy_response(row));
+        tasks.spawn_blocking(move || strategy_response(row, query.include_credentials));
     }
     let mut strategies = Vec::with_capacity(tasks.len());
     while let Some(result) = tasks.join_next().await {
@@ -2662,7 +2676,7 @@ async fn get_strategy(
 
     match row {
         Some(row) => {
-            let response = tokio::task::spawn_blocking(move || strategy_response(row))
+            let response = tokio::task::spawn_blocking(move || strategy_response(row, true))
                 .await
                 .context("join strategy credential check")??;
             Ok(Json(response).into_response())
@@ -2804,24 +2818,34 @@ async fn get_strategy_pnl(
     Ok(Json(response).into_response())
 }
 
-fn strategy_response(row: StrategyRecord) -> Result<StrategyResponse> {
-    let required_keys: Vec<String> =
-        serde_json::from_value(row.required_keys).context("decode required_keys")?;
+fn strategy_response(row: StrategyRecord, include_credentials: bool) -> Result<StrategyResponse> {
     let display_name = row.alias.clone().unwrap_or_else(|| row.slug.clone());
-    let env_path = Path::new(&row.env_path);
-    let content = read_env_file(&row.host, env_path);
-    let env_exists = content.is_ok();
-    let assigned = match content {
-        Ok(content) => assigned_env_keys(&content),
-        Err(error) => {
-            warn!(host = %row.host, path = %row.env_path, %error, "strategy env unavailable");
-            HashMap::new()
-        }
+    // Account discovery needs only DB metadata. In particular, it must not
+    // depend on SSH availability for another host's credential files.
+    let (env_exists, credentials_ready, missing_keys) = if include_credentials {
+        let required_keys: Vec<String> =
+            serde_json::from_value(row.required_keys).context("decode required_keys")?;
+        let content = read_env_file(&row.host, Path::new(&row.env_path));
+        let env_exists = content.is_ok();
+        let assigned = match content {
+            Ok(content) => assigned_env_keys(&content),
+            Err(error) => {
+                warn!(host = %row.host, path = %row.env_path, %error, "strategy env unavailable");
+                HashMap::new()
+            }
+        };
+        let missing_keys = required_keys
+            .into_iter()
+            .filter(|key| !assigned.get(key).copied().unwrap_or(false))
+            .collect::<Vec<_>>();
+        (
+            Some(env_exists),
+            Some(env_exists && missing_keys.is_empty()),
+            Some(missing_keys),
+        )
+    } else {
+        (None, None, None)
     };
-    let missing_keys = required_keys
-        .into_iter()
-        .filter(|key| !assigned.get(key).copied().unwrap_or(false))
-        .collect::<Vec<_>>();
 
     Ok(StrategyResponse {
         slug: row.slug,
@@ -2838,7 +2862,7 @@ fn strategy_response(row: StrategyRecord) -> Result<StrategyResponse> {
         config_url: row.config_url,
         sort_order: row.sort_order,
         env_exists,
-        credentials_ready: env_exists && missing_keys.is_empty(),
+        credentials_ready,
         missing_keys,
     })
 }
@@ -2945,11 +2969,74 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        IntraAnalysisStrategyRecord, assigned_env_keys, expected_history_datasets,
-        intra_analysis_adapter, intra_analysis_fee_usdt, is_default_bybit_instrument,
-        parse_initial_positions, snapshot_source_url, valid_schema,
+        IntraAnalysisStrategyRecord, StrategyListQuery, StrategyRecord, assigned_env_keys,
+        expected_history_datasets, intra_analysis_adapter, intra_analysis_fee_usdt,
+        is_default_bybit_instrument, parse_initial_positions, snapshot_source_url,
+        strategy_response, valid_schema,
     };
     use crate::{intra_analysis, intra_latency};
+
+    #[test]
+    fn catalog_discovery_skips_unavailable_credentials_without_claiming_readiness() {
+        let query: StrategyListQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.include_credentials);
+
+        let row = || StrategyRecord {
+            slug: "bybit_fr_arb01".into(),
+            alias: Some("Bybit FR".into()),
+            db_schema: "bybit_fr_arb01".into(),
+            host: "sg".into(),
+            env_path: "/unavailable/env.sh".into(),
+            csv_output_dir: String::new(),
+            st_ms: 1,
+            strategy_kind: "funding_rate".into(),
+            exchange: "bybit".into(),
+            account_mode: "unified".into(),
+            // Invalid credential metadata must not affect catalog discovery.
+            required_keys: serde_json::json!({"unavailable": true}),
+            config_url: "http://sg/fr/bybit_fr_arb01/config".into(),
+            sort_order: 3,
+        };
+        let response = serde_json::to_value(strategy_response(row(), false).unwrap()).unwrap();
+        assert_eq!(response["slug"], "bybit_fr_arb01");
+        assert_eq!(response["host"], "sg");
+        assert_eq!(response["strategyKind"], "funding_rate");
+        assert_eq!(response["displayName"], "Bybit FR");
+        assert_eq!(response["configUrl"], "http://sg/fr/bybit_fr_arb01/config");
+        for key in ["envExists", "credentialsReady", "missingKeys"] {
+            assert!(
+                response.get(key).is_none(),
+                "unexpected credential field {key}"
+            );
+        }
+        assert!(strategy_response(row(), true).is_err());
+    }
+
+    #[test]
+    fn interactive_strategy_response_keeps_credential_fields() {
+        let row = StrategyRecord {
+            slug: "test_fr_arb01".into(),
+            alias: None,
+            db_schema: "test_fr_arb01".into(),
+            host: "local".into(),
+            env_path: "/nonexistent-nav-test/env.sh".into(),
+            csv_output_dir: String::new(),
+            st_ms: 1,
+            strategy_kind: "funding_rate".into(),
+            exchange: "bybit".into(),
+            account_mode: "unified".into(),
+            required_keys: serde_json::json!(["BYBIT_API_KEY"]),
+            config_url: String::new(),
+            sort_order: 0,
+        };
+        let response = serde_json::to_value(strategy_response(row, true).unwrap()).unwrap();
+        assert_eq!(response["envExists"], false);
+        assert_eq!(response["credentialsReady"], false);
+        assert_eq!(
+            response["missingKeys"],
+            serde_json::json!(["BYBIT_API_KEY"])
+        );
+    }
 
     #[test]
     fn detects_only_non_empty_assignments() {
