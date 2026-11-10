@@ -406,7 +406,7 @@ async fn load_strategies(pool: &PgPool) -> Result<Vec<LiveHistoryStrategy>> {
                  'binance_exec_trade01',
                  'binance_exec_trade02',
                  'bybit_mm_alpha',
-                 'okex_mm_alpha',
+                 'okex_mm_83777',
                  'bybit-intra-arb01',
                  'bybit-intra-arb02',
                  'bybit_fr_arb01',
@@ -846,6 +846,7 @@ fn account_datasets(strategy: &LiveHistoryStrategy) -> &'static [&'static str] {
         ("bitget" | "bybit", "funding_rate") => &["funding", "interest"],
         ("binance", "intra_exchange") => &["funding", "interest"],
         ("bybit", "intra_exchange") => &["funding", "interest"],
+        ("okx" | "okex", "market_making") => &["funding"],
         _ => &[],
     }
 }
@@ -1292,6 +1293,10 @@ mod tests {
             account_datasets(&strategy("bitget_fr_arb02", "bitget", "funding_rate")),
             ["funding", "interest"]
         );
+        assert_eq!(
+            account_datasets(&strategy("okex_mm_83777", "okx", "market_making")),
+            ["funding"]
+        );
         let mut rapidx = strategy("binance_cta_rx01", "binance", "cta");
         rapidx.account_mode = "rapidx".to_string();
         assert_eq!(account_datasets(&rapidx), ["funding", "interest"]);
@@ -1306,6 +1311,7 @@ mod tests {
         assert!(alignment_check_enabled("bybit-intra-arb01", true));
         assert!(alignment_check_enabled("bybit-intra-arb02", true));
         assert!(!alignment_check_enabled("binance_fr_arb03", true));
+        assert!(!alignment_check_enabled("okex_mm_83777", true));
     }
 
     #[test]

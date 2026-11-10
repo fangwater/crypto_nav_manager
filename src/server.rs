@@ -1912,6 +1912,7 @@ fn expected_history_datasets(
     const BINANCE_INTRA: &[&str] = &["trades", "funding", "interest"];
     const BYBIT_INTRA: &[&str] = &["trades", "funding", "interest"];
     const MM: &[&str] = &["trades"];
+    const OKX_MM: &[&str] = &["trades", "funding"];
     const RAPIDX_FUTURES: &[&str] = &["trades", "funding", "interest"];
 
     if host == "local" && account_mode == "rapidx" {
@@ -1925,7 +1926,7 @@ fn expected_history_datasets(
                 | "binance_exec_trade01"
                 | "binance_exec_trade02"
                 | "bybit_mm_alpha"
-                | "okex_mm_alpha"
+                | "okex_mm_83777"
                 | "binance-intra-arb01"
                 | "bybit-intra-arb01"
                 | "bybit-intra-arb02"
@@ -1945,7 +1946,8 @@ fn expected_history_datasets(
         ("bitget", "funding_rate") => Some(BITGET_FR),
         ("binance", "intra_exchange") => Some(BINANCE_INTRA),
         ("bybit", "intra_exchange") => Some(BYBIT_INTRA),
-        ("binance", "market_making" | "cta") | ("bybit" | "okx", "market_making") => Some(MM),
+        ("okx" | "okex", "market_making") => Some(OKX_MM),
+        ("binance", "market_making" | "cta") | ("bybit", "market_making") => Some(MM),
         _ => None,
     }
 }
@@ -3284,8 +3286,8 @@ mod tests {
             Some(["trades", "funding", "interest", "liquidations"].as_slice())
         );
         assert_eq!(
-            expected_history_datasets("okex_mm_alpha", "local", "okx", "market_making", "unified"),
-            Some(["trades"].as_slice())
+            expected_history_datasets("okex_mm_83777", "local", "okx", "market_making", "unified"),
+            Some(["trades", "funding"].as_slice())
         );
     }
 }

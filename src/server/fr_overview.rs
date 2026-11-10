@@ -183,7 +183,7 @@ impl FrOverview {
         risks: &AccountRiskCache,
         marks: &MarkPriceCache,
     ) -> Result<()> {
-        let strategies=sqlx::query_as::<_,StrategyRecord>("SELECT slug,alias,db_schema,host,env_path,csv_output_dir,st_ms,strategy_kind,exchange,account_mode,required_keys,config_url,sort_order FROM strategy_envs WHERE enabled AND (strategy_kind='funding_rate' OR (strategy_kind='market_making' AND slug IN ('okex_mm_alpha','bybit_mm_alpha'))) ORDER BY sort_order,slug").fetch_all(pool).await?;
+        let strategies=sqlx::query_as::<_,StrategyRecord>("SELECT slug,alias,db_schema,host,env_path,csv_output_dir,st_ms,strategy_kind,exchange,account_mode,required_keys,config_url,sort_order FROM strategy_envs WHERE enabled AND (strategy_kind='funding_rate' OR (strategy_kind='market_making' AND slug IN ('okex_mm_83777','bybit_mm_alpha'))) ORDER BY sort_order,slug").fetch_all(pool).await?;
         let slugs = strategies
             .iter()
             .map(|s| s.slug.clone())
