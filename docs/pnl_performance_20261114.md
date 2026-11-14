@@ -94,3 +94,47 @@ Build locally from the configured NVMe target directory. Preserve rollback
 binaries and the old CPU drop-in, upload to explicit staging paths, verify
 SHA-256, then replace atomically and restart only `crypto-nav-manager.service`.
 Keep all migration-embedding utility binaries consistent with the service.
+
+## jp-meta deployment verification
+
+Feature commit `8fb7ae2` was pushed to `origin/master` and deployed on jp-meta
+only. Replacement began at15:48:06.878 UTC; gateway health passed at15:48:08.729.
+The service is PID1115313, active, `NRestarts=0`, with every thread on CPU35.
+CTA PID438574 remains on24, Redis PID4100946 remains on28, and PostgreSQL's
+main PID1938 remains running. Only `crypto-nav-manager.service` restarted.
+
+All seven installed service/migration-tool binaries matched the upload manifest.
+The service SHA-256 is
+`6e7a2cea12a7a6d4d1c5c4be64660e48628902c035e471a310c9cec0996d812a`.
+Old binaries, the original CPU24 drop-in and rollback hashes remain in the
+host-only `maintenance-backups/nav-opt-20261114/pre-release/` directory.
+The exact release staging directory, archive and temporary audit executables
+were removed after verification; frozen private inputs and receipts remain.
+
+All12 supported overview accounts completed their first reconstruction by
+15:50:38, with FIFO replay stages taking0–259 ms. The existing unsupported
+`gate_fr_arb05` row remains unavailable. Authenticated machine reads verified
+complete Gate FR04, Binance FR04, OKX MM and Bybit FR curves; frontend JS/CSS,
+`/nav-api/health` and CTA anonymous status all returned200 through4191 Nginx.
+
+Normal five-minute refreshes confirmed production checkpoint reuse:
+
+| UTC | Account | Total events | Reused | Replayed | Replay ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 15:53:09 | okex_mm_83777 | 16,785 | 16,564 | 221 | 3 |
+| 15:53:23 | bybit_fr_arb01 | 26,364 | 26,310 | 54 | 3 |
+
+By15:54:15, CTA completed848 target requests since cutover, all200, including
+122 each for `rbf_mid` and `rbf_big`; their maximum application processing times
+were13/31 ms. The independent Nginx sample through approximately15:55:36 had
+1033 target POSTs, all200, with no499/5xx. These are bounded observations, not
+a claim that every future publication timeout is eliminated.
+
+All94 sampled host configuration fingerprints and all four CTA immutable
+position tables plus NAV's five selected initial snapshot records matched.
+Of239 pre-cutover process samples,231 retained executable, start identity and
+the affinity of existing threads. Eight short-lived `postgres` processes were
+absent; the unchanged PostgreSQL main process is separately verified. The raw
+audit retains these exceptions. No other sampled process identity or affinity
+changed. Local README edits and remote untracked credentials/maintenance files
+were preserved. No frontend, trading, Viz, Config or Nginx deployment occurred.
