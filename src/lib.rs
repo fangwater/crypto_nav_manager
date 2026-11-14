@@ -6,6 +6,7 @@ pub mod contract_multipliers;
 pub mod exchange;
 pub mod fee_rate_store;
 pub mod fifo_pnl;
+mod fifo_valuation;
 pub mod fr_position_limits;
 pub mod intra_analysis;
 pub mod intra_latency;

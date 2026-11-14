@@ -3,10 +3,11 @@
 //! Each open lot stores Liang Torch's `amountu`, not asset quantity. Closing
 //! PnL is the entry-to-exit return multiplied by the matched `amountu`.
 
+use crate::fifo_valuation::Inventory;
 use std::collections::VecDeque;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -53,6 +54,8 @@ pub enum FifoPnlError {
 pub struct FifoPnl {
     longs: VecDeque<Lot>,
     shorts: VecDeque<Lot>,
+    long_inventory: Inventory,
+    short_inventory: Inventory,
     long_amount_u: f64,
     short_amount_u: f64,
     gross_realized_pnl: f64,
@@ -83,8 +86,20 @@ impl FifoPnl {
         }
 
         let (realized_pnl, remaining_amount_u) = match side {
-            Side::Buy => close_fifo(&mut self.shorts, price, amount_u, -1.0),
-            Side::Sell => close_fifo(&mut self.longs, price, amount_u, 1.0),
+            Side::Buy => close_fifo(
+                &mut self.shorts,
+                &mut self.short_inventory,
+                price,
+                amount_u,
+                -1.0,
+            ),
+            Side::Sell => close_fifo(
+                &mut self.longs,
+                &mut self.long_inventory,
+                price,
+                amount_u,
+                1.0,
+            ),
         };
         let matched_amount_u = amount_u - remaining_amount_u;
 
@@ -100,10 +115,12 @@ impl FifoPnl {
             match side {
                 Side::Buy => {
                     self.longs.push_back(lot);
+                    self.long_inventory.notional(price, remaining_amount_u);
                     self.long_amount_u += remaining_amount_u;
                 }
                 Side::Sell => {
                     self.shorts.push_back(lot);
+                    self.short_inventory.notional(price, remaining_amount_u);
                     self.short_amount_u += remaining_amount_u;
                 }
             }
@@ -127,17 +144,21 @@ impl FifoPnl {
         validate_positive("bid", bid)?;
         validate_positive("ask", ask)?;
 
-        let long_pnl = self
-            .longs
-            .iter()
-            .map(|lot| (ask - lot.entry_price) / lot.entry_price * lot.amount_u)
-            .sum::<f64>();
-        let short_pnl = self
-            .shorts
-            .iter()
-            .map(|lot| (lot.entry_price - bid) / lot.entry_price * lot.amount_u)
-            .sum::<f64>();
-        Ok(long_pnl + short_pnl)
+        #[cfg(test)]
+        if crate::fifo_valuation::reference_enabled() {
+            return Ok(self
+                .longs
+                .iter()
+                .map(|l| (ask - l.entry_price) / l.entry_price * l.amount_u)
+                .sum::<f64>()
+                + self
+                    .shorts
+                    .iter()
+                    .map(|l| (l.entry_price - bid) / l.entry_price * l.amount_u)
+                    .sum::<f64>());
+        }
+
+        Ok(self.long_inventory.floating(ask) - self.short_inventory.floating(bid))
     }
 
     pub fn mark_pnl(&self, mark_price: f64) -> Result<f64, FifoPnlError> {
@@ -177,10 +198,15 @@ impl FifoPnl {
     pub fn open_lot_count(&self) -> usize {
         self.longs.len() + self.shorts.len()
     }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        (self.longs.capacity() + self.shorts.capacity()) * std::mem::size_of::<Lot>()
+    }
 }
 
 fn close_fifo(
     lots: &mut VecDeque<Lot>,
+    inventory: &mut Inventory,
     close_price: f64,
     mut amount_u: f64,
     direction: f64,
@@ -193,12 +219,17 @@ fn close_fifo(
         };
         let matched = amount_u.min(lot.amount_u);
         realized_pnl += direction * (close_price - lot.entry_price) / lot.entry_price * matched;
+        inventory.notional(lot.entry_price, -matched);
         amount_u -= matched;
         lot.amount_u -= matched;
 
         if lot.amount_u == 0.0 {
             lots.pop_front();
         }
+    }
+
+    if lots.is_empty() {
+        inventory.clear();
     }
 
     (realized_pnl, amount_u)
@@ -381,6 +412,38 @@ mod tests {
         }
         *lots = next;
         realized
+    }
+
+    #[test]
+    fn aggregated_amount_marks_match_notebook_formula_for_long_histories() {
+        let mut pnl = FifoPnl::new();
+        for index in 0..15_000 {
+            let side = if index % 73 < 48 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let price = 10.0 + (index % 137) as f64 / 11.0;
+            pnl.apply_fill(side, price, (index % 29 + 1) as f64 / 7.0, -0.0001)
+                .unwrap();
+            let bid = 15.0 + (index % 11) as f64 / 9.0;
+            let ask = bid + 0.1;
+            let expected = pnl
+                .longs
+                .iter()
+                .map(|l| (ask - l.entry_price) / l.entry_price * l.amount_u)
+                .chain(
+                    pnl.shorts
+                        .iter()
+                        .map(|l| (l.entry_price - bid) / l.entry_price * l.amount_u),
+                )
+                .sum::<f64>();
+            let actual = pnl.floating_pnl(bid, ask).unwrap();
+            assert!(
+                (actual - expected).abs() <= 1e-9 + expected.abs() * 1e-11,
+                "index={index}, actual={actual}, expected={expected}"
+            );
+        }
     }
 
     fn reference_floating(lots: &[ReferenceLot], bid: f64, ask: f64) -> f64 {

@@ -20,9 +20,10 @@ const STABLECOINS: [&str; 3] = ["USDT", "USDC", "USD"];
 // through the next-hour wallet distribution.
 const BINANCE_INTRA_SPOT_MAKER_REBATE_RATE: f64 = 0.4 / 10_000.0;
 
+pub mod audit;
 pub mod overview;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PnlSourceKind {
     Intra,
     FundingRate,
@@ -73,7 +74,7 @@ impl PnlSourceKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NormalizedTrade {
     pub symbol: String,
     pub side: Side,
@@ -85,20 +86,20 @@ pub struct NormalizedTrade {
     pub ts: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PositionLeg {
     Spot,
     Futures,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FundingEvent {
     pub symbol: String,
     pub amount_usdt: f64,
     pub ts: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InterestEvent {
     pub symbol: String,
     pub cost_usdt: Option<f64>,
@@ -107,7 +108,7 @@ pub struct InterestEvent {
     pub ts: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InitialPosition {
     pub symbol: String,
     pub spot_quantity: f64,
@@ -115,7 +116,7 @@ pub struct InitialPosition {
     pub mark_price: f64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PnlInputs {
     pub trades: Vec<NormalizedTrade>,
     pub funding: Vec<FundingEvent>,
@@ -347,6 +348,13 @@ impl Default for VenueFifo {
 }
 
 impl VenueFifo {
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::AmountU(fifo) => fifo.allocated_bytes(),
+            Self::Quantity(fifo) => fifo.allocated_bytes(),
+        }
+    }
+
     fn for_source(source: PnlSourceKind) -> Self {
         match source {
             PnlSourceKind::Intra

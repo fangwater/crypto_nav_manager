@@ -128,6 +128,7 @@ pub(super) struct FrOverview {
     cache: Arc<RwLock<Cache>>,
     client: reqwest::Client,
     history_gate: Arc<tokio::sync::Semaphore>,
+    replays: Arc<std::sync::Mutex<pnl::overview::ReplayCache>>,
 }
 impl FrOverview {
     pub(super) fn new() -> Result<Self> {
@@ -142,6 +143,7 @@ impl FrOverview {
             token_hash: token.map(|v| Sha256::digest(v.as_bytes()).into()),
             cache: Arc::default(),
             history_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            replays: Arc::default(),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -188,6 +190,9 @@ impl FrOverview {
             .iter()
             .map(|s| s.slug.clone())
             .collect::<HashSet<_>>();
+        if let Ok(mut replays) = self.replays.try_lock() {
+            replays.retain_accounts(&slugs);
+        }
         let snapshots = risks
             .snapshots()
             .into_iter()
@@ -333,7 +338,9 @@ impl FrOverview {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let (equity, at) = anchor;
-                    match reconstruct(&pool, &marks, &strategy, equity, at).await {
+                    match reconstruct(&pool, &marks, &strategy, equity, at, hub.replays.clone())
+                        .await
+                    {
                         Ok(value) => {
                             if let Some(account) =
                                 hub.cache.write().unwrap().accounts.get_mut(&strategy.slug)
@@ -457,6 +464,7 @@ async fn reconstruct(
     strategy: &StrategyRecord,
     equity: Option<f64>,
     at: i64,
+    replays: Arc<std::sync::Mutex<pnl::overview::ReplayCache>>,
 ) -> Result<Reconstruction> {
     let source = PnlSourceKind::for_strategy(
         &strategy.strategy_kind,
@@ -491,8 +499,28 @@ async fn reconstruct(
         .filter(|ts| *ts >= start)
         .collect::<Vec<_>>();
     boundaries.extend(monitor_boundaries(start, at)?);
+    let account = strategy.slug.clone();
+    let context = format!(
+        "{}:{}:{}:{}",
+        strategy.db_schema, strategy.exchange, strategy.st_ms, start
+    );
+    let started = std::time::Instant::now();
     let history = tokio::task::spawn_blocking(move || {
-        pnl::overview::replay(source, inputs, at - 46 * DAY, at, &boundaries)
+        let mut cache = replays.lock().unwrap_or_else(|e| e.into_inner());
+        let (history, stats) = cache.replay(
+            &account,
+            &context,
+            source,
+            inputs,
+            at - 46 * DAY,
+            at,
+            &boundaries,
+        )?;
+        tracing::info!(slug=%account, total_events=stats.total_events,
+            reused_events=stats.reused_events, replayed_events=stats.replayed_events,
+            checkpoint_retained=stats.retained, duration_ms=started.elapsed().as_millis() as u64,
+            "account overview FIFO replay complete");
+        anyhow::Ok(history)
     })
     .await??;
     Ok(Reconstruction {

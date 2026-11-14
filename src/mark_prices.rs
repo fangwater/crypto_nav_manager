@@ -59,6 +59,14 @@ pub struct MarkPriceCache {
 }
 
 impl MarkPriceCache {
+    /// Read-only audit helper: subscribe to existing public IPC marks without
+    /// starting the REST bootstrap or publishing any market/account message.
+    pub(crate) fn ipc_only() -> Self {
+        let cache = Self::default();
+        cache.spawn_ipc_listener();
+        cache
+    }
+
     pub async fn start() -> Self {
         let cache = Self::default();
         cache.bootstrap_rest().await;

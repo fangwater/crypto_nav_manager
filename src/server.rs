@@ -251,9 +251,9 @@ struct SetInitialSnapshotRequest {
     snapshot_ts_ms: i64,
 }
 
-struct ParsedInitialPositions {
-    positions: Vec<InitialPosition>,
-    skipped_count: usize,
+pub(crate) struct ParsedInitialPositions {
+    pub(crate) positions: Vec<InitialPosition>,
+    pub(crate) skipped_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2312,7 +2312,7 @@ async fn load_initial_snapshot(pool: &PgPool, slug: &str) -> Result<Option<Snaps
     .context("load initial strategy snapshot")
 }
 
-fn parse_initial_positions(payload: &Value) -> Result<ParsedInitialPositions> {
+pub(crate) fn parse_initial_positions(payload: &Value) -> Result<ParsedInitialPositions> {
     let entries = payload
         .get("entries")
         .and_then(Value::as_array)
@@ -2378,7 +2378,7 @@ fn parse_initial_positions(payload: &Value) -> Result<ParsedInitialPositions> {
     })
 }
 
-fn postgres_options() -> Result<PgConnectOptions> {
+pub(crate) fn postgres_options() -> Result<PgConnectOptions> {
     match env::var("CRYPTO_NAV_DATABASE_URL") {
         Ok(url) => PgConnectOptions::from_str(&url).context("invalid CRYPTO_NAV_DATABASE_URL"),
         Err(env::VarError::NotPresent) => Ok(PgConnectOptions::new()

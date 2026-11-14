@@ -2,7 +2,10 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+mod cache;
+pub use cache::{ReplayCache, ReplayStats};
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct History {
     pub boundaries: BTreeMap<i64, f64>,
     pub points: Vec<(i64, f64)>,
