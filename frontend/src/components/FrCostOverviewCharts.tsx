@@ -37,7 +37,7 @@ export function FrCostOverviewCharts({ rows, takerThreshold, basisThreshold, onS
         name, type: 'bar', barMaxWidth: 9,
         data: ranked.map(r => ({ value: costMetric(r, key), itemStyle: { opacity: (r.covered[coverage].quantityCoveragePct ?? 0) >= 99.9999 ? 1 : 0.5 } })),
       })),
-      graphic: ranked.length ? [] : [{ type: 'text', left: 'center', top: 'middle', style: { text: '等待可计算片段，参考数据正在补齐', fill: '#65777e', fontSize: 12 } }],
+      graphic: ranked.length ? [] : [{ type: 'text', left: 'center', top: 'middle', style: { text: '暂无可计算片段，可手动补齐参考', fill: '#65777e', fontSize: 12 } }],
     })
     const points = rows.filter(r => costMetric(r, 'taker') !== null && costMetric(r, 'basisAbs') !== null)
     scatterChart.setOption({

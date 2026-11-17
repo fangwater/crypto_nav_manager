@@ -42,13 +42,11 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
   const [ascending, setAscending] = useState(false)
   const [page, setPage] = useState(0)
   const backfill = useRef<AbortController | null>(null)
-  const autoStarted = useRef(false)
   const [progress, setProgress] = useState<{ done: number; total: number; symbol: string; failed: number } | null>(null)
   const [backfillNote, setBackfillNote] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
-    autoStarted.current = false
     setLoading(true); setError(''); setOverview(null); setProgress(null); setBackfillNote('')
     getFrCostOverview(slug, new URLSearchParams({ endMs: String(endMs) }), controller.signal)
       .then(result => { if (!controller.signal.aborted) { setOverview(result); onLoaded(result) } })
@@ -78,13 +76,6 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
   const pending = filtered.filter(row => matchesCostThresholds(row, thresholds, mode, numberInput(minNotional)) === null).length
   const incomplete = overview?.rows.filter(row => row.summary.pairCount > 0 && row.summary.referenceCoveredQuantity + 1e-8 < row.summary.quantity) ?? []
   const supportsReference = overview && ['binance', 'bybit', 'gate'].includes(overview.exchange)
-
-  useEffect(() => {
-    if (!loading && overview?.strategySlug === slug && overview?.endMs === endMs && supportsReference && !autoStarted.current) {
-      autoStarted.current = true
-      void fillReferences()
-    }
-  })
 
   async function fillReferences() {
     if (!overview || backfill.current) return
@@ -153,20 +144,22 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
       <label><input type="checkbox" checked={keepUnknown} onChange={e => { setKeepUnknown(e.target.checked); setPage(0) }} /> 保留无法判断的币种</label>
       <button type="button" onClick={reset}>清空筛选</button>
       {progress ? <button type="button" onClick={() => backfill.current?.abort()}>停止补齐</button>
-        : <button type="button" disabled={!supportsReference || !incomplete.length} onClick={() => void fillReferences()}>补齐缺失参考（{incomplete.length}）</button>}
+        : <button type="button" disabled={!supportsReference || !incomplete.length} onClick={() => void fillReferences()}>手动补齐参考（{incomplete.length}）</button>}
     </div>
+    <p>页面仅加载一次，不持续刷新。点击“计算 / 刷新”重新读取持仓，点击“手动补齐参考”执行一轮补齐。</p>
     {loading && <p role="status">读取实时持仓，仅重建当前持有币种的成交…</p>}
     {error && <p className="fr-cost-notice" role="alert">币种汇总加载失败：{error}。可使用上方“计算 / 刷新”重试。</p>}
     {pending > 0 && <p>当前保留 {pending} 个无法判断是否满足阈值的币种，不代表已命中或正常。</p>}
-    {progress && <p role="status">自动补齐 {progress.symbol}，已处理 {progress.done} / {progress.total}；每个币种最多约 8 秒，可继续筛选或停止。</p>}
+    {progress && <p role="status">正在手动补齐 {progress.symbol}，已处理 {progress.done} / {progress.total}；每个币种最多约 8 秒，可继续筛选或停止。</p>}
     {backfillNote && <p role="status">{backfillNote}</p>}
     {overview && <>
       <div className="fr-cost-coverage-cards">
         <article><span>当前持仓</span><strong>{overview.rows.length}</strong><small>以实时合约持仓为准</small></article>
         <article><span>可计算成本</span><strong>{overview.rows.filter(r => costMetric(r, 'costBps') !== null).length}</strong><small>完整 {overview.rows.filter(r => r.summary.estimatedCostBps !== null).length} · 其余标注覆盖率</small></article>
-        <article><span>参考尚有缺口</span><strong>{incomplete.length}</strong><small>自动逐币种补齐，不填零</small></article>
+        <article><span>参考尚有缺口</span><strong>{incomplete.length}</strong><small>可手动补齐，缺失不填零</small></article>
         <article><span>费用折算待补齐</span><strong>{overview.rows.filter(r => r.pairedLiquidity.spot.total.unconvertedFeeParts + r.pairedLiquidity.futures.total.unconvertedFeeParts > 0).length}</strong><small>例如 BNB 手续费缺少成交时估值</small></article>
       </div>
+      <details><summary>数量覆盖是什么意思？</summary><p>数量覆盖 = 能计算该项指标的配对币数 ÷ 当前 FIFO 配对总币数。例如配对了 100 个币，其中 80 个币的数据齐全，覆盖率就是 80%。金额和 bps 仅对应这 80 个币，其中 bps 按这部分的成交本金计算，不代表整仓。</p><p>这是数据完整度：手续费需要成交价和费用折算，执行偏差需要成交价和分钟参考，总成本需要两者都齐全，所以三项覆盖率可能不同。</p></details>
       <FrCostOverviewCharts rows={filtered} takerThreshold={numberInput(thresholds.taker)} basisThreshold={numberInput(thresholds.basisAbs)} onSelect={onSelect} />
       <p>表格、排序和阈值使用当前可计算片段的 bps。部分覆盖按该部分本金计算，不外推为整仓成本；鼠标悬停图表可查看覆盖率，点击可看明细。</p>
       <div className="fr-cost-table-wrap"><table><thead><tr>{columns.map(column => <th key={column.key} aria-sort={sort === column.key ? ascending ? 'ascending' : 'descending' : 'none'}>
@@ -176,7 +169,7 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
       </tr>)}</tbody></table></div>
       {!filtered.length && <p>{overview.rows.length ? '没有符合当前筛选条件的持仓币种。' : '当前没有 FR 持仓。'}</p>}
       <div className="fr-cost-pager"><button disabled={activePage === 0} onClick={() => setPage(activePage - 1)}>上一页</button><span>{activePage + 1} / {pages}</span><button disabled={activePage + 1 >= pages} onClick={() => setPage(activePage + 1)}>下一页</button></div>
-      <p>实时持仓快照：{new Date(overview.factualSnapshotMs).toLocaleString('zh-CN', { hour12: false })}。汇总截至 {new Date(overview.endMs).toLocaleString('zh-CN', { hour12: false })}。taker 按各腿成交额计算，未知成交角色仍计入分母。成本仅覆盖配对库存；缺失原始成本、费用或参考时保留未知。汇总使用市场参考，手动假设仅影响单币明细。{!supportsReference ? '本交易所自动参考尚不可用。' : '自动补齐当前持仓的参考；仍有缺口可再次补齐。'}</p>
+      <p>实时持仓快照：{new Date(overview.factualSnapshotMs).toLocaleString('zh-CN', { hour12: false })}。汇总截至 {new Date(overview.endMs).toLocaleString('zh-CN', { hour12: false })}。taker 按各腿成交额计算，未知成交角色仍计入分母。成本仅覆盖配对库存；缺失原始成本、费用或参考时保留未知。汇总使用市场参考，手动假设仅影响单币明细。{!supportsReference ? '本交易所市场参考尚不可用。' : '需要更新时手动刷新或补齐参考。'}</p>
     </>}
   </section>
 }
