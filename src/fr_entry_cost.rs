@@ -147,6 +147,33 @@ impl Inventory {
         (signed(&self.spot), signed(&self.futures))
     }
 
+    /// Prioritize short, material paired intervals so overview backfills produce
+    /// useful covered subsets before walking long historical gaps.
+    pub fn reference_windows(&self) -> Vec<(i64, i64)> {
+        let report = self.clone().report(&BTreeMap::new());
+        let mut pairs: Vec<_> = report
+            .pairs
+            .iter()
+            .filter(|p| p.entry_spread_usdt.is_some())
+            .collect();
+        pairs.sort_by(|a, b| {
+            let density =
+                |p: &Pair| p.notional_usdt.unwrap_or(0.0) / p.expected_minutes.max(1) as f64;
+            density(b).total_cmp(&density(a))
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        pairs
+            .into_iter()
+            .filter_map(|p| {
+                let window = (
+                    minute(p.spot.ts.min(p.futures.ts)),
+                    minute(p.completed_at_ms),
+                );
+                seen.insert(window).then_some(window)
+            })
+            .collect()
+    }
+
     pub fn paired_time_range(&self) -> Option<(i64, i64)> {
         let s = self.spot.front()?;
         let f = self.futures.front()?;

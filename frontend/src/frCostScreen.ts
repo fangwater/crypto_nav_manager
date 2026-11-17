@@ -20,13 +20,13 @@ export function costMetric(row: FrCostRow, key: CostMetric): number | null {
     case 'futuresTaker': return mix.futures.takerNotionalPct
     case 'taker': return mix.spot.takerNotionalPct !== null && mix.futures.takerNotionalPct !== null
       ? Math.max(mix.spot.takerNotionalPct, mix.futures.takerNotionalPct) : null
-    case 'fee': return s.feeUsdt
-    case 'feeBps': return bps(s.feeUsdt)
+    case 'fee': return s.feeUsdt ?? row.covered?.fee.valueUsdt ?? null
+    case 'feeBps': return bps(s.feeUsdt) ?? row.covered?.fee.bps ?? null
     case 'basis': return row.fillSpreadBps
     case 'basisAbs': return row.fillSpreadBps === null ? null : Math.abs(row.fillSpreadBps)
-    case 'deviation': return row.executionDeviationBps
-    case 'cost': return s.estimatedCostUsdt
-    case 'costBps': return s.estimatedCostBps
+    case 'deviation': return row.executionDeviationBps ?? row.covered?.deviation.bps ?? null
+    case 'cost': return s.estimatedCostUsdt ?? row.covered?.cost.valueUsdt ?? null
+    case 'costBps': return s.estimatedCostBps ?? row.covered?.cost.bps ?? null
     case 'lastPair': return row.lastPairMs
   }
 }

@@ -61,6 +61,18 @@
 .fr-cost-selected { background: #f0f7f4; }
 .fr-cost-adverse { color: #ad4631; }
 #fr-cost-detail { scroll-margin-top: 20px; }
+.fr-cost-coverage-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+.fr-cost-coverage-cards article { border: 1px solid #dde7e3; border-radius: 9px; padding: 16px; background: #f7faf8; }
+.fr-cost-coverage-cards span, .fr-cost-coverage-cards strong, .fr-cost-coverage-cards small { display: block; }
+.fr-cost-coverage-cards span { font-size: 12px; color: #65777e; }
+.fr-cost-coverage-cards strong { font-size: 28px; color: #246e65; margin: 8px 0; }
+.fr-cost-coverage-cards small { font-size: 11px; color: #65777e; }
+.fr-cost-comparison-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 22px 0; }
+.fr-cost-comparison-charts article { min-width: 0; border: 1px solid #e0e8e5; border-radius: 10px; padding: 16px 8px; }
+.fr-cost-comparison-charts h3 { font-size: 14px; margin: 0 10px; }
+.fr-cost-comparison-charts p { font-size: 11px; margin: 10px; min-height: 38px; }
+.fr-cost-comparison-chart { height: 430px; width: 100%; }
+@media (max-width: 850px) { .fr-cost-comparison-charts { grid-template-columns: 1fr; } .fr-cost-coverage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 850px) { .fr-cost-screen-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 500px) { .fr-cost-screen-controls { grid-template-columns: 1fr; } }
 @media (max-width: 850px) { .fr-cost-metrics { grid-template-columns: repeat(2, 1fr); } .fr-cost-hero { flex-direction: column; } .fr-cost-hero-meta { grid-template-columns: repeat(2, 1fr); } }

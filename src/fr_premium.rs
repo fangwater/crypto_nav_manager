@@ -73,6 +73,7 @@ pub async fn load(
     start: i64,
     end: i64,
     anchors: &[i64],
+    entry_windows: Option<&[(i64, i64)]>,
 ) -> (Series, String, Vec<String>) {
     let source = format!("{exchange}_premium_index_1m_close");
     if !matches!(exchange, "binance" | "bybit" | "gate") {
@@ -133,15 +134,18 @@ pub async fn load(
         let mut requests = 0;
         // Fetch the comparison endpoints before a potentially long historical
         // backfill. A partial backfill must not starve the latest closed minute.
-        let mut priority = vec![end];
-        for &t in anchors {
-            let t = minute(t);
-            if t >= start && t <= end && !priority.contains(&t) {
-                priority.push(t);
+        let mut priority = Vec::new();
+        if entry_windows.is_none() {
+            priority.push(end);
+            for &t in anchors {
+                let t = minute(t);
+                if t >= start && t <= end && !priority.contains(&t) {
+                    priority.push(t);
+                }
             }
-        }
-        if !priority.contains(&start) {
-            priority.push(start);
+            if !priority.contains(&start) {
+                priority.push(start);
+            }
         }
         for t in priority {
             if !values.contains_key(&t) {
@@ -149,6 +153,29 @@ pub async fn load(
                 requests += 1;
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
+        }
+        if let Some(windows) = entry_windows {
+            for &(begin, finish) in windows {
+                let mut cursor = begin.max(start);
+                let finish = finish.min(end);
+                while cursor <= finish && requests < 8 {
+                    if values.contains_key(&cursor) {
+                        cursor += MINUTE_MS;
+                        continue;
+                    }
+                    // Use one full exchange page around a needed minute, so
+                    // nearby paired fills share the same public request.
+                    let stop = (cursor + 999 * MINUTE_MS).min(end);
+                    values.extend(fetch_page(&client, exchange, symbol, cursor, stop).await?);
+                    requests += 1;
+                    cursor = stop + MINUTE_MS;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                if requests >= 8 {
+                    break;
+                }
+            }
+            return Ok::<(), anyhow::Error>(());
         }
         while cursor <= end {
             if values.contains_key(&cursor) {
@@ -169,11 +196,14 @@ pub async fn load(
         }
         Ok::<(), anyhow::Error>(())
     };
-    match tokio::time::timeout(Duration::from_secs(40), fetch).await {
+    let seconds = if entry_windows.is_some() { 8 } else { 40 };
+    match tokio::time::timeout(Duration::from_secs(seconds), fetch).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => issues
             .push("公开 premium 历史请求失败；保留已取得分钟，缺口不插值，刷新可重试。".into()),
-        Err(_) => issues.push("参考补齐达到 40 秒；已获取分钟保留在缓存，刷新可继续。".into()),
+        Err(_) => issues.push(format!(
+            "参考补齐达到 {seconds} 秒；已获取分钟保留在缓存，刷新可继续。"
+        )),
     }
     // Bound per-symbol memory while retaining the requested historical window.
     if values.len() > 600_000 {

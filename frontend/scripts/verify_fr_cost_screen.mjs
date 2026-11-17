@@ -52,4 +52,12 @@ assert.equal(numberInput(''), null)
 assert.equal(numberInput('Infinity'), null)
 assert.equal(numberInput('0'), 0)
 assert.equal(numberInput('-2.5'), -2.5)
+const coveredRow = { ...unknown, summary: { ...unknown.summary, notionalUsdt: 10000 }, covered: {
+  fee: { valueUsdt: 1, bps: 10, quantityCoveragePct: 10 },
+  deviation: { valueUsdt: 2, bps: 20, quantityCoveragePct: 10 },
+  cost: { valueUsdt: 3, bps: 30, quantityCoveragePct: 10 },
+} }
+assert.equal(costMetric(coveredRow, 'costBps'), 30, 'partial bps uses the covered notional, not full position')
+assert.equal(costMetric(coveredRow, 'cost'), 3, 'partial amount must not be extrapolated to whole position')
+assert.equal(match(coveredRow, { ...EMPTY_THRESHOLDS, deviation: '15' }, 'any'), true)
 console.log('FR screen: inclusive thresholds, any/all, signed and absolute basis, rebates, unknown roles, missing values and bidirectional sorting passed.')

@@ -116,7 +116,17 @@ export interface FrEntryAnalysis {
   executionDeviationBps: number | null
   deviationAssessment: 'adverse' | 'favorable' | 'at_reference' | 'unknown'
   basis: BasisEvolution
+  covered: CoveredCosts
 }
+
+export interface CoveredMetric {
+  valueUsdt: number | null
+  bps: number | null
+  notionalUsdt: number
+  quantity: number
+  quantityCoveragePct: number | null
+}
+export interface CoveredCosts { fee: CoveredMetric; deviation: CoveredMetric; cost: CoveredMetric }
 
 export interface FrCostRow {
   symbol: string
@@ -128,6 +138,8 @@ export interface FrCostRow {
   fillSpreadBps: number | null
   executionDeviationBps: number | null
   lastPairMs: number | null
+  factualPosition: { spotQuantity: number; futuresQuantity: number } | null
+  covered: CoveredCosts
 }
 
 export interface FrCostOverview {
@@ -135,6 +147,7 @@ export interface FrCostOverview {
   exchange: string
   endMs: number
   historyStartMs: number
+  factualSnapshotMs: number
   rows: FrCostRow[]
 }
 
@@ -149,6 +162,8 @@ export function entryCostRow(data: FrEntryCost): FrCostRow {
     fillSpreadBps: data.analysis.fillSpreadBps,
     executionDeviationBps: data.analysis.executionDeviationBps,
     lastPairMs: data.analysis.basis.lastPair?.eventMs ?? null,
+    factualPosition: data.factualPosition,
+    covered: data.analysis.covered,
   }
 }
 

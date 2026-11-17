@@ -135,6 +135,53 @@ pub struct EntryAnalysis {
     pub execution_deviation_bps: Option<f64>,
     pub deviation_assessment: &'static str,
     pub basis: BasisEvolution,
+    pub covered: CoveredCosts,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoveredMetric {
+    pub value_usdt: Option<f64>,
+    pub bps: Option<f64>,
+    pub notional_usdt: f64,
+    pub quantity: f64,
+    pub quantity_coverage_pct: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CoveredCosts {
+    pub fee: CoveredMetric,
+    pub deviation: CoveredMetric,
+    pub cost: CoveredMetric,
+}
+
+pub fn covered_costs(report: &Report) -> CoveredCosts {
+    let metric = |value: fn(&crate::fr_entry_cost::Pair) -> Option<f64>| {
+        let (mut total, mut notional, mut quantity) = (0.0, 0.0, 0.0);
+        for pair in &report.pairs {
+            if let Some((v, n)) = value(pair)
+                .zip(pair.notional_usdt)
+                .filter(|(_, n)| *n > 0.0)
+            {
+                total += v;
+                notional += n;
+                quantity += pair.quantity;
+            }
+        }
+        CoveredMetric {
+            value_usdt: (notional > 0.0).then_some(total),
+            bps: (notional > 0.0).then(|| total / notional * 10_000.0),
+            notional_usdt: notional,
+            quantity,
+            quantity_coverage_pct: (report.summary.quantity > 0.0)
+                .then(|| quantity / report.summary.quantity * 100.0),
+        }
+    };
+    CoveredCosts {
+        fee: metric(|p| p.fee_usdt),
+        deviation: metric(|p| p.execution_deviation_usdt),
+        cost: metric(|p| p.estimated_cost_usdt),
+    }
 }
 
 pub fn calculate(
@@ -275,6 +322,7 @@ pub fn calculate(
         points,
     };
     EntryAnalysis {
+        covered: covered_costs(report),
         paired_liquidity,
         window_liquidity,
         spot_vwap,
@@ -291,6 +339,34 @@ pub fn calculate(
 mod tests {
     use super::*;
     use crate::fr_entry_cost::{Inventory, Seed};
+
+    #[test]
+    fn covered_costs_keep_sample_denominators_and_do_not_extrapolate_missing_costs() {
+        let mut inventory = Inventory::default();
+        let mut missing_fee = fill("s2", 120_000, Leg::Spot, 3.0, 200.0, "maker", 0.0);
+        missing_fee.fee_usdt = None;
+        for f in [
+            fill("s1", 0, Leg::Spot, 1.0, 100.0, "maker", -0.1),
+            fill("f1", 0, Leg::Futures, 1.0, 101.0, "maker", 0.2),
+            missing_fee,
+            fill("f2", 120_000, Leg::Futures, 3.0, 202.0, "taker", 0.3),
+        ] {
+            inventory.apply(f).unwrap();
+        }
+        let report = inventory.report(&BTreeMap::from([(0, 0.005)]));
+        let covered = covered_costs(&report);
+        assert!(report.summary.estimated_cost_usdt.is_none());
+        near(covered.cost.notional_usdt, 100.0);
+        near(covered.cost.value_usdt.unwrap(), -0.4);
+        near(covered.cost.bps.unwrap(), -40.0);
+        near(covered.cost.quantity_coverage_pct.unwrap(), 25.0);
+        near(covered.deviation.bps.unwrap(), -50.0);
+        near(covered.fee.value_usdt.unwrap(), 0.1);
+        let empty = covered_costs(&Inventory::default().report(&BTreeMap::new()));
+        assert!(empty.cost.value_usdt.is_none());
+        assert!(empty.cost.bps.is_none());
+        assert!(empty.cost.quantity_coverage_pct.is_none());
+    }
     fn fill(id: &str, ts: i64, leg: Leg, q: f64, price: f64, role: &str, fee: f64) -> Fill {
         Fill {
             id: id.into(),

@@ -6,7 +6,7 @@ import { FrAlignmentChart, FrCostChart } from '../components/FrCostChart'
 import { FrEntryAttribution } from '../components/FrEntryAttribution'
 import { FrCostOverviewTable } from '../components/FrCostOverviewTable'
 import { costBps, coverage } from '../frEntryCost'
-import type { FrEntryCost } from '../frEntryCost'
+import type { FrCostOverview, FrEntryCost } from '../frEntryCost'
 import type { Strategy } from '../types'
 import './FrEntryCostPage.css'
 
@@ -19,7 +19,7 @@ export function FrEntryCostPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [data, setData] = useState<FrEntryCost | null>(null)
   const [symbol, setSymbol] = useState('')
-  const [asOf, setAsOf] = useState('')
+  const [holdings, setHoldings] = useState<FrCostOverview | null>(null)
   const [reference, setReference] = useState('')
   const [query, setQuery] = useState(() => new URLSearchParams({ endMs: String(Date.now()) }).toString())
   const [refresh, setRefresh] = useState(0)
@@ -28,6 +28,8 @@ export function FrEntryCostPage() {
   const [error, setError] = useState('')
   const [page, setPage] = useState(0)
   const [crossOnly, setCrossOnly] = useState(false)
+  const endMs = Number(new URLSearchParams(query).get('endMs'))
+  const currentHoldings = holdings && holdings.strategySlug === slug && holdings.endMs === endMs ? holdings : null
 
   useEffect(() => {
     const controller = new AbortController()
@@ -40,30 +42,36 @@ export function FrEntryCostPage() {
   }, [slug, navigate])
 
   useEffect(() => {
-    if (!slug) return
+    setData(null)
+    if (!slug || !holdings || holdings.strategySlug !== slug || holdings.endMs !== endMs) { setLoading(false); return }
+    if (!holdings.rows.length) { setSymbol(''); setLoading(false); return }
+    const params = new URLSearchParams(query)
+    const available = holdings.rows.map(row => row.symbol)
+    const requested = params.get('symbol')
+    if (!requested || !available.includes(requested)) { setSymbol(''); setLoading(false); return }
+    params.set('symbol', requested)
     const controller = new AbortController()
     setLoading(true)
     setError('')
     setData(null)
     setPage(0)
-    getFrEntryCost(slug, new URLSearchParams(query), controller.signal).then(result => {
+    getFrEntryCost(slug, params, controller.signal).then(result => {
       if (controller.signal.aborted) return
       setData(result)
       setSymbol(result.symbol)
     }).catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)) })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [slug, query, refresh, detailRefresh])
+  }, [slug, query, refresh, detailRefresh, holdings, endMs])
 
   function run() {
     const params = new URLSearchParams()
     if (symbol) params.set('symbol', symbol)
-    params.set('endMs', String(asOf ? new Date(asOf).getTime() : Date.now()))
+    params.set('endMs', String(Date.now()))
     if (reference.trim()) params.set('referenceBps', reference)
     setQuery(params.toString())
     setRefresh(v => v + 1)
   }
-  const endMs = Number(new URLSearchParams(query).get('endMs'))
   function selectCoin(value: string) {
     const params = new URLSearchParams(query)
     params.set('symbol', value)
@@ -72,6 +80,7 @@ export function FrEntryCostPage() {
     document.getElementById('fr-cost-detail')?.scrollIntoView({ behavior: 'smooth' })
   }
   const summary = data?.report.summary
+  const covered = data?.analysis.covered
   const pairs = data?.report.pairs.filter(p => !crossOnly || p.crossMinute) ?? []
   const pages = Math.max(1, Math.ceil(pairs.length / 50))
 
@@ -84,24 +93,26 @@ export function FrEntryCostPage() {
     <main className="fr-cost-shell">
       <form className="fr-cost-controls" onSubmit={e => { e.preventDefault(); run() }}>
         <label>FR 账户<select value={slug ?? ''} onChange={e => {
-          setSymbol(''); setQuery(new URLSearchParams({ endMs: String(Date.now()) }).toString()); setReference(''); setAsOf(''); navigate(`/fr-entry-cost/${e.target.value}`)
+          setSymbol(''); setQuery(new URLSearchParams({ endMs: String(Date.now()) }).toString()); setReference(''); setHoldings(null); navigate(`/fr-entry-cost/${e.target.value}`)
         }}><option value="" disabled>选择账户</option>{strategies.map(s => <option key={s.slug} value={s.slug}>{s.displayName}</option>)}</select></label>
-        <label>币种<select value={symbol} onChange={e => setSymbol(e.target.value)} disabled={!data}>
-          {(data?.availableSymbols ?? []).map(s => <option key={s} value={s}>{s}</option>)}</select></label>
-        <label>持仓截至时间（留空为现在）<input type="datetime-local" value={asOf} onChange={e => setAsOf(e.target.value)} /></label>
+        <label>币种<select value={symbol} onChange={e => setSymbol(e.target.value)} disabled={!currentHoldings?.rows.length}>
+          <option value="" disabled>选择币种查看明细</option>
+          {(currentHoldings?.rows ?? []).map(row => <option key={row.symbol} value={row.symbol}>{row.symbol}</option>)}</select></label>
         <label>参考基差假设 bps（留空用市场数据）<input type="number" step="any" min="-10000" max="10000" value={reference} placeholder="自动读取分钟 premium" onChange={e => setReference(e.target.value)} /></label>
         <button className="config-button" disabled={loading || !slug}><RefreshCw size={15} />{loading ? '重建与补齐中…' : '计算 / 刷新'}</button>
       </form>
       {error && <p className="fr-cost-notice" role="alert">{error}</p>}
       {!slug && !error && strategies.length === 0 && <p>没有可访问的 FR 账户。</p>}
-      {slug && <FrCostOverviewTable key={slug} slug={slug} endMs={endMs} refresh={refresh} detail={data} onSelect={selectCoin} />}
+      {slug && <FrCostOverviewTable key={slug} slug={slug} endMs={endMs} refresh={refresh} detail={data} onSelect={selectCoin} onLoaded={setHoldings} />}
       <div id="fr-cost-detail" />
+      {!loading && !data && !!currentHoldings?.rows.length && <p className="fr-cost-notice">点击表格币种或图表数据点，查看该持仓的 FIFO 建仓明细。</p>}
       {loading && <p className="fr-cost-notice" role="status">重放实际成交并补齐分钟参考，首次加载可能需要约 40 秒。</p>}
       {data && summary && <>
         <section className="fr-cost-hero">
           <div><p>{data.symbol || '无成交'} · {data.referenceBps === null ? '建仓成本估算' : '建仓成本 · 假设情景'}</p>
-            <h2>{summary.pairCount ? fmt(summary.estimatedCostUsdt) : '无配对仓位'} <small>USDT</small></h2>
-            <strong>{fmt(summary.estimatedCostBps)} bps</strong>
+            <h2>{summary.pairCount ? fmt(summary.estimatedCostUsdt ?? covered?.cost.valueUsdt ?? null) : 'FIFO 成本待核对'} <small>USDT</small></h2>
+            <strong>{fmt(summary.estimatedCostBps ?? covered?.cost.bps ?? null)} bps</strong>
+            {summary.estimatedCostBps === null && covered?.cost.bps !== null && covered?.cost.bps !== undefined && <p>部分估算：仅覆盖 {fmt(covered.cost.quantityCoveragePct, 2)}% 配对数量；金额和 bps 均只对应这部分库存，不外推整仓。</p>}
             <p>参考基差 − 实际成交基差 ＋ 两腿手续费；正值为损耗，负值为相对参考的优势。</p>
             <p>成本只覆盖历史重建中已配对的剩余仓位；数量不齐时，不能代表整组真实持仓的总成本。</p>
           </div>
@@ -114,8 +125,8 @@ export function FrEntryCostPage() {
         <div className="fr-cost-metrics">
           <article><span>实际成交基差</span><strong>{fmt(costBps(summary.entrySpreadUsdt, summary.notionalUsdt))} bps</strong><small>已按套利方向调整，正值有利</small></article>
           <article><span>参考基差</span><strong>{fmt(costBps(summary.referenceSpreadUsdt, summary.notionalUsdt))} bps</strong><small>{data.referenceBps === null ? '跨分钟 premium 均值' : `手动恒定假设 ${data.referenceBps} bps`}</small></article>
-          <article><span>执行偏离估算</span><strong>{fmt(summary.executionDeviationUsdt)} USDT</strong><small>含等待与指数口径差异，非纯滑点</small></article>
-          <article><span>剩余仓位分摊手续费</span><strong>{fmt(summary.feeUsdt)} USDT</strong><small>实际成交费；负数为返佣</small></article>
+          <article><span>执行偏离估算</span><strong>{fmt(summary.executionDeviationUsdt ?? covered?.deviation.valueUsdt ?? null)} USDT</strong><small>数量覆盖 {fmt(covered?.deviation.quantityCoveragePct ?? null, 2)}%；非纯滑点</small></article>
+          <article><span>剩余仓位分摊手续费</span><strong>{fmt(summary.feeUsdt ?? covered?.fee.valueUsdt ?? null)} USDT</strong><small>数量覆盖 {fmt(covered?.fee.quantityCoveragePct ?? null, 2)}%；负数为返佣</small></article>
         </div>
         <FrEntryAttribution key={`${data.strategySlug}-${data.symbol}`} analysis={data.analysis} />
         <section className="fr-cost-panel"><h2>数量与时间对齐</h2>

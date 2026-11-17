@@ -109,43 +109,101 @@ struct FactualPosition {
     futures_quantity: f64,
 }
 
-fn snapshot_positions(payload: &Value) -> Vec<(String, FactualPosition, f64)> {
+struct CurrentHoldings {
+    ts_ms: i64,
+    positions: Vec<(String, FactualPosition, f64)>,
+}
+
+fn parse_current_holdings(payload: &Value, now: i64) -> Result<CurrentHoldings> {
+    let entry = payload["entries"]
+        .as_array()
+        .context("missing snapshot entries")?
+        .iter()
+        .find(|e| e["type"] == "pre_trade_exposure")
+        .context("missing factual positions")?;
+    let entry = &entry["entry"];
+    let ts_ms = entry["ts_ms"]
+        .as_i64()
+        .context("missing position timestamp")?;
+    anyhow::ensure!(
+        (-5_000..=90_000).contains(&(now - ts_ms)),
+        "positions are not fresh"
+    );
+    let rows = entry["rows"].as_array().context("missing position rows")?;
     let mut positions = Vec::new();
-    if let Some(entries) = payload.get("entries").and_then(Value::as_array) {
-        for entry in entries
-            .iter()
-            .filter(|entry| entry["type"] == "pre_trade_exposure")
-        {
-            if let Some(rows) = entry["entry"]["rows"].as_array() {
-                for row in rows {
-                    if row["is_total"].as_bool() == Some(true) {
-                        continue;
-                    }
-                    let Some(asset) = row["asset"].as_str() else {
-                        continue;
-                    };
-                    let (Some(spot), Some(futures)) =
-                        (row["open_qty"].as_f64(), row["hedge_qty"].as_f64())
-                    else {
-                        continue;
-                    };
-                    if !spot.is_finite() || !futures.is_finite() {
-                        continue;
-                    }
-                    positions.push((
-                        format!("{}USDT", asset.to_ascii_uppercase()),
-                        FactualPosition {
-                            spot_quantity: spot,
-                            futures_quantity: futures,
-                        },
-                        row["open_usdt"].as_f64().unwrap_or(0.0).abs(),
-                    ));
-                }
-            }
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows.iter().filter(|r| r["is_total"] != true) {
+        let asset = row["asset"]
+            .as_str()
+            .context("missing asset")?
+            .trim()
+            .to_ascii_uppercase();
+        anyhow::ensure!(
+            !asset.is_empty() && seen.insert(asset.clone()),
+            "invalid or duplicate asset"
+        );
+        let spot = row["open_qty"].as_f64().context("missing spot quantity")?;
+        let futures = row["hedge_qty"]
+            .as_f64()
+            .context("missing futures quantity")?;
+        anyhow::ensure!(
+            spot.is_finite() && futures.is_finite(),
+            "invalid factual quantity"
+        );
+        // A flat hedge is no longer an open FR position. Spot residual balances
+        // do not resurrect it, regardless of historical FIFO residual inventory.
+        if futures == 0.0 {
+            continue;
         }
+        positions.push((
+            format!("{asset}USDT"),
+            FactualPosition {
+                spot_quantity: spot,
+                futures_quantity: futures,
+            },
+            row["hedge_usdt"]
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .map_or(0.0, f64::abs),
+        ));
     }
-    positions.sort_by(|a, b| b.2.total_cmp(&a.2));
-    positions
+    positions.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    Ok(CurrentHoldings { ts_ms, positions })
+}
+
+async fn current_holdings(pool: &PgPool, slug: &str) -> Result<CurrentHoldings> {
+    let source = sqlx::query_as::<_, SnapshotStrategyRecord>(
+        "SELECT slug,host,config_url,snapshot_url FROM strategy_envs WHERE enabled AND slug=$1",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await?;
+    let url = source
+        .snapshot_url
+        .map(Ok)
+        .unwrap_or_else(|| snapshot_source_url(&source.host, &source.config_url))?;
+    let payload = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    parse_current_holdings(&payload, chrono::Utc::now().timestamp_millis())
+}
+
+fn holdings_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "当前持仓暂不可用或已过期，请稍后刷新；未使用历史库存替代当前持仓。",
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -169,6 +227,8 @@ struct CostRow {
     fill_spread_bps: Option<f64>,
     execution_deviation_bps: Option<f64>,
     last_pair_ms: Option<i64>,
+    factual_position: FactualPosition,
+    covered: crate::fr_entry_analysis::CoveredCosts,
 }
 
 impl CostRow {
@@ -176,6 +236,7 @@ impl CostRow {
         symbol: String,
         report: &cost::Report,
         analysis: crate::fr_entry_analysis::EntryAnalysis,
+        factual_position: FactualPosition,
     ) -> Self {
         Self {
             symbol,
@@ -187,6 +248,8 @@ impl CostRow {
             fill_spread_bps: analysis.fill_spread_bps,
             execution_deviation_bps: analysis.execution_deviation_bps,
             last_pair_ms: analysis.basis.last_pair.map(|p| p.event_ms),
+            factual_position,
+            covered: analysis.covered,
         }
     }
 }
@@ -204,6 +267,7 @@ struct CostOverview {
     exchange: String,
     end_ms: i64,
     history_start_ms: i64,
+    factual_snapshot_ms: i64,
     rows: Vec<CostRow>,
 }
 
@@ -240,6 +304,15 @@ pub(super) async fn overview(
         )
             .into_response());
     }
+    let holdings = match current_holdings(&state.pool, &slug).await {
+        Ok(holdings) => holdings,
+        Err(_) => return Ok(holdings_unavailable()),
+    };
+    let held_symbols: Vec<String> = holdings
+        .positions
+        .iter()
+        .map(|(s, _, _)| s.clone())
+        .collect();
     let _permit = OVERVIEW_REPLAY
         .acquire()
         .await
@@ -250,9 +323,16 @@ pub(super) async fn overview(
     let history_start_ms = initial
         .as_ref()
         .map_or(strategy.st_ms, |s| s.snapshot_ts_ms.saturating_add(1));
-    let mut inventories = BTreeMap::<String, Inventory>::new();
+    let mut inventories: BTreeMap<String, Inventory> = held_symbols
+        .iter()
+        .map(|s| (s.clone(), Inventory::default()))
+        .collect();
     if let Some(initial) = &initial {
-        for position in parse_initial_positions(&initial.payload)?.positions {
+        for position in parse_initial_positions(&initial.payload)?
+            .positions
+            .into_iter()
+            .filter(|p| held_symbols.contains(&p.symbol))
+        {
             let inventory = inventories.entry(position.symbol).or_default();
             inventory.seed(Seed {
                 ts: initial.snapshot_ts_ms,
@@ -267,16 +347,17 @@ pub(super) async fn overview(
         }
     }
     let sql = format!(
-        "SELECT upper(symbol) AS symbol,trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE event_time_ms >= $1 AND event_time_ms <= $2 ORDER BY event_time_ms,market,trade_id",
+        "SELECT upper(symbol) AS symbol,trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE event_time_ms >= $1 AND event_time_ms <= $2 AND upper(symbol)=ANY($3) ORDER BY event_time_ms,market,trade_id",
         strategy.db_schema
     );
     let trades = sqlx::query_as::<_, Trade>(sqlx::AssertSqlSafe(sql))
         .bind(history_start_ms)
         .bind(end_ms)
+        .bind(&held_symbols)
         .fetch_all(&state.pool)
         .await?;
     let exchange = strategy.exchange.clone();
-    let inventories = tokio::task::spawn_blocking(move || {
+    let mut inventories = tokio::task::spawn_blocking(move || {
         for trade in trades {
             let inventory = inventories.entry(trade.symbol.clone()).or_default();
             inventory.apply(trade.into_fill(&exchange)?)?;
@@ -286,7 +367,10 @@ pub(super) async fn overview(
     .await
     .context("join FR overview replay")??;
     let mut rows = Vec::with_capacity(inventories.len());
-    for (symbol, inventory) in inventories {
+    for (symbol, factual_position, _) in &holdings.positions {
+        let inventory = inventories.remove(symbol).unwrap_or_default();
+        let symbol = symbol.clone();
+        let factual_position = factual_position.clone();
         let premiums = if let Some((start, last_pair)) = inventory.paired_time_range() {
             crate::fr_premium::cached(&state.pool, &strategy.exchange, &symbol, start, last_pair)
                 .await?
@@ -298,7 +382,7 @@ pub(super) async fn overview(
             // Overview needs retained-inventory metrics, not the whole trading window.
             let analysis =
                 crate::fr_entry_analysis::calculate(&report, &[], &premiums, end_ms, false);
-            CostRow::new(symbol, &report, analysis)
+            CostRow::new(symbol, &report, analysis, factual_position)
         })
         .await
         .context("join FR overview summary")?;
@@ -309,6 +393,7 @@ pub(super) async fn overview(
         exchange: strategy.exchange,
         end_ms,
         history_start_ms,
+        factual_snapshot_ms: holdings.ts_ms,
         rows,
     })
     .into_response())
@@ -359,48 +444,27 @@ pub(super) async fn report(
         .as_ref()
         .map(|s| parse_initial_positions(&s.payload))
         .transpose()?;
-    let symbols_sql = format!(
-        "SELECT upper(symbol) AS symbol FROM {}.trades WHERE event_time_ms >= $1 AND event_time_ms <= $2 GROUP BY upper(symbol) ORDER BY max(event_time_ms) DESC,upper(symbol)",
-        strategy.db_schema
-    );
-    let mut available_symbols: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(symbols_sql))
-        .bind(history_start_ms)
-        .bind(end_ms)
-        .fetch_all(&state.pool)
-        .await?;
-    if let Some(parsed) = &parsed {
-        for p in &parsed.positions {
-            if !available_symbols.contains(&p.symbol) {
-                available_symbols.push(p.symbol.clone());
-            }
-        }
-    }
-    let factual_snapshot = sqlx::query_as::<_, (i64, Value)>(
-        "SELECT snapshot_ts_ms,payload FROM strategy_snapshots WHERE strategy_slug=$1 AND snapshot_ts_ms <= $2 ORDER BY snapshot_ts_ms DESC LIMIT 1"
-    ).bind(&slug).bind(end_ms).fetch_optional(&state.pool).await?;
-    let factual_positions = factual_snapshot
-        .as_ref()
-        .map(|(_, payload)| snapshot_positions(payload))
-        .unwrap_or_default();
+    let holdings = match current_holdings(&state.pool, &slug).await {
+        Ok(holdings) => holdings,
+        Err(_) => return Ok(holdings_unavailable()),
+    };
+    let available_symbols: Vec<String> = holdings
+        .positions
+        .iter()
+        .map(|(s, _, _)| s.clone())
+        .collect();
     let symbol = query
         .symbol
         .map(|s| s.trim().to_ascii_uppercase())
-        .or_else(|| {
-            factual_positions
-                .iter()
-                .find(|(symbol, p, _)| {
-                    p.spot_quantity * p.futures_quantity < 0.0 && available_symbols.contains(symbol)
-                })
-                .map(|(s, _, _)| s.clone())
-        })
         .or_else(|| available_symbols.first().cloned())
         .unwrap_or_default();
-    let factual_position = factual_positions
+    let factual_position = holdings
+        .positions
         .iter()
         .find(|(s, _, _)| *s == symbol)
         .map(|(_, p, _)| p.clone());
-    if !symbol.is_empty() && !available_symbols.contains(&symbol) {
-        return Ok(not_found("symbol not found in FR history"));
+    if !symbol.is_empty() && factual_position.is_none() {
+        return Ok(not_found("symbol has no current FR position"));
     }
     let sql = format!(
         "SELECT upper(symbol) AS symbol,trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE upper(symbol)=$1 AND event_time_ms >= $2 AND event_time_ms <= $3 ORDER BY event_time_ms,market,trade_id",
@@ -475,13 +539,19 @@ pub(super) async fn report(
                 .collect();
             (values, "manual_constant_scenario".into())
         } else {
+            let windows = query.summary_only.then(|| inventory.reference_windows());
             let (values, source, issues) = crate::fr_premium::load(
                 &state.pool,
                 &strategy.exchange,
                 &symbol,
                 start,
-                end_ms,
+                if query.summary_only {
+                    last_pair
+                } else {
+                    end_ms
+                },
                 &[last_pair, cost::minute(end_ms) - cost::MINUTE_MS],
+                windows.as_deref(),
             )
             .await;
             warnings.extend(issues);
@@ -500,7 +570,10 @@ pub(super) async fn report(
     .await
     .context("join FR cost calculation")?;
     if query.summary_only {
-        return Ok(Json(CostRow::new(symbol, &report, analysis)).into_response());
+        let Some(factual_position) = factual_position else {
+            return Ok(not_found("no current FR position"));
+        };
+        return Ok(Json(CostRow::new(symbol, &report, analysis, factual_position)).into_response());
     }
     if report.summary.cost_covered_quantity < report.summary.quantity {
         warnings.push("部分库存缺少原始成交价、手续费折算或所需分钟参考；完整总成本显示为未知，不能将缺失部分按零计入。".into());
@@ -517,7 +590,7 @@ pub(super) async fn report(
         last_trade_ms,
         reference_source,
         reference_bps: query.reference_bps,
-        factual_snapshot_ms: factual_snapshot.as_ref().map(|(ts, _)| *ts),
+        factual_snapshot_ms: Some(holdings.ts_ms),
         factual_position,
         warnings,
         alignment,
@@ -525,4 +598,75 @@ pub(super) async fn report(
         analysis,
     })
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snapshot(rows: Value, ts: i64) -> Value {
+        json!({"entries":[{"type":"pre_trade_exposure","entry":{"ts_ms":ts,"rows":rows}}]})
+    }
+
+    #[test]
+    fn fr_current_holdings_excludes_closed_hedges_including_spot_residuals() {
+        let payload = snapshot(
+            json!([
+                {"asset":"OPEN","open_qty":100,"hedge_qty":-100,"hedge_usdt":-500},
+                {"asset":"REVERSE","open_qty":-20,"hedge_qty":20,"hedge_usdt":200},
+                {"asset":"CLOSED","open_qty":0,"hedge_qty":0},
+                {"asset":"RESIDUAL","open_qty":0.001,"hedge_qty":0},
+                {"is_total":true,"open_qty":null,"hedge_qty":null}
+            ]),
+            100_000,
+        );
+        let holdings = parse_current_holdings(&payload, 101_000).unwrap();
+        assert_eq!(
+            holdings
+                .positions
+                .iter()
+                .map(|p| p.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OPENUSDT", "REVERSEUSDT"]
+        );
+        assert_eq!(holdings.ts_ms, 100_000);
+    }
+
+    #[test]
+    fn fr_current_holdings_does_not_infer_flatness_from_unpriced_or_small_hedges() {
+        let payload = snapshot(
+            json!([
+                {"asset":"UNPRICED","open_qty":100,"hedge_qty":-100,"hedge_usdt":0},
+                {"asset":"SMALL","open_qty":0,"hedge_qty":0.00000000001}
+            ]),
+            100_000,
+        );
+        assert_eq!(
+            parse_current_holdings(&payload, 101_000)
+                .unwrap()
+                .positions
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fr_current_holdings_unavailable_is_not_an_empty_account() {
+        assert!(parse_current_holdings(&json!({"entries":[]}), 100_000).is_err());
+        let malformed = snapshot(
+            json!([{"asset":"BTC","open_qty":1,"hedge_qty":null}]),
+            100_000,
+        );
+        assert!(parse_current_holdings(&malformed, 100_000).is_err());
+        let valid_empty = snapshot(json!([]), 100_000);
+        assert!(
+            parse_current_holdings(&valid_empty, 101_000)
+                .unwrap()
+                .positions
+                .is_empty()
+        );
+        assert!(parse_current_holdings(&valid_empty, 190_001).is_err());
+        assert!(parse_current_holdings(&valid_empty, 94_999).is_err());
+    }
 }

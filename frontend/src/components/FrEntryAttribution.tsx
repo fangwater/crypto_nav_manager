@@ -28,12 +28,14 @@ export function FrEntryAttribution({ analysis }: { analysis: FrEntryAnalysis }) 
   const [scope, setScope] = useState<'paired' | 'window'>('paired')
   const { basis } = analysis
   const selected = scope === 'window' ? analysis.windowLiquidity : analysis.pairedLiquidity
+  const deviation = analysis.executionDeviationBps ?? analysis.covered.deviation.bps
+  const assessmentKey = deviation === null ? 'unknown' : deviation > 0.0001 ? 'adverse' : deviation < -0.0001 ? 'favorable' : 'at_reference'
   const assessment = {
     adverse: '成交劣于参考：存在不利执行偏离',
     favorable: '成交优于参考：获得执行优势',
     at_reference: '成交与参考基本一致',
     unknown: '参考覆盖不足，暂不能判断执行偏离',
-  }[analysis.deviationAssessment]
+  }[assessmentKey]
   return <>
     <section className="fr-cost-panel"><div className="fr-cost-table-head"><h2>手续费与 maker/taker 成交结构</h2>
       <select aria-label="成交统计范围" value={scope} onChange={e => setScope(e.target.value as 'paired' | 'window')}>
@@ -51,8 +53,9 @@ export function FrEntryAttribution({ analysis }: { analysis: FrEntryAnalysis }) 
         <span>合约成交 VWAP <b>{fmt(analysis.futuresVwap, 8)}</b></span>
         <span>实际价差 F − S <b>{fmt(analysis.fillSpread, 8)} USDT / 币</b></span>
         <span>实际成交基差 <b>{fmt(analysis.fillSpreadBps)} bps</b></span>
-        <span>执行偏离（已调整套利方向）<b>{change(analysis.executionDeviationBps)}</b></span>
+        <span>执行偏离（已调整套利方向）<b>{change(deviation)}</b></span>
       </div>
+      <p>执行偏离数量覆盖 {fmt(analysis.covered.deviation.quantityCoveragePct, 2)}%；部分覆盖仅描述已有完整参考的 FIFO 片段。</p>
       <p><strong>{assessment}</strong>。当前参考为 premium index 或手动情景；偏离含口径差异和等待对冲的影响，仅凭它不能断言纯滑点。</p>
     </section>
     <section className="fr-cost-panel"><h2>从开始建仓到现在：基差变化</h2>
