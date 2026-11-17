@@ -50,6 +50,7 @@ const DEFAULT_DB_USER: &str = "ubuntu";
 const FRONTEND_DIR_ENV: &str = "CRYPTO_NAV_FRONTEND_DIR";
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+mod fr_entry_cost;
 mod fr_overview;
 
 #[derive(Clone, Copy)]
@@ -667,6 +668,10 @@ pub async fn run() -> Result<()> {
         .route("/api/alignment-status", get(list_alignment_status))
         .route("/api/intra-matching", get(list_intra_matching))
         .route("/api/analysis/{slug}/intra-fifo", get(get_intra_analysis))
+        .route(
+            "/api/analysis/{slug}/fr-entry-cost",
+            get(fr_entry_cost::report),
+        )
         .route(
             "/api/analysis/{slug}/hourly-latency",
             get(get_intra_hourly_latency),

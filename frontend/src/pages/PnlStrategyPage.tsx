@@ -683,6 +683,7 @@ export function PnlStrategyPage({ readOnly }: { readOnly: boolean }) {
             </div>
           </div>
           <div className="detail-header-actions">
+            {strategy.strategyKind === 'funding_rate' && <Link className="strategy-card__analysis" to={`/fr-entry-cost/${strategy.slug}`}><FlaskConical size={14} /><span>建仓成本</span></Link>}
             {analysisLink && (
               <Link
                 className="strategy-card__analysis"

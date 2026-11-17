@@ -329,6 +329,7 @@ export function IndexPage({
               <Gauge size={16} />
               <span>FR 限仓</span>
             </Link>
+            <Link className="header-nav-link" to="/fr-entry-cost" title="FR 建仓成本"><Percent size={16} /><span>FR 建仓成本</span></Link>
             {session.admin && (
               <Link
                 className="header-nav-link"

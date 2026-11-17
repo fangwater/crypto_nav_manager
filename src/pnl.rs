@@ -1616,7 +1616,7 @@ fn market_making_quantity(
     Ok(quantity)
 }
 
-fn spot_swap_position_quantity(
+pub(crate) fn spot_swap_position_quantity(
     exchange: &str,
     leg: PositionLeg,
     side: Side,

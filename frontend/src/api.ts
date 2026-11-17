@@ -1,4 +1,5 @@
 import type { HourlyLatencySeries } from './analysisLatencyChart'
+import type { FrEntryCost } from './frEntryCost'
 import type {
   AccountFeeRates,
   AccountRisk,
@@ -154,6 +155,14 @@ export function getOpsOverview(signal?: AbortSignal): Promise<OpsOverview> {
 
 export function getStrategies(): Promise<Strategy[]> {
   return getJson<Strategy[]>('/strategies')
+}
+
+export function getFrCostStrategies(signal?: AbortSignal): Promise<Strategy[]> {
+  return getJson<Strategy[]>('/strategies?include_credentials=false', signal)
+}
+
+export function getFrEntryCost(slug: string, query: URLSearchParams, signal?: AbortSignal): Promise<FrEntryCost> {
+  return getJson<FrEntryCost>(`/analysis/${encodeURIComponent(slug)}/fr-entry-cost?${query}`, signal)
 }
 
 export function getAccountRisks(signal?: AbortSignal): Promise<AccountRisk[]> {

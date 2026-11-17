@@ -1,0 +1,38 @@
+.fr-cost-shell { max-width: 1480px; margin: 0 auto; padding: 24px; color: #243b43; }
+.fr-cost-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
+.fr-cost-controls label { display: grid; gap: 7px; font-size: 12px; color: #60727a; }
+.fr-cost-controls select, .fr-cost-controls input { min-height: 38px; padding: 7px 10px; border: 1px solid #cedada; border-radius: 7px; background: white; color: #243b43; }
+.fr-cost-notice { background: #fff6e8; border: 1px solid #ecd2a8; padding: 14px; border-radius: 9px; }
+.fr-cost-hero { display: flex; justify-content: space-between; gap: 24px; padding: 28px 32px; border: 1px solid #c7dcd8; border-radius: 14px; background: linear-gradient(120deg, #edf7f3, #f8faf8); }
+.fr-cost-hero h2 { font-size: 42px; letter-spacing: -1.5px; margin: 12px 0; color: #14645c; }
+.fr-cost-hero h2 small { font-size: 16px; letter-spacing: 0; }
+.fr-cost-hero p, .fr-cost-panel p { color: #65777e; font-size: 13px; line-height: 1.7; }
+.fr-cost-hero-meta { display: grid; align-content: center; gap: 14px; font-size: 12px; }
+.fr-cost-hero-meta b { display: block; margin-top: 4px; font-size: 14px; }
+.fr-cost-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 18px 0; }
+.fr-cost-metrics article, .fr-cost-panel { padding: 20px; border: 1px solid #dde5e7; border-radius: 11px; background: #fff; }
+.fr-cost-metrics span, .fr-cost-metrics strong, .fr-cost-metrics small { display: block; }
+.fr-cost-metrics span { font-size: 12px; color: #65777e; }
+.fr-cost-metrics strong { font-size: 22px; margin: 12px 0; }
+.fr-cost-metrics small { font-size: 11px; color: #7b898e; }
+.fr-cost-panel { margin: 18px 0; }
+.fr-cost-panel h2 { font-size: 16px; margin: 0 0 14px; }
+.fr-cost-alignment { display: flex; flex-wrap: wrap; gap: 22px; font-size: 12px; color: #65777e; }
+.fr-cost-alignment b { display: block; color: #243b43; margin-top: 8px; font-size: 18px; }
+.fr-cost-chart { height: 360px; width: 100%; }
+.fr-cost-alignment-chart { height: 220px; width: 100%; margin-top: 22px; }
+.fr-cost-table-head, .fr-cost-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.fr-cost-table-head label { font-size: 12px; }
+.fr-cost-table-wrap { overflow: auto; }
+.fr-cost-table-wrap table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: 12px; }
+.fr-cost-table-wrap th, .fr-cost-table-wrap td { text-align: right; padding: 12px 10px; border-bottom: 1px solid #edf0f0; font-variant-numeric: tabular-nums; }
+.fr-cost-table-wrap th { color: #76878c; font-weight: 500; background: #f8faf9; }
+.fr-cost-table-wrap th:first-child, .fr-cost-table-wrap td:first-child { text-align: left; }
+.fr-cost-table-wrap small { display: block; color: #87959a; margin-top: 5px; font-size: 10px; }
+.fr-cost-pager { justify-content: end; margin-top: 14px; font-size: 12px; }
+.fr-cost-pager button { padding: 6px 12px; border: 1px solid #d8e1e0; border-radius: 6px; background: white; cursor: pointer; }
+.fr-cost-pager button:disabled { opacity: .4; cursor: default; }
+.fr-cost-panel summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.fr-cost-panel li { font-size: 12px; line-height: 1.8; color: #687a80; margin: 8px 0; }
+@media (max-width: 850px) { .fr-cost-metrics { grid-template-columns: repeat(2, 1fr); } .fr-cost-hero { flex-direction: column; } .fr-cost-hero-meta { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 500px) { .fr-cost-shell { padding: 12px; } .fr-cost-hero { padding: 20px; } .fr-cost-hero h2 { font-size: 32px; } .fr-cost-controls label { width: 100%; } }

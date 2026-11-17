@@ -47,6 +47,8 @@ const FrPositionLimitsPage = lazy(() =>
   })),
 )
 
+const FrEntryCostPage = lazy(() => import('./pages/FrEntryCostPage').then(module => ({ default: module.FrEntryCostPage })))
+
 const AdminUsersPage = lazy(() =>
   import('./pages/AdminUsersPage').then((module) => ({
     default: module.AdminUsersPage,
@@ -132,6 +134,7 @@ export default function App() {
         />
         <Route path="/intra-matching" element={<IntraMatchingPage />} />
         <Route path="/fr-position-limits" element={<FrPositionLimitsPage />} />
+        <Route path="/fr-entry-cost/:slug?" element={<FrEntryCostPage />} />
         <Route path="/analysis/:slug" element={<IntraAnalysisPage />} />
         <Route
           path="/strategies/:slug"
