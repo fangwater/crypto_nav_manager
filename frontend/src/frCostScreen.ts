@@ -73,7 +73,9 @@ export type CoveredCostMetric = 'feeBps' | 'deviation' | 'costBps'
 
 export function costMetricCoverage(row: FrCostRow, key: CoveredCostMetric): number | null {
   if (costMetric(row, key) === null) return null
-  const full = key === 'feeBps' ? row.summary.feeUsdt : key === 'deviation' ? row.executionDeviationBps : row.summary.estimatedCostBps
+  const full = key === 'feeBps'
+    ? row.summary.notionalUsdt !== null && row.summary.notionalUsdt > 0 ? row.summary.feeUsdt : null
+    : key === 'deviation' ? row.executionDeviationBps : row.summary.estimatedCostBps
   if (full !== null) return 100
   return row.covered?.[key === 'feeBps' ? 'fee' : key === 'costBps' ? 'cost' : 'deviation'].quantityCoveragePct ?? null
 }

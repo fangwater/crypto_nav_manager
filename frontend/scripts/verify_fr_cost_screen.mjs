@@ -63,6 +63,10 @@ assert.equal(match(coveredRow, { ...EMPTY_THRESHOLDS, deviation: '15' }, 'any'),
 assert.equal(costMetricCoverage(adverse, 'deviation'), 100)
 assert.equal(costMetricCoverage(coveredRow, 'costBps'), 10)
 assert.equal(costMetricCoverage(unknown, 'costBps'), null)
+const missingNotional = { ...coveredRow, summary: { ...coveredRow.summary, feeUsdt: 2, notionalUsdt: null } }
+assert.equal(costMetric(missingNotional, 'feeBps'), 10)
+assert.equal(costMetricCoverage(missingNotional, 'feeBps'), 10, 'known whole-position fee with unpriced inventory still uses subset bps and coverage')
+assert.deepEqual(rankCostConcerns([missingNotional]), [], 'partial fee bps must not masquerade as full coverage')
 assert.deepEqual(rankCostConcerns([favorable, unknown, noPair, coveredRow]), [], 'favorable, unknown, unpaired and tiny samples must not become worst positions')
 const adequate = { ...coveredRow, symbol: 'ADEQUATE', covered: Object.fromEntries(Object.entries(coveredRow.covered).map(([k, v]) => [k, { ...v, quantityCoveragePct: 50 }])) }
 assert.ok(rankCostConcerns([adequate])[0].reasons.includes('成本偏高'), '50% coverage is an inclusive, explicit review gate')
