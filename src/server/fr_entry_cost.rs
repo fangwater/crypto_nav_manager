@@ -41,9 +41,57 @@ struct CostResponse {
     last_trade_ms: Option<i64>,
     reference_source: String,
     reference_bps: Option<f64>,
+    factual_snapshot_ms: Option<i64>,
+    factual_position: Option<FactualPosition>,
     warnings: Vec<String>,
     alignment: Vec<AlignmentMinute>,
     report: cost::Report,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FactualPosition {
+    spot_quantity: f64,
+    futures_quantity: f64,
+}
+
+fn snapshot_positions(payload: &Value) -> Vec<(String, FactualPosition, f64)> {
+    let mut positions = Vec::new();
+    if let Some(entries) = payload.get("entries").and_then(Value::as_array) {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry["type"] == "pre_trade_exposure")
+        {
+            if let Some(rows) = entry["entry"]["rows"].as_array() {
+                for row in rows {
+                    if row["is_total"].as_bool() == Some(true) {
+                        continue;
+                    }
+                    let Some(asset) = row["asset"].as_str() else {
+                        continue;
+                    };
+                    let (Some(spot), Some(futures)) =
+                        (row["open_qty"].as_f64(), row["hedge_qty"].as_f64())
+                    else {
+                        continue;
+                    };
+                    if !spot.is_finite() || !futures.is_finite() {
+                        continue;
+                    }
+                    positions.push((
+                        format!("{}USDT", asset.to_ascii_uppercase()),
+                        FactualPosition {
+                            spot_quantity: spot,
+                            futures_quantity: futures,
+                        },
+                        row["open_usdt"].as_f64().unwrap_or(0.0).abs(),
+                    ));
+                }
+            }
+        }
+    }
+    positions.sort_by(|a, b| b.2.total_cmp(&a.2));
+    positions
 }
 
 #[derive(Serialize)]
@@ -116,11 +164,30 @@ pub(super) async fn report(
             }
         }
     }
+    let factual_snapshot = sqlx::query_as::<_, (i64, Value)>(
+        "SELECT snapshot_ts_ms,payload FROM strategy_snapshots WHERE strategy_slug=$1 AND snapshot_ts_ms <= $2 ORDER BY snapshot_ts_ms DESC LIMIT 1"
+    ).bind(&slug).bind(end_ms).fetch_optional(&state.pool).await?;
+    let factual_positions = factual_snapshot
+        .as_ref()
+        .map(|(_, payload)| snapshot_positions(payload))
+        .unwrap_or_default();
     let symbol = query
         .symbol
         .map(|s| s.trim().to_ascii_uppercase())
+        .or_else(|| {
+            factual_positions
+                .iter()
+                .find(|(symbol, p, _)| {
+                    p.spot_quantity * p.futures_quantity < 0.0 && available_symbols.contains(symbol)
+                })
+                .map(|(s, _, _)| s.clone())
+        })
         .or_else(|| available_symbols.first().cloned())
         .unwrap_or_default();
+    let factual_position = factual_positions
+        .iter()
+        .find(|(s, _, _)| *s == symbol)
+        .map(|(_, p, _)| p.clone());
     if !symbol.is_empty() && !available_symbols.contains(&symbol) {
         return Ok(not_found("symbol not found in FR history"));
     }
@@ -265,6 +332,8 @@ pub(super) async fn report(
         last_trade_ms,
         reference_source,
         reference_bps: query.reference_bps,
+        factual_snapshot_ms: factual_snapshot.as_ref().map(|(ts, _)| *ts),
+        factual_position,
         warnings,
         alignment,
         report,

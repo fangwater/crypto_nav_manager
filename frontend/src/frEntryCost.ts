@@ -57,6 +57,8 @@ export interface FrEntryCost {
   lastTradeMs: number | null
   referenceSource: string
   referenceBps: number | null
+  factualSnapshotMs: number | null
+  factualPosition: { spotQuantity: number; futuresQuantity: number } | null
   warnings: string[]
   alignment: { ts: number; spotQuantity: number; futuresQuantity: number; netQuantity: number }[]
   report: {

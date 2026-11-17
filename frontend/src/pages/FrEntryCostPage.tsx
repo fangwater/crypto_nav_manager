@@ -67,7 +67,7 @@ export function FrEntryCostPage() {
   return <>
     <header className="detail-header"><div className="detail-header__inner">
       <div className="detail-title"><Link className="icon-button" to="/" aria-label="返回总览"><ArrowLeft size={18} /></Link>
-        <div><p>FR · 当前持仓 · FIFO</p><h1>建仓成本</h1></div></div>
+        <div><p>FR · 成交重建仓位 · FIFO</p><h1>建仓成本</h1></div></div>
       {slug && <Link className="config-button" to={`/strategies/${slug}`}>账户净值</Link>}
     </div></header>
     <main className="fr-cost-shell">
@@ -90,11 +90,14 @@ export function FrEntryCostPage() {
             <h2>{summary.pairCount ? fmt(summary.estimatedCostUsdt) : '无配对仓位'} <small>USDT</small></h2>
             <strong>{fmt(summary.estimatedCostBps)} bps</strong>
             <p>参考基差 − 实际成交基差 ＋ 两腿手续费；正值为损耗，负值为相对参考的优势。</p>
+            <p>成本只覆盖历史重建中已配对的剩余仓位；数量不齐时，不能代表整组真实持仓的总成本。</p>
           </div>
           <div className="fr-cost-hero-meta"><span>配对现货名义本金 <b>{fmt(summary.notionalUsdt, 2)} USDT</b></span>
             <span>完整成本覆盖 <b>{fmt(coverage(summary.costCoveredQuantity, summary.quantity), 2)}%</b></span>
+            <span>两腿库存配对覆盖 <b>{fmt(coverage(2 * summary.quantity, Math.abs(data.report.spotQuantity) + Math.abs(data.report.futuresQuantity)), 2)}%</b></span>
             <span>持仓截至 <b>{time(data.endMs)}</b></span><span>最新入库成交 <b>{time(data.lastTradeMs)}</b></span></div>
         </section>
+        {Math.abs(data.report.netQuantity) > 1e-8 && <p className="fr-cost-notice">成交历史重建数量未完全对齐。这可能来自两腿成交时间差、期初库存、划转或历史缺口，不足以证明实盘仓位不中性。下方净数量仅用于核对，平均参考值不会消除数量缺口。</p>}
         <div className="fr-cost-metrics">
           <article><span>实际成交基差</span><strong>{fmt(costBps(summary.entrySpreadUsdt, summary.notionalUsdt))} bps</strong><small>已按套利方向调整，正值有利</small></article>
           <article><span>参考基差</span><strong>{fmt(costBps(summary.referenceSpreadUsdt, summary.notionalUsdt))} bps</strong><small>{data.referenceBps === null ? '跨分钟 premium 均值' : `手动恒定假设 ${data.referenceBps} bps`}</small></article>
@@ -102,6 +105,9 @@ export function FrEntryCostPage() {
           <article><span>剩余仓位分摊手续费</span><strong>{fmt(summary.feeUsdt)} USDT</strong><small>实际成交费；负数为返佣</small></article>
         </div>
         <section className="fr-cost-panel"><h2>数量与时间对齐</h2>
+          <p>事实快照：{time(data.factualSnapshotMs)}。{data.factualPosition
+            ? `现货 ${fmt(data.factualPosition.spotQuantity, 8)}，合约 ${fmt(data.factualPosition.futuresQuantity, 8)}。请与下方成交重建数量核对；快照时点可能早于查询截止时间。`
+            : '该快照未列示此币种的完整两腿数量，不能据此当作零仓位。'}</p>
           <div className="fr-cost-alignment"><span>现货净数量 <b>{fmt(data.report.spotQuantity, 8)}</b></span><span>合约净数量 <b>{fmt(data.report.futuresQuantity, 8)}</b></span>
             <span>未对齐净数量 <b>{fmt(data.report.netQuantity, 8)}</b></span><span>已配对数量 <b>{fmt(summary.quantity, 8)}</b></span>
             <span>跨分钟配对占比 <b>{fmt(coverage(summary.crossMinuteQuantity, summary.quantity), 2)}%</b></span><span>最大两腿间隔 <b>{fmt(summary.maxLagMs / 60_000, 2)} 分钟</b></span></div>

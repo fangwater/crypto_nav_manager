@@ -1,6 +1,6 @@
 # FR 建仓成本分析
 
-实现：NAV `/nav/fr-entry-cost/:slug` 页面与受账户权限保护的 `/api/analysis/{slug}/fr-entry-cost`。读取实际成交，以 FIFO 识别当前剩余仓位成本，并按 1 分钟归因；两腿跨分钟时平均参考值。
+实现：NAV `/nav/#/fr-entry-cost/:slug` 页面与受账户权限保护的 `/api/analysis/{slug}/fr-entry-cost`。沿用现有 HashRouter，网关入口为 `/nav/`，不新增 Nginx 路由。读取实际成交，以 FIFO 识别当前剩余仓位成本，并按 1 分钟归因；两腿跨分钟时平均参考值。
 
 ## 主指标
 
