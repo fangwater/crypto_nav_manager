@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { getFrCostStrategies, getFrEntryCost } from '../api'
 import { FrAlignmentChart, FrCostChart } from '../components/FrCostChart'
 import { FrEntryAttribution } from '../components/FrEntryAttribution'
+import { FrCostOverviewTable } from '../components/FrCostOverviewTable'
 import { costBps, coverage } from '../frEntryCost'
 import type { FrEntryCost } from '../frEntryCost'
 import type { Strategy } from '../types'
@@ -20,8 +21,9 @@ export function FrEntryCostPage() {
   const [symbol, setSymbol] = useState('')
   const [asOf, setAsOf] = useState('')
   const [reference, setReference] = useState('')
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useState(() => new URLSearchParams({ endMs: String(Date.now()) }).toString())
   const [refresh, setRefresh] = useState(0)
+  const [detailRefresh, setDetailRefresh] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [page, setPage] = useState(0)
@@ -51,15 +53,23 @@ export function FrEntryCostPage() {
     }).catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)) })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [slug, query, refresh])
+  }, [slug, query, refresh, detailRefresh])
 
   function run() {
     const params = new URLSearchParams()
     if (symbol) params.set('symbol', symbol)
-    if (asOf) params.set('endMs', String(new Date(asOf).getTime()))
+    params.set('endMs', String(asOf ? new Date(asOf).getTime() : Date.now()))
     if (reference.trim()) params.set('referenceBps', reference)
     setQuery(params.toString())
     setRefresh(v => v + 1)
+  }
+  const endMs = Number(new URLSearchParams(query).get('endMs'))
+  function selectCoin(value: string) {
+    const params = new URLSearchParams(query)
+    params.set('symbol', value)
+    params.delete('referenceBps')
+    setSymbol(value); setReference(''); setQuery(params.toString()); setDetailRefresh(v => v + 1)
+    document.getElementById('fr-cost-detail')?.scrollIntoView({ behavior: 'smooth' })
   }
   const summary = data?.report.summary
   const pairs = data?.report.pairs.filter(p => !crossOnly || p.crossMinute) ?? []
@@ -74,7 +84,7 @@ export function FrEntryCostPage() {
     <main className="fr-cost-shell">
       <form className="fr-cost-controls" onSubmit={e => { e.preventDefault(); run() }}>
         <label>FR 账户<select value={slug ?? ''} onChange={e => {
-          setSymbol(''); setQuery(''); setReference(''); setAsOf(''); navigate(`/fr-entry-cost/${e.target.value}`)
+          setSymbol(''); setQuery(new URLSearchParams({ endMs: String(Date.now()) }).toString()); setReference(''); setAsOf(''); navigate(`/fr-entry-cost/${e.target.value}`)
         }}><option value="" disabled>选择账户</option>{strategies.map(s => <option key={s.slug} value={s.slug}>{s.displayName}</option>)}</select></label>
         <label>币种<select value={symbol} onChange={e => setSymbol(e.target.value)} disabled={!data}>
           {(data?.availableSymbols ?? []).map(s => <option key={s} value={s}>{s}</option>)}</select></label>
@@ -84,6 +94,8 @@ export function FrEntryCostPage() {
       </form>
       {error && <p className="fr-cost-notice" role="alert">{error}</p>}
       {!slug && !error && strategies.length === 0 && <p>没有可访问的 FR 账户。</p>}
+      {slug && <FrCostOverviewTable key={slug} slug={slug} endMs={endMs} refresh={refresh} detail={data} onSelect={selectCoin} />}
+      <div id="fr-cost-detail" />
       {loading && <p className="fr-cost-notice" role="status">重放实际成交并补齐分钟参考，首次加载可能需要约 40 秒。</p>}
       {data && summary && <>
         <section className="fr-cost-hero">

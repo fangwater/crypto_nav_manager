@@ -118,6 +118,40 @@ export interface FrEntryAnalysis {
   basis: BasisEvolution
 }
 
+export interface FrCostRow {
+  symbol: string
+  direction: 'positive' | 'reverse' | null
+  spotQuantity: number
+  futuresQuantity: number
+  summary: FrCostTotals
+  pairedLiquidity: LiquidityMix
+  fillSpreadBps: number | null
+  executionDeviationBps: number | null
+  lastPairMs: number | null
+}
+
+export interface FrCostOverview {
+  strategySlug: string
+  exchange: string
+  endMs: number
+  historyStartMs: number
+  rows: FrCostRow[]
+}
+
+export function entryCostRow(data: FrEntryCost): FrCostRow {
+  return {
+    symbol: data.symbol,
+    direction: data.report.pairs[0]?.direction ?? null,
+    spotQuantity: data.report.spotQuantity,
+    futuresQuantity: data.report.futuresQuantity,
+    summary: data.report.summary,
+    pairedLiquidity: data.analysis.pairedLiquidity,
+    fillSpreadBps: data.analysis.fillSpreadBps,
+    executionDeviationBps: data.analysis.executionDeviationBps,
+    lastPairMs: data.analysis.basis.lastPair?.eventMs ?? null,
+  }
+}
+
 export function costBps(amount: number | null, notional: number | null): number | null {
   return amount !== null && notional !== null && notional > 0
     ? amount / notional * 10_000 : null

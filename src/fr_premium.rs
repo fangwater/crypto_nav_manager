@@ -16,6 +16,56 @@ type Series = BTreeMap<i64, f64>;
 type Cache = BTreeMap<String, Arc<Mutex<Series>>>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
+/// Overview reads only existing observations. It never fans out public backfills
+/// across all account symbols, or waits behind an in-flight detail backfill.
+pub async fn cached(
+    pool: &PgPool,
+    exchange: &str,
+    symbol: &str,
+    start: i64,
+    end: i64,
+) -> Result<Series> {
+    let start = minute(start);
+    let end = minute(end).min(minute(chrono::Utc::now().timestamp_millis()) - MINUTE_MS);
+    let mut values = Series::new();
+    if end < start {
+        return Ok(values);
+    }
+    if let Some(cache) = CACHE.get() {
+        let shared = cache
+            .lock()
+            .await
+            .get(&format!("{exchange}/{symbol}"))
+            .cloned();
+        if let Some(shared) = shared {
+            if let Ok(known) = shared.try_lock() {
+                values.extend(known.range(start..=end).map(|(&t, &v)| (t, v)));
+            }
+        }
+    }
+    if let Some(table) = premium_table(exchange) {
+        let sql = format!(
+            "SELECT open_time_ms,close_rate FROM {table} WHERE symbol=$1 AND interval='1m' AND open_time_ms >= $2 AND open_time_ms <= $3 ORDER BY open_time_ms"
+        );
+        let rows = sqlx::query_as::<_, (i64, f64)>(sqlx::AssertSqlSafe(sql))
+            .bind(symbol)
+            .bind(start)
+            .bind(end)
+            .fetch_all(pool)
+            .await?;
+        values.extend(rows.into_iter().filter(|(_, p)| p.is_finite()));
+    }
+    Ok(values)
+}
+
+fn premium_table(exchange: &str) -> Option<&'static str> {
+    match exchange {
+        "binance" => Some("binance_premium_index_klines"),
+        "bybit" => Some("bybit_premium_index_klines"),
+        _ => None,
+    }
+}
+
 pub async fn load(
     pool: &PgPool,
     exchange: &str,
@@ -53,12 +103,7 @@ pub async fn load(
     };
     let mut values = shared.lock().await;
     let mut issues = Vec::new();
-    let table = match exchange {
-        "binance" => Some("binance_premium_index_klines"),
-        "bybit" => Some("bybit_premium_index_klines"),
-        _ => None,
-    };
-    if let Some(table) = table {
+    if let Some(table) = premium_table(exchange) {
         let sql = format!(
             "SELECT open_time_ms,close_rate FROM {table} WHERE symbol=$1 AND interval='1m' AND open_time_ms >= $2 AND open_time_ms <= $3 ORDER BY open_time_ms"
         );

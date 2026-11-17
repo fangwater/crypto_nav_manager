@@ -673,6 +673,10 @@ pub async fn run() -> Result<()> {
             get(fr_entry_cost::report),
         )
         .route(
+            "/api/analysis/{slug}/fr-entry-cost-overview",
+            get(fr_entry_cost::overview),
+        )
+        .route(
             "/api/analysis/{slug}/hourly-latency",
             get(get_intra_hourly_latency),
         )

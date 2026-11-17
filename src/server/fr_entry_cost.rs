@@ -11,10 +11,13 @@ pub(super) struct CostQuery {
     symbol: Option<String>,
     end_ms: Option<i64>,
     reference_bps: Option<f64>,
+    #[serde(default)]
+    summary_only: bool,
 }
 
 #[derive(FromRow)]
 struct Trade {
+    symbol: String,
     id: String,
     order_id: String,
     market: String,
@@ -26,6 +29,56 @@ struct Trade {
     fee_asset: String,
     liquidity: String,
     ts: i64,
+}
+
+impl Trade {
+    fn into_fill(self, exchange: &str) -> Result<Fill> {
+        let leg = match self.market.as_str() {
+            "spot" | "margin" => Leg::Spot,
+            "swap" | "linear" | "usdm_futures" | "usdt_futures" => Leg::Futures,
+            _ => anyhow::bail!("unsupported FR trade market {}", self.market),
+        };
+        let side = match self.side.as_str() {
+            "buy" => 1,
+            "sell" => -1,
+            _ => anyhow::bail!("unsupported trade side"),
+        };
+        let base = self.symbol.strip_suffix("USDT").unwrap_or("");
+        let fee_asset = self.fee_asset.to_ascii_uppercase();
+        let fee_usdt = self.fee_usdt.or_else(|| {
+            if self.fee == 0.0 || matches!(fee_asset.as_str(), "USDT" | "USDC" | "USD") {
+                Some(self.fee)
+            } else if !base.is_empty() && fee_asset == base {
+                Some(self.fee * self.price)
+            } else {
+                None
+            }
+        });
+        let quantity = pnl::spot_swap_position_quantity(
+            exchange,
+            if leg == Leg::Spot {
+                pnl::PositionLeg::Spot
+            } else {
+                pnl::PositionLeg::Futures
+            },
+            if side == 1 { Side::Buy } else { Side::Sell },
+            self.quantity.abs(),
+            self.fee,
+            &fee_asset,
+            base,
+        );
+        Ok(Fill {
+            id: self.id,
+            order_id: self.order_id,
+            ts: self.ts,
+            leg,
+            side,
+            price: self.price,
+            quantity,
+            fee_usdt,
+            liquidity: self.liquidity,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -102,6 +155,163 @@ struct AlignmentMinute {
     spot_quantity: f64,
     futures_quantity: f64,
     net_quantity: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CostRow {
+    symbol: String,
+    direction: Option<&'static str>,
+    spot_quantity: f64,
+    futures_quantity: f64,
+    summary: cost::Totals,
+    paired_liquidity: crate::fr_entry_analysis::LiquidityMix,
+    fill_spread_bps: Option<f64>,
+    execution_deviation_bps: Option<f64>,
+    last_pair_ms: Option<i64>,
+}
+
+impl CostRow {
+    fn new(
+        symbol: String,
+        report: &cost::Report,
+        analysis: crate::fr_entry_analysis::EntryAnalysis,
+    ) -> Self {
+        Self {
+            symbol,
+            direction: report.pairs.first().map(|p| p.direction),
+            spot_quantity: report.spot_quantity,
+            futures_quantity: report.futures_quantity,
+            summary: report.summary.clone(),
+            paired_liquidity: analysis.paired_liquidity,
+            fill_spread_bps: analysis.fill_spread_bps,
+            execution_deviation_bps: analysis.execution_deviation_bps,
+            last_pair_ms: analysis.basis.last_pair.map(|p| p.event_ms),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OverviewQuery {
+    end_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CostOverview {
+    strategy_slug: String,
+    exchange: String,
+    end_ms: i64,
+    history_start_ms: i64,
+    rows: Vec<CostRow>,
+}
+
+// Full-account replays are serialized to bound transient memory and DB load.
+static OVERVIEW_REPLAY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+pub(super) async fn overview(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(slug): AxumPath<String>,
+    Query(query): Query<OverviewQuery>,
+) -> Result<Response, ApiError> {
+    let visible = visible_slugs(&state.pool, &user).await?;
+    if !slug_visible(&visible, &slug) {
+        return Ok(not_found("strategy not found"));
+    }
+    let strategy = sqlx::query_as::<_, IntraAnalysisStrategyRecord>(
+        "SELECT slug,alias,db_schema,st_ms,exchange,strategy_kind FROM strategy_envs WHERE enabled AND slug=$1 AND strategy_kind='funding_rate'",
+    ).bind(&slug).fetch_optional(&state.pool).await?;
+    let Some(strategy) = strategy else {
+        return Ok(not_found("FR strategy not found"));
+    };
+    if !valid_schema(&strategy.db_schema) {
+        return Err(anyhow::anyhow!("invalid strategy schema").into());
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let end_ms = query.end_ms.unwrap_or(now);
+    if end_ms < strategy.st_ms || end_ms > now + 60_000 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid endMs",
+            }),
+        )
+            .into_response());
+    }
+    let _permit = OVERVIEW_REPLAY
+        .acquire()
+        .await
+        .context("FR overview replay permit")?;
+    let initial = load_initial_snapshot(&state.pool, &slug)
+        .await?
+        .filter(|s| s.snapshot_ts_ms <= end_ms);
+    let history_start_ms = initial
+        .as_ref()
+        .map_or(strategy.st_ms, |s| s.snapshot_ts_ms.saturating_add(1));
+    let mut inventories = BTreeMap::<String, Inventory>::new();
+    if let Some(initial) = &initial {
+        for position in parse_initial_positions(&initial.payload)?.positions {
+            let inventory = inventories.entry(position.symbol).or_default();
+            inventory.seed(Seed {
+                ts: initial.snapshot_ts_ms,
+                leg: Leg::Spot,
+                signed_quantity: position.spot_quantity,
+            })?;
+            inventory.seed(Seed {
+                ts: initial.snapshot_ts_ms,
+                leg: Leg::Futures,
+                signed_quantity: position.futures_quantity,
+            })?;
+        }
+    }
+    let sql = format!(
+        "SELECT upper(symbol) AS symbol,trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE event_time_ms >= $1 AND event_time_ms <= $2 ORDER BY event_time_ms,market,trade_id",
+        strategy.db_schema
+    );
+    let trades = sqlx::query_as::<_, Trade>(sqlx::AssertSqlSafe(sql))
+        .bind(history_start_ms)
+        .bind(end_ms)
+        .fetch_all(&state.pool)
+        .await?;
+    let exchange = strategy.exchange.clone();
+    let inventories = tokio::task::spawn_blocking(move || {
+        for trade in trades {
+            let inventory = inventories.entry(trade.symbol.clone()).or_default();
+            inventory.apply(trade.into_fill(&exchange)?)?;
+        }
+        anyhow::Ok(inventories)
+    })
+    .await
+    .context("join FR overview replay")??;
+    let mut rows = Vec::with_capacity(inventories.len());
+    for (symbol, inventory) in inventories {
+        let premiums = if let Some((start, last_pair)) = inventory.paired_time_range() {
+            crate::fr_premium::cached(&state.pool, &strategy.exchange, &symbol, start, last_pair)
+                .await?
+        } else {
+            BTreeMap::new()
+        };
+        let row = tokio::task::spawn_blocking(move || {
+            let report = inventory.report(&premiums);
+            // Overview needs retained-inventory metrics, not the whole trading window.
+            let analysis =
+                crate::fr_entry_analysis::calculate(&report, &[], &premiums, end_ms, false);
+            CostRow::new(symbol, &report, analysis)
+        })
+        .await
+        .context("join FR overview summary")?;
+        rows.push(row);
+    }
+    Ok(Json(CostOverview {
+        strategy_slug: slug,
+        exchange: strategy.exchange,
+        end_ms,
+        history_start_ms,
+        rows,
+    })
+    .into_response())
 }
 
 pub(super) async fn report(
@@ -193,7 +403,7 @@ pub(super) async fn report(
         return Ok(not_found("symbol not found in FR history"));
     }
     let sql = format!(
-        "SELECT trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE upper(symbol)=$1 AND event_time_ms >= $2 AND event_time_ms <= $3 ORDER BY event_time_ms,market,trade_id",
+        "SELECT upper(symbol) AS symbol,trade_id AS id,order_id,market,side,price::float8 AS price,quantity::float8 AS quantity,fee_amount::float8 AS fee,fee_usdt::float8 AS fee_usdt,COALESCE(fee_asset,'') AS fee_asset,liquidity_role AS liquidity,event_time_ms AS ts FROM {}.trades WHERE upper(symbol)=$1 AND event_time_ms >= $2 AND event_time_ms <= $3 ORDER BY event_time_ms,market,trade_id",
         strategy.db_schema
     );
     let rows = sqlx::query_as::<_, Trade>(sqlx::AssertSqlSafe(sql))
@@ -224,65 +434,21 @@ pub(super) async fn report(
                 .into(),
         );
     }
-    let base = symbol.strip_suffix("USDT").unwrap_or("");
     let (mut spot_balance, mut futures_balance) = inventory.quantities();
     let alignment_start = cost::minute((end_ms - 86_400_000).max(history_start_ms));
     let mut balance_events = BTreeMap::new();
     balance_events.insert(alignment_start, (spot_balance, futures_balance));
     let mut fills = Vec::with_capacity(rows.len());
     for row in rows {
-        let leg = match row.market.as_str() {
-            "spot" | "margin" => Leg::Spot,
-            "swap" | "linear" | "usdm_futures" | "usdt_futures" => Leg::Futures,
-            _ => return Err(anyhow::anyhow!("unsupported FR trade market {}", row.market).into()),
-        };
-        let side = match row.side.as_str() {
-            "buy" => 1,
-            "sell" => -1,
-            _ => return Err(anyhow::anyhow!("unsupported trade side").into()),
-        };
-        let fee_asset = row.fee_asset.to_ascii_uppercase();
-        let fee_usdt = row.fee_usdt.or_else(|| {
-            if row.fee == 0.0 || matches!(fee_asset.as_str(), "USDT" | "USDC" | "USD") {
-                Some(row.fee)
-            } else if !base.is_empty() && fee_asset == base {
-                Some(row.fee * row.price)
-            } else {
-                None
-            }
-        });
-        let quantity = pnl::spot_swap_position_quantity(
-            &strategy.exchange,
-            if leg == Leg::Spot {
-                pnl::PositionLeg::Spot
-            } else {
-                pnl::PositionLeg::Futures
-            },
-            if side == 1 { Side::Buy } else { Side::Sell },
-            row.quantity.abs(),
-            row.fee,
-            &fee_asset,
-            base,
-        );
-        match leg {
-            Leg::Spot => spot_balance += f64::from(side) * quantity,
-            Leg::Futures => futures_balance += f64::from(side) * quantity,
+        let fill = row.into_fill(&strategy.exchange)?;
+        match fill.leg {
+            Leg::Spot => spot_balance += f64::from(fill.side) * fill.quantity,
+            Leg::Futures => futures_balance += f64::from(fill.side) * fill.quantity,
         }
         balance_events.insert(
-            cost::minute(row.ts).max(alignment_start),
+            cost::minute(fill.ts).max(alignment_start),
             (spot_balance, futures_balance),
         );
-        let fill = Fill {
-            id: row.id,
-            order_id: row.order_id,
-            ts: row.ts,
-            leg,
-            side,
-            price: row.price,
-            quantity,
-            fee_usdt,
-            liquidity: row.liquidity,
-        };
         inventory.apply(fill.clone())?;
         fills.push(fill);
     }
@@ -333,6 +499,9 @@ pub(super) async fn report(
     })
     .await
     .context("join FR cost calculation")?;
+    if query.summary_only {
+        return Ok(Json(CostRow::new(symbol, &report, analysis)).into_response());
+    }
     if report.summary.cost_covered_quantity < report.summary.quantity {
         warnings.push("部分库存缺少原始成交价、手续费折算或所需分钟参考；完整总成本显示为未知，不能将缺失部分按零计入。".into());
     }

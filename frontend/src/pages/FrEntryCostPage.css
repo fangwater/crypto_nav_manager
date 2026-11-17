@@ -45,5 +45,23 @@
 .fr-cost-pager button:disabled { opacity: .4; cursor: default; }
 .fr-cost-panel summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 .fr-cost-panel li { font-size: 12px; line-height: 1.8; color: #687a80; margin: 8px 0; }
+.fr-cost-overview { border-color: #c7dcd8; }
+.fr-cost-count { font-size: 12px; color: #65777e; }
+.fr-cost-screen-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+.fr-cost-screen-controls label { display: grid; gap: 7px; font-size: 12px; color: #60727a; }
+.fr-cost-screen-controls input, .fr-cost-screen-controls select, .fr-cost-screen-actions select { min-width: 0; min-height: 36px; padding: 7px 9px; border: 1px solid #cedada; border-radius: 6px; background: white; color: #243b43; }
+.fr-cost-screen-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0 18px; font-size: 12px; }
+.fr-cost-screen-actions label { display: flex; align-items: center; gap: 7px; }
+.fr-cost-screen-actions button { padding: 8px 12px; border: 1px solid #cedada; border-radius: 6px; background: white; color: #243b43; cursor: pointer; }
+.fr-cost-screen-actions button:disabled { opacity: .5; cursor: default; }
+.fr-cost-sort, .fr-cost-symbol { padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.fr-cost-sort { min-height: 28px; }
+.fr-cost-sort:hover, .fr-cost-symbol:hover { color: #14645c; text-decoration: underline; }
+.fr-cost-symbol { color: #14645c; font-weight: 600; }
+.fr-cost-selected { background: #f0f7f4; }
+.fr-cost-adverse { color: #ad4631; }
+#fr-cost-detail { scroll-margin-top: 20px; }
+@media (max-width: 850px) { .fr-cost-screen-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 500px) { .fr-cost-screen-controls { grid-template-columns: 1fr; } }
 @media (max-width: 850px) { .fr-cost-metrics { grid-template-columns: repeat(2, 1fr); } .fr-cost-hero { flex-direction: column; } .fr-cost-hero-meta { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 500px) { .fr-cost-shell { padding: 12px; } .fr-cost-hero { padding: 20px; } .fr-cost-hero h2 { font-size: 32px; } .fr-cost-controls label { width: 100%; } .fr-cost-milestones { grid-template-columns: 1fr; } .fr-cost-table-head { flex-wrap: wrap; } }
