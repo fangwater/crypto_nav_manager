@@ -46,6 +46,7 @@ struct CostResponse {
     warnings: Vec<String>,
     alignment: Vec<AlignmentMinute>,
     report: cost::Report,
+    analysis: crate::fr_entry_analysis::EntryAnalysis,
 }
 
 #[derive(Clone, Serialize)]
@@ -228,6 +229,7 @@ pub(super) async fn report(
     let alignment_start = cost::minute((end_ms - 86_400_000).max(history_start_ms));
     let mut balance_events = BTreeMap::new();
     balance_events.insert(alignment_start, (spot_balance, futures_balance));
+    let mut fills = Vec::with_capacity(rows.len());
     for row in rows {
         let leg = match row.market.as_str() {
             "spot" | "margin" => Leg::Spot,
@@ -270,7 +272,7 @@ pub(super) async fn report(
             cost::minute(row.ts).max(alignment_start),
             (spot_balance, futures_balance),
         );
-        inventory.apply(Fill {
+        let fill = Fill {
             id: row.id,
             order_id: row.order_id,
             ts: row.ts,
@@ -280,7 +282,9 @@ pub(super) async fn report(
             quantity,
             fee_usdt,
             liquidity: row.liquidity,
-        })?;
+        };
+        inventory.apply(fill.clone())?;
+        fills.push(fill);
     }
     let mut alignment = Vec::new();
     let mut latest = (0.0, 0.0);
@@ -295,8 +299,8 @@ pub(super) async fn report(
             net_quantity: latest.0 + latest.1,
         });
     }
-    let start = inventory.oldest_pair_time();
-    let (premiums, reference_source) = if let Some(start) = start {
+    let range = inventory.paired_time_range();
+    let (premiums, reference_source) = if let Some((start, last_pair)) = range {
         if let Some(bps) = query.reference_bps {
             // A manual scenario is explicitly labeled and never masquerades as market data.
             let values = (cost::minute(start)..=cost::minute(end_ms))
@@ -305,18 +309,30 @@ pub(super) async fn report(
                 .collect();
             (values, "manual_constant_scenario".into())
         } else {
-            let (values, source, issues) =
-                crate::fr_premium::load(&state.pool, &strategy.exchange, &symbol, start, end_ms)
-                    .await;
+            let (values, source, issues) = crate::fr_premium::load(
+                &state.pool,
+                &strategy.exchange,
+                &symbol,
+                start,
+                end_ms,
+                &[last_pair, cost::minute(end_ms) - cost::MINUTE_MS],
+            )
+            .await;
             warnings.extend(issues);
             (values, source)
         }
     } else {
         (BTreeMap::new(), "no_paired_position".into())
     };
-    let report = tokio::task::spawn_blocking(move || inventory.report(&premiums))
-        .await
-        .context("join FR cost calculation")?;
+    let scenario = query.reference_bps.is_some();
+    let (report, analysis) = tokio::task::spawn_blocking(move || {
+        let report = inventory.report(&premiums);
+        let analysis =
+            crate::fr_entry_analysis::calculate(&report, &fills, &premiums, end_ms, scenario);
+        (report, analysis)
+    })
+    .await
+    .context("join FR cost calculation")?;
     if report.summary.cost_covered_quantity < report.summary.quantity {
         warnings.push("部分库存缺少原始成交价、手续费折算或所需分钟参考；完整总成本显示为未知，不能将缺失部分按零计入。".into());
     }
@@ -337,6 +353,7 @@ pub(super) async fn report(
         warnings,
         alignment,
         report,
+        analysis,
     })
     .into_response())
 }

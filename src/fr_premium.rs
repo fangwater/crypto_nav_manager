@@ -22,6 +22,7 @@ pub async fn load(
     symbol: &str,
     start: i64,
     end: i64,
+    anchors: &[i64],
 ) -> (Series, String, Vec<String>) {
     let source = format!("{exchange}_premium_index_1m_close");
     if !matches!(exchange, "binance" | "bybit" | "gate") {
@@ -85,6 +86,25 @@ pub async fn load(
     let fetch = async {
         let mut cursor = start;
         let mut requests = 0;
+        // Fetch the comparison endpoints before a potentially long historical
+        // backfill. A partial backfill must not starve the latest closed minute.
+        let mut priority = vec![end];
+        for &t in anchors {
+            let t = minute(t);
+            if t >= start && t <= end && !priority.contains(&t) {
+                priority.push(t);
+            }
+        }
+        if !priority.contains(&start) {
+            priority.push(start);
+        }
+        for t in priority {
+            if !values.contains_key(&t) {
+                values.extend(fetch_page(&client, exchange, symbol, t, t).await?);
+                requests += 1;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
         while cursor <= end {
             if values.contains_key(&cursor) {
                 cursor += MINUTE_MS;

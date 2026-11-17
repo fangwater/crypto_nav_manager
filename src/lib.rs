@@ -7,6 +7,7 @@ pub mod exchange;
 pub mod fee_rate_store;
 pub mod fifo_pnl;
 mod fifo_valuation;
+pub mod fr_entry_analysis;
 pub mod fr_entry_cost;
 pub mod fr_position_limits;
 mod fr_premium;

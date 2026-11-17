@@ -147,10 +147,35 @@ impl Inventory {
         (signed(&self.spot), signed(&self.futures))
     }
 
-    pub fn oldest_pair_time(&self) -> Option<i64> {
+    pub fn paired_time_range(&self) -> Option<(i64, i64)> {
         let s = self.spot.front()?;
         let f = self.futures.front()?;
-        (s.side != f.side).then_some(s.ts.min(f.ts))
+        if s.side == f.side {
+            return None;
+        }
+        let start = s.ts.min(f.ts);
+        let (mut si, mut fi) = (0, 0);
+        let (mut sq, mut fq) = (s.quantity, f.quantity);
+        let mut end = start;
+        while si < self.spot.len() && fi < self.futures.len() {
+            end = end.max(self.spot[si].ts).max(self.futures[fi].ts);
+            let q = sq.min(fq);
+            sq -= q;
+            fq -= q;
+            if sq == 0.0 {
+                si += 1;
+                if let Some(s) = self.spot.get(si) {
+                    sq = s.quantity;
+                }
+            }
+            if fq == 0.0 {
+                fi += 1;
+                if let Some(f) = self.futures.get(fi) {
+                    fq = f.quantity;
+                }
+            }
+        }
+        Some((start, end))
     }
 
     pub fn report(self, premiums: &BTreeMap<i64, f64>) -> Report {
@@ -517,5 +542,20 @@ mod tests {
         assert_eq!(r.summary.estimated_cost_usdt, None);
         assert_eq!(r.summary.entry_spread_usdt, None);
         assert_eq!(r.summary.fee_usdt, None);
+    }
+
+    #[test]
+    fn paired_time_range_excludes_later_unmatched_fills() {
+        let mut book = Inventory::default();
+        book.apply(fill("s", 1, Leg::Spot, 1, 1.0, 100.0, 0.0))
+            .unwrap();
+        book.apply(fill("f", 60_001, Leg::Futures, -1, 1.0, 101.0, 0.0))
+            .unwrap();
+        book.apply(fill("unmatched", 180_001, Leg::Spot, 1, 1.0, 102.0, 0.0))
+            .unwrap();
+        assert_eq!(book.paired_time_range(), Some((1, 60_001)));
+        let report = book.report(&BTreeMap::new());
+        assert_eq!(report.pairs.last().unwrap().completed_at_ms, 60_001);
+        assert_eq!(report.unmatched[0].ts, 180_001);
     }
 }

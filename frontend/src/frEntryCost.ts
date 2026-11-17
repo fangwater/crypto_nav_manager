@@ -71,6 +71,51 @@ export interface FrEntryCost {
     pairs: FrCostPair[]
     unmatched: FrCostLot[]
   }
+  analysis: FrEntryAnalysis
+}
+
+export interface LiquidityBucket {
+  fillCount: number
+  quantity: number
+  notionalUsdt: number | null
+  feeUsdt: number | null
+  unconvertedFeeParts: number
+}
+
+export interface LegLiquidity {
+  maker: LiquidityBucket
+  taker: LiquidityBucket
+  unknown: LiquidityBucket
+  total: LiquidityBucket
+  makerNotionalPct: number | null
+  takerNotionalPct: number | null
+  unknownNotionalPct: number | null
+}
+
+export interface LiquidityMix { spot: LegLiquidity; futures: LegLiquidity }
+export interface BasisMilestone { eventMs: number; referenceMinuteMs: number; premiumBps: number | null }
+export interface BasisEvolution {
+  start: BasisMilestone | null
+  lastPair: BasisMilestone | null
+  asOf: BasisMilestone
+  isScenario: boolean
+  buildChangeBps: number | null
+  afterPairChangeBps: number | null
+  totalChangeBps: number | null
+  coveredMinutes: number
+  expectedMinutes: number
+  points: { ts: number; premiumBps: number | null }[]
+}
+export interface FrEntryAnalysis {
+  pairedLiquidity: LiquidityMix
+  windowLiquidity: LiquidityMix | null
+  spotVwap: number | null
+  futuresVwap: number | null
+  fillSpread: number | null
+  fillSpreadBps: number | null
+  executionDeviationBps: number | null
+  deviationAssessment: 'adverse' | 'favorable' | 'at_reference' | 'unknown'
+  basis: BasisEvolution
 }
 
 export function costBps(amount: number | null, notional: number | null): number | null {

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { getFrCostStrategies, getFrEntryCost } from '../api'
 import { FrAlignmentChart, FrCostChart } from '../components/FrCostChart'
+import { FrEntryAttribution } from '../components/FrEntryAttribution'
 import { costBps, coverage } from '../frEntryCost'
 import type { FrEntryCost } from '../frEntryCost'
 import type { Strategy } from '../types'
@@ -104,6 +105,7 @@ export function FrEntryCostPage() {
           <article><span>执行偏离估算</span><strong>{fmt(summary.executionDeviationUsdt)} USDT</strong><small>含等待与指数口径差异，非纯滑点</small></article>
           <article><span>剩余仓位分摊手续费</span><strong>{fmt(summary.feeUsdt)} USDT</strong><small>实际成交费；负数为返佣</small></article>
         </div>
+        <FrEntryAttribution key={`${data.strategySlug}-${data.symbol}`} analysis={data.analysis} />
         <section className="fr-cost-panel"><h2>数量与时间对齐</h2>
           <p>事实快照：{time(data.factualSnapshotMs)}。{data.factualPosition
             ? `现货 ${fmt(data.factualPosition.spotQuantity, 8)}，合约 ${fmt(data.factualPosition.futuresQuantity, 8)}。请与下方成交重建数量核对；快照时点可能早于查询截止时间。`

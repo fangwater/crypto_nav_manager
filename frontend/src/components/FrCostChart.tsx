@@ -3,7 +3,7 @@ import { DataZoomComponent, GridComponent, LegendComponent, TooltipComponent } f
 import * as echarts from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { useEffect, useRef } from 'react'
-import type { FrEntryCost } from '../frEntryCost'
+import type { BasisEvolution, FrEntryCost } from '../frEntryCost'
 import { costBps } from '../frEntryCost'
 
 echarts.use([BarChart, LineChart, DataZoomComponent, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
@@ -55,4 +55,32 @@ export function FrAlignmentChart({ points }: { points: FrEntryCost['alignment'] 
     return () => { observer.disconnect(); chart.dispose() }
   }, [points])
   return <div ref={ref} className="fr-cost-alignment-chart" role="img" aria-label="最近 24 小时按成交重建的分钟末净敞口" />
+}
+
+export function FrBasisChart({ basis, fillSpreadBps }: { basis: BasisEvolution; fillSpreadBps: number | null }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!ref.current) return
+    const chart = echarts.init(ref.current)
+    const label = basis.isScenario ? '手动参考情景 bps' : '市场 premium 代理 bps'
+    chart.setOption({
+      color: ['#157f78', '#e99b3e'],
+      tooltip: { trigger: 'axis' },
+      legend: { top: 0 },
+      grid: { left: 65, right: 30, top: 40, bottom: 70 },
+      xAxis: { type: 'time' },
+      yAxis: { type: 'value', name: 'bps', scale: true },
+      dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 6 }],
+      series: [
+        { type: 'line', name: label, showSymbol: basis.points.length < 3, connectNulls: false,
+          data: basis.points.map(p => [p.ts, p.premiumBps]) },
+        { type: 'line', name: '当前 FIFO 成交基差 bps', showSymbol: false,
+          data: basis.points.map(p => [p.ts, fillSpreadBps]), lineStyle: { type: 'dashed' } },
+      ],
+    })
+    const observer = new ResizeObserver(() => chart.resize())
+    observer.observe(ref.current)
+    return () => { observer.disconnect(); chart.dispose() }
+  }, [basis, fillSpreadBps])
+  return <div ref={ref} className="fr-cost-basis-chart" role="img" aria-label="从开始建仓至查询时刻的分钟基差变化" />
 }

@@ -21,6 +21,17 @@
 .fr-cost-alignment b { display: block; color: #243b43; margin-top: 8px; font-size: 18px; }
 .fr-cost-chart { height: 360px; width: 100%; }
 .fr-cost-alignment-chart { height: 220px; width: 100%; margin-top: 22px; }
+.fr-cost-basis-chart { height: 320px; width: 100%; }
+.fr-cost-total { background: #f0f6f4; font-weight: 600; }
+.fr-cost-table-head select { border: 1px solid #cedada; border-radius: 6px; padding: 7px; background: white; color: #243b43; max-width: 100%; }
+.fr-cost-milestones { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 16px 0; }
+.fr-cost-milestones article { padding: 16px; border: 1px solid #dfe9e6; border-radius: 8px; background: #f8fbfa; }
+.fr-cost-milestones span, .fr-cost-milestones strong, .fr-cost-milestones b, .fr-cost-milestones small { display: block; }
+.fr-cost-milestones span { font-size: 12px; color: #65777e; }
+.fr-cost-milestones strong { font-size: 15px; margin: 10px 0; }
+.fr-cost-milestones b { font-size: 23px; margin-top: 8px; color: #14645c; }
+.fr-cost-milestones small { font-size: 11px; margin-top: 9px; color: #65777e; }
+.fr-cost-changes article { background: white; }
 .fr-cost-table-head, .fr-cost-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .fr-cost-table-head label { font-size: 12px; }
 .fr-cost-table-wrap { overflow: auto; }
@@ -35,4 +46,4 @@
 .fr-cost-panel summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 .fr-cost-panel li { font-size: 12px; line-height: 1.8; color: #687a80; margin: 8px 0; }
 @media (max-width: 850px) { .fr-cost-metrics { grid-template-columns: repeat(2, 1fr); } .fr-cost-hero { flex-direction: column; } .fr-cost-hero-meta { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 500px) { .fr-cost-shell { padding: 12px; } .fr-cost-hero { padding: 20px; } .fr-cost-hero h2 { font-size: 32px; } .fr-cost-controls label { width: 100%; } }
+@media (max-width: 500px) { .fr-cost-shell { padding: 12px; } .fr-cost-hero { padding: 20px; } .fr-cost-hero h2 { font-size: 32px; } .fr-cost-controls label { width: 100%; } .fr-cost-milestones { grid-template-columns: 1fr; } .fr-cost-table-head { flex-wrap: wrap; } }
