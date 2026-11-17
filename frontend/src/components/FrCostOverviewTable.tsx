@@ -5,6 +5,7 @@ import type { FrCostOverview, FrCostRow, FrEntryCost } from '../frEntryCost'
 import { compareCostRows, costMetric, EMPTY_THRESHOLDS, matchesCostThresholds, numberInput } from '../frCostScreen'
 import type { CostMetric, ThresholdMetric, Thresholds } from '../frCostScreen'
 import { FrCostOverviewCharts } from './FrCostOverviewCharts'
+import { FrCostShortlist } from './FrCostShortlist'
 
 const fmt = (n: number | null, digits = 2) => n === null ? '未知' : n.toLocaleString('en-US', { maximumFractionDigits: digits })
 const thresholdFields: { key: ThresholdMetric; label: string; placeholder: string; max?: number; min?: number }[] = [
@@ -41,6 +42,7 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
   const [sort, setSort] = useState<CostMetric | 'symbol'>('costBps')
   const [ascending, setAscending] = useState(false)
   const [page, setPage] = useState(0)
+  const [expanded, setExpanded] = useState(false)
   const backfill = useRef<AbortController | null>(null)
   const [progress, setProgress] = useState<{ done: number; total: number; symbol: string; failed: number } | null>(null)
   const [backfillNote, setBackfillNote] = useState('')
@@ -131,8 +133,23 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
   }
 
   return <section className="fr-cost-panel fr-cost-overview" aria-label="按币种筛选建仓成本">
-    <div className="fr-cost-table-head"><h2>按币种比较建仓成本</h2><span className="fr-cost-count">{loading ? '读取当前持仓中…' : `当前持仓 ${filtered.length} / ${overview?.rows.length ?? 0} 个币种`}</span></div>
-    <p>仅当前持仓（实时合约数量非零），合约平仓后不再追踪；成本按 FIFO 剩余配对库存计算。阈值留空表示不限，点击表头切换升降序。入场基差 = (合约均价 − 现货均价) / 现货均价，保留正负；大基差不直接等于高成本。执行偏差正值为不利，仅为相对 premium 的估算。</p>
+    <div className="fr-cost-table-head"><h2>优先检查 · 前 5 个持仓</h2><span className="fr-cost-count">仅当前持仓 · 手动刷新</span></div>
+    <p>先看执行偏差与成本，再看 taker 比例和不利基差。点击币种查看 FIFO 建仓明细。</p>
+    {loading && <p role="status">读取实时持仓，仅重建当前持有币种的成交…</p>}
+    {error && <p className="fr-cost-notice" role="alert">币种汇总加载失败：{error}。可使用上方“计算 / 刷新”重试。</p>}
+    {overview && <FrCostShortlist rows={overview.rows} onSelect={onSelect} />}
+    <div className="fr-cost-screen-actions">
+      <button type="button" aria-expanded={expanded} aria-controls="fr-cost-full-overview" onClick={() => setExpanded(value => !value)}>{expanded ? '收起完整表格' : '展开完整表格与筛选'}</button>
+      {progress ? <button type="button" onClick={() => backfill.current?.abort()}>停止补齐</button>
+        : <button type="button" disabled={!supportsReference || !incomplete.length} onClick={() => void fillReferences()}>手动补齐参考（{incomplete.length}）</button>}
+      <span>不自动刷新或补齐数据</span>
+    </div>
+    {progress && <p role="status">正在手动补齐 {progress.symbol}，已处理 {progress.done} / {progress.total}；每个币种最多约 8 秒，可继续筛选或停止。</p>}
+    {backfillNote && <p role="status">{backfillNote}</p>}
+    <details><summary>数量覆盖是什么意思？</summary><p>数量覆盖 = 能计算该项指标的配对币数 ÷ 当前 FIFO 配对总币数。例如配对了 100 个币，其中 80 个币的数据齐全，覆盖率就是 80%。金额和 bps 仅对应这 80 个币，其中 bps 按这部分的成交本金计算，不代表整仓。</p><p>这是数据完整度：手续费需要成交价和费用折算，执行偏差需要成交价和分钟参考，总成本需要两者都齐全，所以三项覆盖率可能不同。</p></details>
+    {expanded && <div id="fr-cost-full-overview">
+    <div className="fr-cost-table-head"><h2>完整持仓与自定义筛选</h2><span className="fr-cost-count">{filtered.length} / {overview?.rows.length ?? 0} 个币种</span></div>
+    <p>成本按 FIFO 剩余配对库存计算，已平仓币种不再追踪。阈值留空表示不限，点击表头切换升降序。入场基差 = (合约均价 − 现货均价) / 现货均价，保留正负；大基差不直接等于高成本。</p>
     <div className="fr-cost-screen-controls">
       <label>搜索币种<input type="search" value={search} onChange={e => { setSearch(e.target.value); setPage(0) }} placeholder="如 BTC" /></label>
       <label>最低配对本金 USDT<input type="number" min="0" step="any" value={minNotional} onChange={e => { setMinNotional(e.target.value); setPage(0) }} placeholder="不限" /></label>
@@ -143,15 +160,8 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
       <label>指标阈值组合<select value={mode} onChange={e => { setMode(e.target.value as 'any' | 'all'); setPage(0) }}><option value="any">满足任一阈值</option><option value="all">满足全部阈值</option></select></label>
       <label><input type="checkbox" checked={keepUnknown} onChange={e => { setKeepUnknown(e.target.checked); setPage(0) }} /> 保留无法判断的币种</label>
       <button type="button" onClick={reset}>清空筛选</button>
-      {progress ? <button type="button" onClick={() => backfill.current?.abort()}>停止补齐</button>
-        : <button type="button" disabled={!supportsReference || !incomplete.length} onClick={() => void fillReferences()}>手动补齐参考（{incomplete.length}）</button>}
     </div>
-    <p>页面仅加载一次，不持续刷新。点击“计算 / 刷新”重新读取持仓，点击“手动补齐参考”执行一轮补齐。</p>
-    {loading && <p role="status">读取实时持仓，仅重建当前持有币种的成交…</p>}
-    {error && <p className="fr-cost-notice" role="alert">币种汇总加载失败：{error}。可使用上方“计算 / 刷新”重试。</p>}
     {pending > 0 && <p>当前保留 {pending} 个无法判断是否满足阈值的币种，不代表已命中或正常。</p>}
-    {progress && <p role="status">正在手动补齐 {progress.symbol}，已处理 {progress.done} / {progress.total}；每个币种最多约 8 秒，可继续筛选或停止。</p>}
-    {backfillNote && <p role="status">{backfillNote}</p>}
     {overview && <>
       <div className="fr-cost-coverage-cards">
         <article><span>当前持仓</span><strong>{overview.rows.length}</strong><small>以实时合约持仓为准</small></article>
@@ -159,8 +169,7 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
         <article><span>参考尚有缺口</span><strong>{incomplete.length}</strong><small>可手动补齐，缺失不填零</small></article>
         <article><span>费用折算待补齐</span><strong>{overview.rows.filter(r => r.pairedLiquidity.spot.total.unconvertedFeeParts + r.pairedLiquidity.futures.total.unconvertedFeeParts > 0).length}</strong><small>例如 BNB 手续费缺少成交时估值</small></article>
       </div>
-      <details><summary>数量覆盖是什么意思？</summary><p>数量覆盖 = 能计算该项指标的配对币数 ÷ 当前 FIFO 配对总币数。例如配对了 100 个币，其中 80 个币的数据齐全，覆盖率就是 80%。金额和 bps 仅对应这 80 个币，其中 bps 按这部分的成交本金计算，不代表整仓。</p><p>这是数据完整度：手续费需要成交价和费用折算，执行偏差需要成交价和分钟参考，总成本需要两者都齐全，所以三项覆盖率可能不同。</p></details>
-      <FrCostOverviewCharts rows={filtered} takerThreshold={numberInput(thresholds.taker)} basisThreshold={numberInput(thresholds.basisAbs)} onSelect={onSelect} />
+      <FrCostOverviewCharts rows={filtered} onSelect={onSelect} />
       <p>表格、排序和阈值使用当前可计算片段的 bps。部分覆盖按该部分本金计算，不外推为整仓成本；鼠标悬停图表可查看覆盖率，点击可看明细。</p>
       <div className="fr-cost-table-wrap"><table><thead><tr>{columns.map(column => <th key={column.key} aria-sort={sort === column.key ? ascending ? 'ascending' : 'descending' : 'none'}>
         <button className="fr-cost-sort" onClick={() => sortBy(column.key)}>{column.label} <span aria-hidden="true">{sort === column.key ? ascending ? '↑' : '↓' : '↕'}</span></button>
@@ -171,5 +180,6 @@ export function FrCostOverviewTable({ slug, endMs, refresh, detail, onSelect, on
       <div className="fr-cost-pager"><button disabled={activePage === 0} onClick={() => setPage(activePage - 1)}>上一页</button><span>{activePage + 1} / {pages}</span><button disabled={activePage + 1 >= pages} onClick={() => setPage(activePage + 1)}>下一页</button></div>
       <p>实时持仓快照：{new Date(overview.factualSnapshotMs).toLocaleString('zh-CN', { hour12: false })}。汇总截至 {new Date(overview.endMs).toLocaleString('zh-CN', { hour12: false })}。taker 按各腿成交额计算，未知成交角色仍计入分母。成本仅覆盖配对库存；缺失原始成本、费用或参考时保留未知。汇总使用市场参考，手动假设仅影响单币明细。{!supportsReference ? '本交易所市场参考尚不可用。' : '需要更新时手动刷新或补齐参考。'}</p>
     </>}
+    </div>}
   </section>
 }

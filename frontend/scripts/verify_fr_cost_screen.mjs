@@ -6,7 +6,7 @@ const source = readFileSync(new URL('../src/frCostScreen.ts', import.meta.url), 
 const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS } })
 const module = { exports: {} }
 new Function('module', 'exports', outputText)(module, module.exports)
-const { EMPTY_THRESHOLDS, matchesCostThresholds: match, compareCostRows: compare, costMetric, numberInput } = module.exports
+const { EMPTY_THRESHOLDS, matchesCostThresholds: match, compareCostRows: compare, costMetric, numberInput, rankCostConcerns, costMetricCoverage, adverseEntryBasis, COST_REVIEW_RULES } = module.exports
 
 function row(symbol, taker, basis, deviation, fee, cost, unknown = 0) {
   const leg = { takerNotionalPct: taker, makerNotionalPct: taker === null ? null : 100 - taker - unknown, unknownNotionalPct: unknown }
@@ -60,4 +60,30 @@ const coveredRow = { ...unknown, summary: { ...unknown.summary, notionalUsdt: 10
 assert.equal(costMetric(coveredRow, 'costBps'), 30, 'partial bps uses the covered notional, not full position')
 assert.equal(costMetric(coveredRow, 'cost'), 3, 'partial amount must not be extrapolated to whole position')
 assert.equal(match(coveredRow, { ...EMPTY_THRESHOLDS, deviation: '15' }, 'any'), true)
-console.log('FR screen: inclusive thresholds, any/all, signed and absolute basis, rebates, unknown roles, missing values and bidirectional sorting passed.')
+assert.equal(costMetricCoverage(adverse, 'deviation'), 100)
+assert.equal(costMetricCoverage(coveredRow, 'costBps'), 10)
+assert.equal(costMetricCoverage(unknown, 'costBps'), null)
+assert.deepEqual(rankCostConcerns([favorable, unknown, noPair, coveredRow]), [], 'favorable, unknown, unpaired and tiny samples must not become worst positions')
+const adequate = { ...coveredRow, symbol: 'ADEQUATE', covered: Object.fromEntries(Object.entries(coveredRow.covered).map(([k, v]) => [k, { ...v, quantityCoveragePct: 50 }])) }
+assert.ok(rankCostConcerns([adequate])[0].reasons.includes('成本偏高'), '50% coverage is an inclusive, explicit review gate')
+const tinyAdverse = { ...coveredRow, covered: { ...coveredRow.covered, cost: { bps: 10000, quantityCoveragePct: 2 } } }
+assert.deepEqual(rankCostConcerns([tinyAdverse]), [], 'a huge adverse value on 2% coverage must not outrank representative values')
+const knownLeg = { ...unknown, symbol: 'ONELEG', pairedLiquidity: { ...unknown.pairedLiquidity, spot: { takerNotionalPct: 30, unknownNotionalPct: 70 } } }
+assert.deepEqual(rankCostConcerns([knownLeg])[0].reasons, ['现货 taker 高'], 'known taker lower bound proves a breach without inventing the other leg')
+assert.deepEqual(rankCostConcerns([partial]), [], 'unknown roles must not be inferred as taker')
+const unfavorableBasis = row('BASIS', 0, -50, 0, 0, 0)
+const reverseFavorable = { ...unfavorableBasis, direction: 'reverse' }
+const reverseAdverse = { ...unfavorableBasis, direction: 'reverse', fillSpreadBps: 50 }
+assert.equal(adverseEntryBasis(unfavorableBasis), 50)
+assert.equal(adverseEntryBasis(reverseFavorable), -50)
+assert.deepEqual(rankCostConcerns([reverseFavorable]), [])
+assert.deepEqual(rankCostConcerns([reverseAdverse])[0].reasons, ['不利入场基差'])
+assert.deepEqual(rankCostConcerns([{ ...unfavorableBasis, direction: null }]), [], 'unknown direction does not prove adverse basis')
+const feeOnly = row('FEE', 0, 0, null, 10, null)
+assert.deepEqual(rankCostConcerns([feeOnly])[0].reasons, ['手续费偏高'], 'known fees can flag a position with missing market reference')
+const ordered = rankCostConcerns([unfavorableBasis, highTaker, feeOnly, adverse, adequate, favorable, unknown])
+assert.deepEqual(ordered.map(item => item.row.symbol), ['ADEQUATE', 'BBBUSDT', 'FEE', 'AAAUSDT', 'BASIS'], 'cost/execution magnitude first, then taker, then adverse basis')
+const ties = rankCostConcerns([{ ...adverse, symbol: 'Z' }, { ...adverse, symbol: 'A' }])
+assert.deepEqual(ties.map(item => item.row.symbol), ['A', 'Z'])
+assert.equal(COST_REVIEW_RULES.limit, 5)
+console.log('FR screen: thresholds, signed basis, unknown roles, partial coverage, deterministic review priority and sorting passed.')

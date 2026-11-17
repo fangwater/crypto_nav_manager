@@ -67,3 +67,54 @@ export function compareCostRows(a: FrCostRow, b: FrCostRow, key: CostMetric | 's
   if (av === null || bv === null) return av === bv ? a.symbol.localeCompare(b.symbol) : av === null ? 1 : -1
   return (ascending ? av - bv : bv - av) || a.symbol.localeCompare(b.symbol)
 }
+
+export const COST_REVIEW_RULES = { costBps: 10, takerPct: 30, adverseBasisBps: 50, minimumCoveragePct: 50, limit: 5 } as const
+export type CoveredCostMetric = 'feeBps' | 'deviation' | 'costBps'
+
+export function costMetricCoverage(row: FrCostRow, key: CoveredCostMetric): number | null {
+  if (costMetric(row, key) === null) return null
+  const full = key === 'feeBps' ? row.summary.feeUsdt : key === 'deviation' ? row.executionDeviationBps : row.summary.estimatedCostBps
+  if (full !== null) return 100
+  return row.covered?.[key === 'feeBps' ? 'fee' : key === 'costBps' ? 'cost' : 'deviation'].quantityCoveragePct ?? null
+}
+
+// Positive means economically adverse for the actual position direction.
+// Raw (F-S)/S alone cannot distinguish favorable and adverse entry basis.
+export function adverseEntryBasis(row: FrCostRow): number | null {
+  const basis = costMetric(row, 'basis')
+  return basis === null || row.direction === null ? null : row.direction === 'positive' ? -basis : basis
+}
+
+export interface CostConcern {
+  row: FrCostRow
+  reasons: string[]
+  priority: number
+  magnitude: number
+}
+
+export function rankCostConcerns(rows: FrCostRow[]): CostConcern[] {
+  const { costBps, takerPct, adverseBasisBps, minimumCoveragePct } = COST_REVIEW_RULES
+  return rows.flatMap(row => {
+    if (!row.summary.pairCount) return []
+    const reasons: string[] = []
+    const adverseCosts: number[] = []
+    for (const [key, label] of [['deviation', '执行偏差高'], ['costBps', '成本偏高'], ['feeBps', '手续费偏高']] as const) {
+      const value = costMetric(row, key)
+      if (value !== null && value >= costBps && (costMetricCoverage(row, key) ?? 0) >= minimumCoveragePct) {
+        reasons.push(label); adverseCosts.push(value)
+      }
+    }
+    const highTaker: number[] = []
+    for (const [key, label] of [['spot', '现货 taker 高'], ['futures', '合约 taker 高']] as const) {
+      const value = row.pairedLiquidity[key].takerNotionalPct
+      // A known lower bound can prove a breach even when the other leg or
+      // some liquidity roles are unknown. Unknown share is never imputed.
+      if (value !== null && value >= takerPct) { reasons.push(label); highTaker.push(value) }
+    }
+    const basis = adverseEntryBasis(row)
+    if (basis !== null && basis >= adverseBasisBps) reasons.push('不利入场基差')
+    if (!reasons.length) return []
+    return [{ row, reasons, priority: adverseCosts.length ? 0 : highTaker.length ? 1 : 2,
+      magnitude: adverseCosts.length ? Math.max(...adverseCosts) : highTaker.length ? Math.max(...highTaker) : basis! }]
+  }).sort((a, b) => a.priority - b.priority || b.magnitude - a.magnitude || a.row.symbol.localeCompare(b.row.symbol))
+}

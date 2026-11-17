@@ -105,7 +105,7 @@ export function FrEntryCostPage() {
       {!slug && !error && strategies.length === 0 && <p>没有可访问的 FR 账户。</p>}
       {slug && <FrCostOverviewTable key={slug} slug={slug} endMs={endMs} refresh={refresh} detail={data} onSelect={selectCoin} onLoaded={setHoldings} />}
       <div id="fr-cost-detail" />
-      {!loading && !data && !!currentHoldings?.rows.length && <p className="fr-cost-notice">点击表格币种或图表数据点，查看该持仓的 FIFO 建仓明细。</p>}
+      {!loading && !data && !!currentHoldings?.rows.length && <p className="fr-cost-notice">点击优先检查列表或完整表格中的币种，查看该持仓的 FIFO 建仓明细。</p>}
       {loading && <p className="fr-cost-notice" role="status">重放实际成交并补齐分钟参考，首次加载可能需要约 40 秒。</p>}
       {data && summary && <>
         <section className="fr-cost-hero">
