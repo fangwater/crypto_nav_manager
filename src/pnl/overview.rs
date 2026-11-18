@@ -126,12 +126,11 @@ fn realized_net_pnl(metrics: &Metrics) -> f64 {
 }
 
 fn daily_net_pnl(state: &SymbolState, metrics: &Metrics) -> f64 {
-    if let Some(paired) = &state.paired_closings {
-        paired.realized - metrics.trading_fee_usdt + metrics.funding_pnl_usdt
-            - metrics.interest_cost_usdt
-    } else {
-        realized_net_pnl(metrics)
-    }
+    realized_net_pnl(metrics)
+        - state
+            .paired_closings
+            .as_ref()
+            .map_or(0.0, |paired| paired.pending_profit)
 }
 
 #[cfg(test)]
