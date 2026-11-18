@@ -95,6 +95,10 @@ FIFO/fees/funding/interest calculations in NAV, independent per account. FR
 overview daily profit uses FIFO realized trading PnL plus actual funding minus
 fees and borrowing interest; exclude open-position floating PnL and do not
 derive profit from the live-equity difference.
+For hedged FR inventory, recognize the FIFO trading PnL on the Shanghai date
+when the corresponding base quantity has closed on both legs. Recognize closes
+of unpaired inventory and fees, funding and interest on their event dates.
+Keep the per-leg realized PnL for the existing four-hour monitoring curve.
 By operator request on 2026-10-27, the overview preserves priced position
 subtotals when other balances lack prices, and exports `position_unpriced_assets`
 for CTA's partial-valuation disclosure. An entirely unpriced side remains null.

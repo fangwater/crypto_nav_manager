@@ -46,6 +46,7 @@ struct State {
     history: History,
     total: f64,
     realized: f64,
+    daily_profit: f64,
     started: bool,
 }
 
@@ -55,7 +56,7 @@ impl State {
         for position in positions {
             symbols
                 .entry(position.symbol.clone())
-                .or_insert_with(|| SymbolState::for_source(source))
+                .or_insert_with(|| SymbolState::for_overview(source))
                 .seed_position(position)?;
         }
         Ok(Self {
@@ -64,12 +65,15 @@ impl State {
                 boundaries: BTreeMap::new(),
                 points: Vec::new(),
                 realized_boundaries: BTreeMap::new(),
+                daily_profit_boundaries: BTreeMap::new(),
                 final_realized_net: 0.0,
+                final_daily_profit: 0.0,
                 final_pnl: 0.0,
                 start_pnl: 0.0,
             },
             total: 0.0,
             realized: 0.0,
+            daily_profit: 0.0,
             started: false,
         })
     }
@@ -84,6 +88,9 @@ impl State {
         self.history
             .realized_boundaries
             .retain(|ts, _| wanted.contains(ts));
+        self.history
+            .daily_profit_boundaries
+            .retain(|ts, _| wanted.contains(ts));
     }
 
     fn record_boundaries(
@@ -95,6 +102,9 @@ impl State {
             let ts = wanted.next().unwrap();
             self.history.boundaries.insert(ts, self.total);
             self.history.realized_boundaries.insert(ts, self.realized);
+            self.history
+                .daily_profit_boundaries
+                .insert(ts, self.daily_profit);
         }
     }
 
@@ -106,8 +116,9 @@ impl State {
         let symbol = event.symbol();
         self.symbols
             .entry(symbol.into())
-            .or_insert_with(|| SymbolState::for_source(source));
+            .or_insert_with(|| SymbolState::for_overview(source));
         let before = self.symbols[symbol].metrics();
+        let daily_before = daily_net_pnl(&self.symbols[symbol], &before);
         apply_event(&mut self.symbols, event)?;
         let after = self.symbols[symbol].metrics();
         anyhow::ensure!(
@@ -116,6 +127,7 @@ impl State {
         );
         self.total += after.total_pnl_usdt - before.total_pnl_usdt;
         self.realized += realized_net_pnl(&after) - realized_net_pnl(&before);
+        self.daily_profit += daily_net_pnl(&self.symbols[symbol], &after) - daily_before;
         if event.ts() >= start {
             if self
                 .history
@@ -136,12 +148,13 @@ impl State {
             self.history.start_pnl = self.total;
         }
         anyhow::ensure!(
-            self.total.is_finite() && self.realized.is_finite(),
+            self.total.is_finite() && self.realized.is_finite() && self.daily_profit.is_finite(),
             "non-finite account history"
         );
         self.history.points.push((end, self.total));
         self.history.final_pnl = self.total;
         self.history.final_realized_net = self.realized;
+        self.history.final_daily_profit = self.daily_profit;
         Ok(self.history)
     }
 
@@ -157,10 +170,16 @@ impl State {
                     symbol.capacity()
                         + s.spot_fifo.allocated_bytes()
                         + s.futures_fifo.allocated_bytes()
+                        + s.paired_closings
+                            .as_ref()
+                            .map_or(0, |paired| paired.allocated_bytes())
                 })
                 .sum::<usize>()
             + self.history.points.capacity() * std::mem::size_of::<(i64, f64)>()
-            + (self.history.boundaries.len() + self.history.realized_boundaries.len()) * 64
+            + (self.history.boundaries.len()
+                + self.history.realized_boundaries.len()
+                + self.history.daily_profit_boundaries.len())
+                * 64
     }
 }
 

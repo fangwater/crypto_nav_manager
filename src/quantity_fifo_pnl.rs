@@ -38,6 +38,20 @@ impl QuantityFifoPnl {
         quantity: f64,
         fee: f64,
     ) -> Result<(), FifoPnlError> {
+        self.apply_fill_with_closes(side, price, quantity, fee, |_, _| {})
+            .map(|_| ())
+    }
+
+    /// Report each FIFO close as (quantity, gross PnL per unit). Return the
+    /// quantity that opened a new lot after all closes.
+    pub(crate) fn apply_fill_with_closes(
+        &mut self,
+        side: Side,
+        price: f64,
+        quantity: f64,
+        fee: f64,
+        on_close: impl FnMut(f64, f64),
+    ) -> Result<f64, FifoPnlError> {
         validate_positive("price", price)?;
         validate_positive("quantity", quantity)?;
         if !fee.is_finite() {
@@ -51,6 +65,7 @@ impl QuantityFifoPnl {
                 price,
                 quantity,
                 -1.0,
+                on_close,
             ),
             Side::Sell => close_fifo(
                 &mut self.longs,
@@ -58,6 +73,7 @@ impl QuantityFifoPnl {
                 price,
                 quantity,
                 1.0,
+                on_close,
             ),
         };
         if remaining_quantity > 0.0 {
@@ -79,7 +95,7 @@ impl QuantityFifoPnl {
 
         self.gross_realized_pnl += realized_pnl;
         self.cumulative_fees += fee;
-        Ok(())
+        Ok(remaining_quantity)
     }
 
     pub fn snapshot(&self, bid: f64, ask: f64) -> Result<QuantityPnlSnapshot, FifoPnlError> {
@@ -123,6 +139,7 @@ fn close_fifo(
     close_price: f64,
     mut quantity: f64,
     direction: f64,
+    mut on_close: impl FnMut(f64, f64),
 ) -> (f64, f64) {
     let mut realized_pnl = 0.0;
 
@@ -131,7 +148,9 @@ fn close_fifo(
             break;
         };
         let matched_quantity = quantity.min(lot.quantity);
-        realized_pnl += direction * (close_price - lot.entry_price) * matched_quantity;
+        let per_unit = direction * (close_price - lot.entry_price);
+        realized_pnl += per_unit * matched_quantity;
+        on_close(matched_quantity, per_unit);
         inventory.quantity(lot.entry_price, -matched_quantity);
         quantity -= matched_quantity;
         lot.quantity -= matched_quantity;

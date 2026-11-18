@@ -22,6 +22,8 @@ const BINANCE_INTRA_SPOT_MAKER_REBATE_RATE: f64 = 0.4 / 10_000.0;
 
 pub mod audit;
 pub mod overview;
+mod paired_closings;
+use paired_closings::PairedClosings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PnlSourceKind {
@@ -400,6 +402,7 @@ impl VenueFifo {
 struct SymbolState {
     spot_fifo: VenueFifo,
     futures_fifo: VenueFifo,
+    paired_closings: Option<Box<PairedClosings>>,
     funding_pnl_usdt: f64,
     interest_cost_usdt: f64,
     trade_count: u64,
@@ -422,6 +425,14 @@ impl SymbolState {
         }
     }
 
+    fn for_overview(source: PnlSourceKind) -> Self {
+        let mut state = Self::for_source(source);
+        if source == PnlSourceKind::FundingRate {
+            state.paired_closings = Some(Box::default());
+        }
+        state
+    }
+
     fn seed_position(&mut self, position: &InitialPosition) -> Result<()> {
         if !position.mark_price.is_finite() || position.mark_price <= 0.0 {
             bail!("invalid initial mark price for {}", position.symbol);
@@ -436,6 +447,21 @@ impl SymbolState {
             position.futures_quantity,
             position.mark_price,
         )?;
+        if let Some(paired) = &mut self.paired_closings {
+            for (leg, quantity) in [
+                (PositionLeg::Spot, position.spot_quantity),
+                (PositionLeg::Futures, position.futures_quantity),
+            ] {
+                if quantity.abs() > f64::EPSILON {
+                    let side = if quantity > 0.0 {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    paired.open(leg, side, quantity.abs());
+                }
+            }
+        }
         self.spot_position_qty = position.spot_quantity;
         self.futures_position_qty = position.futures_quantity;
         self.mark_price = Some(position.mark_price);
@@ -450,17 +476,44 @@ impl SymbolState {
         Ok(())
     }
 
+    fn apply_leg_fill(
+        &mut self,
+        leg: PositionLeg,
+        side: Side,
+        price: f64,
+        amount_u: f64,
+        quantity: f64,
+        fee: f64,
+    ) -> Result<()> {
+        let fifo = match leg {
+            PositionLeg::Spot => &mut self.spot_fifo,
+            PositionLeg::Futures => &mut self.futures_fifo,
+        };
+        if let (VenueFifo::Quantity(fifo), Some(paired)) = (&mut *fifo, &mut self.paired_closings) {
+            let opened = fifo.apply_fill_with_closes(side, price, quantity, fee, |qty, pnl| {
+                paired.close(leg, qty, pnl);
+            })?;
+            paired.open(leg, side, opened);
+            Ok(())
+        } else {
+            fifo.apply_fill(side, price, amount_u, quantity, fee)
+        }
+    }
+
     fn apply_trade(&mut self, trade: &NormalizedTrade) -> Result<()> {
         let fee = trade.fee_usdt.unwrap_or_else(|| {
             self.unconverted_fee_count += 1;
             0.0
         });
-        let fifo = match trade.leg {
-            PositionLeg::Spot => &mut self.spot_fifo,
-            PositionLeg::Futures => &mut self.futures_fifo,
-        };
-        fifo.apply_fill(trade.side, trade.price, trade.amount_u, trade.quantity, fee)
-            .context("apply normalized trade to venue FIFO")?;
+        self.apply_leg_fill(
+            trade.leg,
+            trade.side,
+            trade.price,
+            trade.amount_u,
+            trade.quantity,
+            fee,
+        )
+        .context("apply normalized trade to venue FIFO")?;
         self.trade_count += 1;
         self.volume_usdt += trade.amount_u;
         let signed_quantity = match trade.side {
@@ -513,15 +566,15 @@ impl SymbolState {
             } else {
                 Side::Sell
             };
-            self.spot_fifo
-                .apply_fill(
-                    side,
-                    conversion_price,
-                    quantity_delta.abs() * conversion_price,
-                    quantity_delta.abs(),
-                    0.0,
-                )
-                .context("apply spot quantity adjustment to venue FIFO")?;
+            self.apply_leg_fill(
+                PositionLeg::Spot,
+                side,
+                conversion_price,
+                quantity_delta.abs() * conversion_price,
+                quantity_delta.abs(),
+                0.0,
+            )
+            .context("apply spot quantity adjustment to venue FIFO")?;
             self.mark_price = Some(conversion_price);
             self.spot_snapshot = Some(
                 self.spot_fifo

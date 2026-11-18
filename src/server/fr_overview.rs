@@ -62,10 +62,10 @@ impl Reconstruction {
             .map(|p| equity - self.history.final_pnl + p)
     }
     fn daily_realized_profit(&self, start: i64, end: Option<i64>) -> Option<f64> {
-        let opening = *self.history.realized_boundaries.get(&start)?;
+        let opening = *self.history.daily_profit_boundaries.get(&start)?;
         let closing = match end {
-            Some(end) => *self.history.realized_boundaries.get(&end)?,
-            None if day(self.at) == start => self.history.final_realized_net,
+            Some(end) => *self.history.daily_profit_boundaries.get(&end)?,
+            None if day(self.at) == start => self.history.final_daily_profit,
             None => return None,
         };
         Some(closing - opening)
@@ -699,9 +699,11 @@ mod tests {
                     (8 * hour, -2.0),
                     (end, 3.0),
                 ]),
+                daily_profit_boundaries: BTreeMap::new(),
                 points: vec![],
                 final_pnl: 300.0,
                 final_realized_net: 3.0,
+                final_daily_profit: 0.0,
                 start_pnl: 0.0,
             },
         });
@@ -751,8 +753,10 @@ mod tests {
             history: pnl::overview::History {
                 boundaries: BTreeMap::from([(5 * DAY, 10.0), (20 * DAY, 0.0)]),
                 points: vec![(6 * DAY, 20.0), (7 * DAY, -10.0), (20 * DAY, 0.0)],
-                realized_boundaries: BTreeMap::from([(5 * DAY, 3.0), (20 * DAY, 8.0)]),
+                realized_boundaries: BTreeMap::new(),
+                daily_profit_boundaries: BTreeMap::from([(5 * DAY, 3.0), (20 * DAY, 8.0)]),
                 final_realized_net: 10.0,
+                final_daily_profit: 10.0,
                 final_pnl: 0.0,
                 start_pnl: 0.0,
             },
@@ -769,7 +773,7 @@ mod tests {
         let opening = day(changed_equity.at);
         changed_equity
             .history
-            .realized_boundaries
+            .daily_profit_boundaries
             .insert(opening, 8.0);
         assert_eq!(
             changed_equity.daily_realized_profit(opening, None),
